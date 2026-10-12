@@ -1,0 +1,17 @@
+[Unit]
+Description=MASC chassis CAN interface setup
+Wants=systemd-udev-trigger.service
+After=systemd-udev-trigger.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/masc-chassis/setup_can.sh socketcan --iface can0 --bitrate 500000 --restart-ms 100 --skip-test
+ExecStop=/usr/local/lib/masc-chassis/setup_can.sh down --iface can0
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=15
+
+[Install]
+WantedBy=multi-user.target

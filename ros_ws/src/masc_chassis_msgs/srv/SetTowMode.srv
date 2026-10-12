@@ -1,0 +1,8 @@
+# Function: One-shot tow mode request.
+# Msg Name: SetTowMode
+# Maps to tow_mode_control_cmd (0x101).
+
+bool enable
+---
+bool success
+string message

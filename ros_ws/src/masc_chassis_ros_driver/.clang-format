@@ -1,0 +1,38 @@
+---
+# 基于 Google 风格定制
+BasedOnStyle: Google
+
+# 缩进宽度
+IndentWidth: 4
+ColumnLimit: 100
+TabWidth: 4
+UseTab: Never
+
+# 大括号换行策略
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  BeforeElse: false
+  IndentBraces: false
+
+# 指针对齐（靠右：int *ptr;）
+PointerAlignment: Right
+
+# 允许短函数写在同一行
+AllowShortFunctionsOnASingleLine: Inline
+
+# 排序头文件（按字母顺序）
+SortIncludes: true
+
+# 访问说明符（public/private）的缩进
+AccessModifierOffset: -4
+
+# 换行前后的空格处理
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeParens: ControlStatements
+---

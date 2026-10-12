@@ -1,0 +1,34 @@
+---
+Checks: 'readability-identifier-naming'
+CheckOptions:
+  # 1. 命名空间：全小写蛇形
+  - { key: readability-identifier-naming.NamespaceCase,       value: snake_case }
+
+  # 2. 类、结构体与枚举名：大驼峰
+  - { key: readability-identifier-naming.ClassCase,           value: CamelCase  }
+  - { key: readability-identifier-naming.StructCase,          value: CamelCase  }
+  - { key: readability-identifier-naming.EnumCase,            value: CamelCase  }
+
+  # 3. 枚举值 (优先enum class 方式，如 DeviceStatus::Connecting)
+  - { key: readability-identifier-naming.EnumConstantCase,    value: CamelCase  }
+
+  # 4. 函数与方法：大驼峰
+  - { key: readability-identifier-naming.FunctionCase,        value: CamelCase  }
+  - { key: readability-identifier-naming.MethodCase,          value: CamelCase  }
+
+  # 5. 局部变量与参数：全小写蛇形
+  - { key: readability-identifier-naming.VariableCase,        value: snake_case }
+  - { key: readability-identifier-naming.ParameterCase,       value: snake_case }
+
+  # 6. 成员变量 (m_snake_case)
+  - { key: readability-identifier-naming.MemberCase,          value: snake_case }
+  - { key: readability-identifier-naming.MemberPrefix,        value: m_         }
+
+  # 7. 全局变量 (g_snake_case)
+  - { key: readability-identifier-naming.GlobalVariableCase,  value: snake_case }
+  - { key: readability-identifier-naming.GlobalVariablePrefix,value: g_         }
+
+  # 8. 常量 (kCamelCase)
+  - { key: readability-identifier-naming.ConstantCase,        value: CamelCase  }
+  - { key: readability-identifier-naming.ConstantPrefix,      value: k          }
+---

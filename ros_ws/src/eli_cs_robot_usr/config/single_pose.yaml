@@ -1,0 +1,11 @@
+pose_target_publisher:
+  ros__parameters:
+    target_topic: /moveit_pose_executor/target_poses
+    frame_id: base_link
+    auto_publish: true
+    auto_publish_delay_sec: 1.0
+    # false: roll/pitch/yaw 使用弧度；true: 使用角度。
+    angles_in_degrees: false
+    # 每个位姿是：x, y, z, roll, pitch, yaw
+    # pitch=pi 表示绕 Y 轴旋转 180 度。
+    poses: [0.40, 0.00, 0.40, 0.00, 3.141592653589793, 0.00]

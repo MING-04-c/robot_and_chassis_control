@@ -1,0 +1,14 @@
+# 机械臂初始关节位姿。
+#
+# pose_execution_system.launch.py 会把这个文件只加载给
+# moveit_pose_executor，不会把关节角当作末端 XYZ/RPY 发布。
+moveit_pose_executor:
+  ros__parameters:
+    # 当前关节角和初始关节角的最大允许误差，单位是弧度。
+    # 六个关节都在这个范围内时，认为已经到达初始位，不再发送零位移轨迹。
+    initial_joint_tolerance: 0.01
+
+    # 六轴关节角，单位是弧度。顺序是：
+    # shoulder_pan_joint, shoulder_lift_joint, elbow_joint,
+    # wrist_1_joint, wrist_2_joint, wrist_3_joint
+    initial_joint_positions: [0.0, -1.57, 0.0, -1.57, 1.57, 0.0]

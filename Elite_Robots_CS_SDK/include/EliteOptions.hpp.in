@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Elite Robots.
+//
+// EliteOptions.hpp
+// Provides build configuration options for the Elite Robotics SDK.
+#ifndef __ELITE_OPTIONS_HPP__
+#define __ELITE_OPTIONS_HPP__
+
+#if defined(_WIN32) || defined(_WIN64)
+	#if defined(ELITE_STATIC_LIBRARY)
+        #define ELITE_EXPORT
+	#elif defined ELITE_EXPORT_LIBRARY
+		#define ELITE_EXPORT __declspec(dllexport)
+	#else
+		#define ELITE_EXPORT __declspec(dllimport)
+	#endif
+#elif defined(__linux) || defined(linux) || defined(__linux__)
+	#define ELITE_EXPORT __attribute__((visibility("default")))
+#endif
+
+#define ELITE_SDK_COMPILE_STANDARD @ELITE_SDK_COMPILE_STANDARD@
+
+#define ELITE_SDK_VERSION "@PROJECT_VERSION@"
+#define ELITE_SDK_VERSION_MAJOR (@PROJECT_VERSION_MAJOR@)
+#define ELITE_SDK_VERSION_MINOR (@PROJECT_VERSION_MINOR@)
+#define ELITE_SDK_VERSION_BUGFIX (@PROJECT_VERSION_PATCH@)
+
+#endif

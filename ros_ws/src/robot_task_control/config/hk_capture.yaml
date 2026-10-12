@@ -1,0 +1,15 @@
+/dataset_capture:
+  ros__parameters:
+    image_topic: /camera/image
+    camera_node_name: /hik_camera_ros2_driver
+    interactive_input: false
+    output_dir: ~/robot_data/hk
+    filename_prefix: defect
+    image_format: jpg
+    jpeg_quality: 95
+    # One fresh photo after each workflow trigger; match the HK camera exposure.
+    exposure_times: [40000]
+    gains: []
+    settle_frames: 1
+    settle_time_sec: 0.0
+    save_latest_without_camera_params: false

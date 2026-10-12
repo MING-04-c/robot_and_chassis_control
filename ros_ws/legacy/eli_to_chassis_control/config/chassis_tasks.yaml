@@ -1,0 +1,15 @@
+# Calls exported by the peer's task_names parameter.
+# Motion deltas remain owned by the peer and are intentionally not duplicated here.
+tasks:
+  forward_10cm:
+    description: Move forward 0.10 m
+  backward_10cm:
+    description: Move backward 0.10 m
+  left_10cm:
+    description: Move left 0.10 m
+  right_10cm:
+    description: Move right 0.10 m
+  rotate_left_90deg:
+    description: Rotate left 90 degrees
+  rotate_right_90deg:
+    description: Rotate right 90 degrees

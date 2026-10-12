@@ -1,0 +1,15 @@
+tcp_node:
+  ros__parameters:
+    mode: server
+    host: 0.0.0.0
+    port: 9000
+    line_mode: true
+    append_newline: true
+    reconnect_period: 2.0
+    text_topic: /tcp/rx
+    bytes_topic: /tcp/rx_bytes
+    write_service: /tcp/write
+    send_file_service: /tcp/send_file
+    tx_string_topic: /tcp/tx
+    tx_float_topic: /tcp/tx_float
+    tx_int_topic: /tcp/tx_int

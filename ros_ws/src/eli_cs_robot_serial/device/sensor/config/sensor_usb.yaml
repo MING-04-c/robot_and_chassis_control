@@ -1,0 +1,39 @@
+sensor_node:
+  ros__parameters:
+    transport: usb
+    device: /dev/ttyCH341USB0
+    baudrate: 115200
+    data_bits: 8
+    stop_bits: 1
+    parity: none
+
+    # 设备协议控制
+    auto_start: true
+    zero_before_request: true
+    request_period: 0.0
+    # 命令间隔，避免设备还在处理上一条协议命令时丢掉下一条。
+    command_delay_ms: 300
+    # 清零会返回多行 zero[...]，等待完成后再发送 02。
+    zero_wait_ms: 1000
+    # 单位切换流程中普通命令之间的等待时间。
+    unit_switch_delay_ms: 300
+    # 停止采集 01 与退出 debug 31 之间等待 1 秒，避免设备漏收停止命令。
+    stop_exit_delay_ms: 1000
+    unit: "N"
+    # /sensor/toggle_unit 固定发送 HEX：AA 55 35 0D 0A。
+    # 1=460800；2、3 的实际波特率待设备手册确认。
+    baud_code: 0
+
+    # 默认只发布原始数据，不猜测设备数据帧格式。
+    publish_wrench: true
+    data_format: float32_be
+    # 29 字节帧中：AA(0) 55(1) 命令(2)，24 字节数据从偏移 3 开始。
+    data_offset: 3
+    frame_size: 29
+    # 这里必须是传感器自身坐标系，不能在轴向不一致时冒充 tool0。
+    frame_id: force_sensor
+    raw_topic: /sensor/rx_bytes
+    raw_rx_topic: /sensor/raw_rx_bytes
+    raw_rx_hex_topic: /sensor/raw_rx
+    hex_topic: /sensor/rx
+    wrench_topic: /sensor/wrench

@@ -1,0 +1,5 @@
+string path
+---
+bool success
+uint64 bytes_sent
+string message

@@ -1,0 +1,14 @@
+<!-- ROS1 启动文件：加载参数并启动 masc_chassis_ros_driver_node。 -->
+<launch>
+  <arg name="driver_params" default="$(find masc_chassis_ros_driver)/config/ros1/driver_params.yaml" />
+
+  <node pkg="masc_chassis_ros_driver"
+        type="masc_chassis_ros_driver_node"
+        name="masc_chassis"
+        output="screen">
+    <env name="LANG" value="C.UTF-8" />
+    <env name="LC_ALL" value="C.UTF-8" />
+    <rosparam command="load" file="$(arg driver_params)" />
+    <remap from="~/cmd_vel" to="cmd_vel" />
+  </node>
+</launch>

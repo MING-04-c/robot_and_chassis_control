@@ -1,0 +1,32 @@
+sensor_node:
+  ros__parameters:
+    transport: tcp
+    # 485 转网口设备应配置为 TCP Server，本节点作为 TCP Client 主动连接。
+    host: 169.254.199.80
+    port: 9001
+    reconnect_period_ms: 1000
+    tcp_keepalive: true
+    tcp_no_delay: true
+    auto_start: true
+    zero_before_request: true
+    request_period: 0.0
+    command_delay_ms: 300
+    zero_wait_ms: 1000
+    unit_switch_delay_ms: 300
+    # 停止采集 01 与退出 debug 31 之间等待 1 秒，避免设备漏收停止命令。
+    stop_exit_delay_ms: 1000
+    # 传感器已通过 /sensor/toggle_unit 切换为 N/N·m 后使用此配置。
+    # 这里只声明设备当前单位，不会在每次启动时重复切换。
+    unit: "N"
+    baud_code: 0
+    publish_wrench: true
+    data_format: float32_be
+    data_offset: 3
+    frame_size: 29
+    # 这里必须是传感器自身坐标系，不能在轴向不一致时冒充 tool0。
+    frame_id: force_sensor
+    raw_topic: /sensor/rx_bytes
+    raw_rx_topic: /sensor/raw_rx_bytes
+    raw_rx_hex_topic: /sensor/raw_rx
+    hex_topic: /sensor/rx
+    wrench_topic: /sensor/wrench

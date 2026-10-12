@@ -1,0 +1,63 @@
+admittance_controller:
+  ros__parameters:
+    use_sim_time: false
+    base_frame: base_link
+    end_effector_frame: tool0
+    wrench_transform_frame: ""
+    # 六维传感器 device/sensor 发布的标准力话题。
+    wrench_topic: /sensor/wrench
+    output_mode: trajectory
+    joint_command_topic: /scaled_joint_trajectory_controller/joint_trajectory
+    # 真机流式轨迹每个点的执行时间。过长会使 100 Hz 连续更新的目标滞后。
+    trajectory_duration: 0.06
+    speed_scaling_topic: /speed_scaling_state_broadcaster/speed_scaling
+    require_speed_scaling: true
+    control_rate: 100.0
+    position_tolerance: 0.005
+    orientation_tolerance: 0.03
+    # 真机初次调试也使用三轴柔顺，但偏移、速度和力限幅均比仿真更严格。
+    compliant_axes: "xyz"
+    # 试验修正：基座 X、Y 导纳响应反号，Z 保持原方向。
+    # 这是导纳输入方向配置，不代表传感器安装 TF 已完成校准。
+    compliance_force_sign: [-1.0, -1.0, 1.0]
+    # 准静态柔顺 x=F/K；缩短目标偏移的平滑延迟。
+    compliance_time_constant: 0.10
+    # 导纳位移先扣除 1.5 N 死区，再按 offset=(|F|-deadband)/stiffness 计算。
+    # 因此持续施加 200 N 时：(200-1.5)/1323.3 = 0.15 m，约产生 15 cm 位移。
+    stiffness: [1323.3, 1323.3, 1323.3]
+    force_deadband: [1.5, 1.5, 1.5]
+    # 导纳输入合力限幅到 200 N，避免更大的推力继续增大目标偏移。
+    force_norm_limit: 200.0
+    # 过载判断使用限幅前的滤波合力；达到 400 N 才保持当前位置。
+    # 200~400 N 仍按限幅后的输入计算让位，降到 3 N 以下后解除过载保持。
+    overload_force_threshold: 400.0
+    protection_release_force: 3.0
+    # 单轴最多让位 15 cm；需要更改时修改这里，单位是米。
+    max_compliance_offset: [0.15, 0.15, 0.15]
+    # 柔顺位移变化速度上限为 8 cm/s，单位是 m/s。
+    max_compliance_speed: [0.08, 0.08, 0.08]
+    # 整个关节增量按同一比例缩小，使最大单关节增量不超过该值。
+    # 不逐轴截断，以免破坏 IK 的关节配合并导致下沉、转腕。
+    max_joint_command_step: 0.03
+    # 只报警，不修改或阻止轨迹；示教器实际关节限位应以现场设置为准。
+    wrist_warning_limit_deg: 270.0
+    hold_orientation_during_compliance: true
+    bias_sample_count: 200
+    # 传感器每帧更新：更大的系数响应更快，同时也会传入更多噪声。
+    force_filter_alpha: 0.15
+
+staged_pose_coordinator:
+  ros__parameters:
+    use_sim_time: false
+    approach_axis: z
+    approach_offset: 0.05
+    transition_delay: 0.2
+    handoff_hold_delay: 0.0
+    skip_target_position_tolerance: 0.01
+    skip_target_orientation_tolerance: 0.05
+    switch_controllers: false
+    moveit_controller: scaled_joint_trajectory_controller
+    compliance_controller: scaled_joint_trajectory_controller
+    admittance_node_name: admittance_controller
+    moveit_target_topic: /moveit_pose_executor/target_poses
+    moveit_execute_service: /moveit_pose_executor/execute_latest

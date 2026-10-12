@@ -1,0 +1,10 @@
+/**:
+  ros__parameters:
+    # 可执行任务表。四个数组必须长度相同，相同下标组成一个任务。
+    # dx: 前(+)/后(-)，dy: 左(+)/右(-)，dyaw: 左转(+)/右转(-)。
+    task_names: [forward_10cm, backward_10cm, left_10cm, right_10cm,
+                 rotate_left_90deg, rotate_right_90deg]
+    task_delta_x_m: [0.10, -0.10, 0.0, 0.0, 0.0, 0.0]
+    task_delta_y_m: [0.0, 0.0, 0.10, -0.10, 0.0, 0.0]
+    task_delta_yaw_rad: [0.0, 0.0, 0.0, 0.0, 1.5707963268, -1.5707963268]
+

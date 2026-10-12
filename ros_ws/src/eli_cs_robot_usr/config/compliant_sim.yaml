@@ -1,0 +1,95 @@
+admittance_controller:
+  ros__parameters:
+    use_sim_time: true
+    base_frame: base_link
+    end_effector_frame: tool0
+    wrench_transform_frame: wrist_3_link
+    wrench_topic: /force_torque_sensor_broadcaster/ft_data
+    # 读取 Gazebo F/T 传感器经 cs_sim_ft.launch.py 重映射后的话题。
+    # topic 模式只接收 /admittance_controller/external_wrench，会忽略下面
+    # 的 wrench_topic；这里必须用 sensor 才能让 ign topic 施加的力参与导纳。
+    force_source: sensor
+    # MoveIt 与导纳共用同一个轨迹控制器。导纳每次发布一个短轨迹，避免
+    # trajectory controller 切换到 position controller 时出现重力下坠。
+    output_mode: trajectory
+    joint_command_topic: /joint_trajectory_controller/joint_trajectory
+    # 每个短轨迹点的到达时间。稍长的时间可以减少持续更新轨迹造成的冲击。
+    # 传感器约 60-100 Hz；短轨迹不能远大于更新周期，否则控制器总在追旧目标。
+    # 控制器每 10 ms 更新一次，因此短轨迹也只覆盖一个控制周期，避免
+    # 多条尚未完成的轨迹互相覆盖后造成关节来回追赶。
+    trajectory_duration: 0.01
+    control_rate: 100.0
+    position_tolerance: 0.005
+    orientation_tolerance: 0.03
+    # 三轴平移均可柔顺，避免接触力存在横向分量时被单轴约束反复推回目标。
+    compliant_axes: "xyz"
+    # 准静态柔顺满足 F=K*x。仿真按 1 N -> 5 mm 设置 K=200 N/m：
+    # 1 N 约让位 0.005 m，10 N 约让位 0.05 m，40 N 达到 0.20 m 上限。
+    # 到达上限后锁定该轴，直到该轴外力清除或反向；300 N 合力保护仍单独生效。
+    # 不再积分虚拟质量和速度，避免 Gazebo 物理受力与二阶导纳叠加后摆臂。
+    # time_constant 越小响应越快；越大越平滑，且不会改变最终让位距离。
+    # 0.03 s 使让位在约 0.1 s 内接近稳定值，适合 Gazebo 中观察力响应。
+    # 真机不要直接照搬这个数值，应从 compliant_real.yaml 的保守参数开始。
+    compliance_time_constant: 0.03
+    stiffness: [200.0, 200.0, 200.0]
+    # 设为零才能让 1 N 完整参与计算。传感器启动零偏和低通滤波仍会抑制噪声。
+    force_deadband: [0.0, 0.0, 0.0]
+    # 柔顺位移锁存的释放阈值。撤力后测量残差低于 0.5 N 就解除锁存，
+    # 偏移开始平滑回到零；它不是 300 N 的过载保护释放阈值。
+    compliance_limit_release_force: 0.5
+    # 只限制三轴合力，不再逐轴限制。超过 150 N 时按比例缩放整个力向量，
+    # 保持多轴合力方向不变。注意这只限制导纳计算输入，不限制 Gazebo 物理外力。
+    force_norm_limit: 150.0
+    # 合力超过该值时进入保护：锁定触发瞬间的 TCP 位姿，不再继续发布
+    # “目标位姿 + 柔顺偏移”。仿真测试允许 60/90/140 N 继续柔顺，只有
+    # 合力达到 300 N 才冻结当前位置。以后只需修改这个值，单位为 N。
+    overload_force_threshold: 300.0
+    # 进入保护后，必须等合力低于 5 N 才恢复，并回到最初目标位置。
+    protection_release_force: 5.0
+    # 最大柔顺让位距离，顺序为 [X, Y, Z]，单位是米。
+    # 当前三个方向最多都可偏离原始目标 0.20 m，也就是 20 cm。
+    # 以后如果只想修改某个方向，例如 X=5 cm、Y=10 cm、Z=3 cm，可写成：
+    # max_compliance_offset: [0.05, 0.10, 0.03]
+    # 数值越大，可让位距离越远，但更容易接近关节限位或不可达区域。
+    max_compliance_offset: [0.20, 0.20, 0.20]
+    # 柔顺偏移的最大 TCP 速度。150 N 到 10 cm 的理论位移约需 0.67 s，
+    # 这个速度仍能看出让位过程，同时避免外力突加时产生明显冲击。
+    max_compliance_speed: [0.08, 0.08, 0.08]
+    # 差分 IK 的单次关节步长。0.04 rad 对本模型过大，可能表现为腕部突然
+    # 转动；0.012 rad 给控制器留下连续跟踪空间。以后若仍有转动，先降到
+    # 0.008；若运动太慢，逐步升高，不建议直接恢复到 0.04。
+    max_joint_command_step: 0.003
+    # 仿真末段使用阻尼微分 IK。它从当前关节状态计算连续小步，适合多轴柔顺，
+    # 不会因为完整 IK 选择另一组腕部解而突然摆动。
+    use_differential_ik: true
+    # 位姿误差到 TCP 速度的比例增益，单位约为 1/s。
+    cartesian_position_gain: 1.0
+    # 姿态只做缓慢恢复，防止重复施力后转角累积，也避免腕部快速追姿态。
+    cartesian_orientation_gain: 0.8
+    # TCP 跟踪目标时的最大线速度和角速度，单位分别为 m/s、rad/s。
+    max_cartesian_tracking_speed: 0.08
+    max_angular_tracking_speed: 0.12
+    # 锁存进入柔顺阶段时的真实 TCP 姿态，而不是追踪输入目标中的姿态。
+    # 柔顺阶段只改变 XYZ；若外力使末端转动，则以受限角速度回到该锁存姿态，
+    # 避免腕部转到 90 度后停住，撤力后也能恢复姿态。
+    hold_orientation_during_compliance: true
+    bias_sample_count: 100
+    force_filter_alpha: 0.08
+
+staged_pose_coordinator:
+  ros__parameters:
+    use_sim_time: true
+    approach_axis: z
+    approach_offset: 0.05
+    transition_delay: 0.2
+    # 仿真中不再切换控制器，MoveIt 和导纳全程使用 joint_trajectory_controller。
+    handoff_hold_delay: 0.0
+    # 当前 TCP 在目标 1 cm 内、姿态误差在 0.05 rad 内时，重复目标直接忽略。
+    skip_target_position_tolerance: 0.01
+    skip_target_orientation_tolerance: 0.05
+    switch_controllers: false
+    moveit_controller: joint_trajectory_controller
+    compliance_controller: joint_trajectory_controller
+    admittance_node_name: admittance_controller
+    moveit_target_topic: /moveit_pose_executor/target_poses
+    moveit_execute_service: /moveit_pose_executor/execute_latest

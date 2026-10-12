@@ -1,0 +1,8 @@
+uint8 EXECUTE=1
+uint8 STOP=2
+uint8 command
+string task
+string execution_id
+---
+bool success
+string message

@@ -1,0 +1,21 @@
+<package format="3">
+  <name>masc_user_serial</name>
+  <version>0.2.0</version>
+  <description>TCP camera and chassis status bridge</description>
+  <maintainer email="dev@example.com">MASC user</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>hik_camera_ros2_driver</exec_depend>
+  <exec_depend>masc_chassis_ros_driver</exec_depend>
+  <exec_depend>masc_chassis_msgs</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

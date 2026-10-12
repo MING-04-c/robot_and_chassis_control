@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>masc_chassis_ros_driver</name>
+  <version>1.0.0</version>
+  <!-- ROS1/ROS2 底盘驱动：依赖 CAN SDK、自定义消息和标准 ROS 消息。 -->
+  <description>ROS1/ROS2 driver for MASC chassis CAN SDK.</description>
+  <maintainer email="keaa@keaa.net">MASC</maintainer>
+  <license>GPL-2.0</license>
+
+  <buildtool_depend condition="$ROS_VERSION == 1">catkin</buildtool_depend>
+  <buildtool_depend condition="$ROS_VERSION == 2">ament_cmake</buildtool_depend>
+
+  <depend condition="$ROS_VERSION == 1">roscpp</depend>
+  <depend condition="$ROS_VERSION == 2">rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>masc_chassis_can_sdk</depend>
+  <depend>masc_chassis_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <test_depend condition="$ROS_VERSION == 2">ament_lint_auto</test_depend>
+  <test_depend condition="$ROS_VERSION == 2">ament_lint_common</test_depend>
+
+  <export>
+    <build_type condition="$ROS_VERSION == 1">catkin</build_type>
+    <build_type condition="$ROS_VERSION == 2">ament_cmake</build_type>
+  </export>
+</package>

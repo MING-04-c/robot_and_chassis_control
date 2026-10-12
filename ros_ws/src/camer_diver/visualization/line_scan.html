@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>蓝线循迹 · 逐行扫描可视化</title>
+<style>
+  :root { color-scheme: light; font-family: system-ui, "Microsoft YaHei", sans-serif; color:#193044; background:#edf3f7; }
+  * { box-sizing:border-box; }
+  body { margin:0; }
+  main { max-width:1360px; padding:28px; margin:auto; }
+  h1 { font-size:27px; margin:0 0 8px; }
+  .intro { margin:0 0 22px; color:#536979; line-height:1.7; }
+  .layout { display:grid; grid-template-columns:minmax(0, 1fr) 330px; gap:20px; align-items:start; }
+  .card { background:white; border:1px solid #dce6ee; border-radius:16px; padding:20px; }
+  .toolbar { display:flex; gap:9px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+  button, select { padding:9px 12px; border-radius:8px; border:1px solid #c6d7e4; background:#f7fafc; font:inherit; cursor:pointer; }
+  button.primary { background:#175acc; color:white; border-color:#175acc; }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline:3px solid #fab83e; outline-offset:2px; }
+  .canvas-wrap { position:relative; background:#e9edf0; border:1px solid #dce6ee; border-radius:10px; overflow:hidden; }
+  canvas { display:block; width:100%; height:auto; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:13px; margin-top:14px; color:#466073; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; }
+  .yellow { background:#f7b42b; } .green { background:#10a979; } .red { background:#ed5466; } .cyan { background:#10bdd4; }
+  .box-title { margin:0 0 12px; font-size:17px; }
+  label.control { display:block; margin:16px 0; font-size:14px; line-height:1.7; }
+  label.control input[type=range] { display:block; width:100%; accent-color:#175acc; }
+  label.check { display:block; font-size:14px; margin:12px 0; }
+  .steps { margin:18px 0; padding:0; list-style:none; }
+  .steps li { padding:8px 10px; margin:5px 0; border-radius:8px; color:#637b8c; font-size:14px; }
+  .steps li.active { background:#eaf2ff; color:#154b9e; font-weight:600; }
+  .metrics { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .metric { background:#f3f7fa; border-radius:9px; padding:10px; }
+  .metric span { display:block; color:#657b8b; font-size:12px; }
+  .metric strong { display:block; margin-top:5px; font-size:20px; font-variant-numeric:tabular-nums; }
+  #status { padding:12px; margin-top:14px; font-size:14px; border-radius:9px; background:#edf6ff; line-height:1.7; min-height:75px; }
+  .notes { margin-top:20px; display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  .notes p { font-size:14px; line-height:1.8; margin:8px 0; color:#4b6476; }
+  code { font-family:ui-monospace, monospace; font-size:13px; background:#eef3f7; padding:2px 4px; border-radius:4px; }
+  .formula { font-size:20px; padding:12px; text-align:center; background:#f2f6fb; border-radius:8px; }
+  .caption { font-size:12px; color:#6c7d89; line-height:1.7; margin:10px 0 0; }
+  @media(max-width:900px) { main {padding:14px;} .layout,.notes {grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<main>
+  <h1>蓝线循迹：逐行扫描怎样得到中线？</h1>
+  <p class="intro">图像由像素组成。先把蓝色像素标为 1，其余标为 0，再从底部向上扫描。切换“急弯”后，观察黄色扫描中点与绿色几何中心的差异。</p>
+  <div class="layout">
+    <section class="card">
+      <div class="toolbar">
+        <select id="scene" aria-label="赛道场景">
+          <option value="gentle">缓弯：逐行中点较稳定</option>
+          <option value="sharp" selected>90° 急弯：横截面中点偏移</option>
+          <option value="edge">蓝线到达画面右边缘</option>
+          <option value="gap">蓝线中间断开</option>
+        </select>
+        <button class="primary" id="play">▶ 播放扫描</button>
+        <button id="step">下一行</button>
+        <button id="finish">扫描到底</button>
+        <button id="reset">重置</button>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="canvas" width="960" height="640" aria-label="从底部向上、从上一行中点向两侧寻找蓝色边界的动态示意"></canvas>
+      </div>
+      <div class="legend">
+        <span><i class="dot yellow"></i>每行扫描中点</span>
+        <span><i class="dot green"></i>合成蓝线的几何中心</span>
+        <span><i class="dot cyan"></i>当前扫描行 / 搜索位置</span>
+        <span><i class="dot red"></i>丢线或无效结果</span>
+      </div>
+      <p class="caption">这是合成的相机图像示意，不是实车误差测量。绿色中心由生成蓝线的路径给出；在急弯横向段，同一行可能对应多个中心点。</p>
+    </section>
+    <aside class="card">
+      <h2 class="box-title">扫描控制</h2>
+      <label class="control">蓝线宽度：<b id="widthText"></b> px
+        <input id="width" type="range" min="12" max="90" value="48">
+      </label>
+      <label class="control">扫描行间隔：<b id="strideText"></b> px
+        <input id="stride" type="range" min="1" max="16" value="6">
+      </label>
+      <label class="control">动画速度
+        <input id="speed" type="range" min="1" max="10" value="6">
+      </label>
+      <label class="control">地板颜色
+        <select id="floor">
+          <option value="white">接近白色</option>
+          <option value="gray">灰色</option>
+          <option value="warm">偏黄色</option>
+          <option value="blue">蓝色干扰：分割失效</option>
+        </select>
+      </label>
+      <label class="check"><input id="binary" type="checkbox"> 显示蓝色二值掩膜（白=蓝线，黑=背景）</label>
+      <label class="check"><input id="truth" type="checkbox" checked> 显示几何中心参照</label>
+      <ol class="steps">
+        <li id="phase0">① 取上一行中点作为本行起点</li>
+        <li id="phase1">② 从起点向左右逐像素找跳变</li>
+        <li id="phase2">③ 记录左右边界，计算中点</li>
+        <li id="phase3">④ 向上一行移动，重复扫描</li>
+      </ol>
+      <div class="metrics">
+        <div class="metric"><span>当前行 y（底部较大）</span><strong id="rowValue">—</strong></div>
+        <div class="metric"><span>扫描起点 x₀</span><strong id="seedValue">—</strong></div>
+        <div class="metric"><span>左边界 L</span><strong id="leftValue">—</strong></div>
+        <div class="metric"><span>右边界 R</span><strong id="rightValue">—</strong></div>
+        <div class="metric"><span>中点 M = (L + R) / 2</span><strong id="midValue">—</strong></div>
+        <div class="metric"><span>与本行几何中心的差值</span><strong id="errorValue">—</strong></div>
+      </div>
+      <div id="status" role="status"></div>
+    </aside>
+  </div>
+  <div class="notes">
+    <section class="card">
+      <h2 class="box-title">可视化里严格采用的扫描规则</h2>
+      <p>第一行从图像中央开始；后续行从上一行的中点开始。分别向左、向右找到第一个 0/1 跳变，以相邻像素之间的位置作为边界。没有跳变时，边界取图像边缘，并标记丢线。</p>
+      <div class="formula">M(y) = [ L(y) + R(y) ] / 2</div>
+      <p>动画会保留无效中点，继续作为下一行起点，便于看到误差怎样传播。实际控制时不能把这些红色结果当作可靠的方向指令。</p>
+      <p>“上一行中点作为起点”能限制搜索范围，但只有起点落在线内、左右跳变对应同一段蓝线时，中点才有意义。起点落在白地板上时，第一次跳变可能是进入蓝线，不是离开蓝线。</p>
+    </section>
+    <section class="card">
+      <h2 class="box-title">急弯为什么偏？</h2>
+      <p>扫描得到的是“这条水平行与蓝色区域交集的中点”。急弯处，水平行可能同时穿过弯曲段和横向段；交集明显拉长，黄色中点偏向横向段。</p>
+      <p>这与沿蓝线宽度方向测量的几何中心不同。弯道越急、蓝线越宽，差异通常越明显。接近水平的段也不再能用每行唯一的 <code>x(y)</code> 来完整描述。</p>
+      <p>绿色线是本例生成图像时已知的参照，不是“已经实现的改进算法”。实际方案可以用蓝色分割 + 骨架/距离变换 + 路径连续性约束，在路径法线方向估计中线。</p>
+      <p>地板变灰或变黄时，按蓝色色相和饱和度分割通常比灰度跳变稳定；如果地板本身也呈蓝色，仅靠颜色无法分清赛道。</p>
+    </section>
+  </div>
+</main>
+<script>
+'use strict';
+const W = 960, H = 640;
+const $ = id => document.getElementById(id);
+const canvas = $('canvas'), ctx = canvas.getContext('2d');
+const source = document.createElement('canvas'); source.width=W; source.height=H;
+const sourceCtx=source.getContext('2d', {willReadFrequently:true});
+const binaryCanvas=document.createElement('canvas'); binaryCanvas.width=W; binaryCanvas.height=H;
+let mask, points=[], results=[], current=null, nextY=H-24, seed=W/2;
+let running=false, lastTime=0, holdUntil=0;
+const floors={white:'#f1f0e9',gray:'#989fa7',warm:'#ddc7a0',blue:'#3474af'};
+
+function generatePath(scene) {
+  const path=[];
+  // Begin in the middle of the image, as required by the first-row seed.
+  const x0=W/2, cy=370, radius=160, cx=x0+radius;
+  if(scene==='sharp') {
+    for(let y=H+20;y>=cy;y-=2) path.push({x:x0,y});
+    for(let i=1;i<=160;i++) {
+      const a=Math.PI+(Math.PI/2)*i/160;
+      path.push({x:cx+radius*Math.cos(a),y:cy+radius*Math.sin(a)});
+    }
+    for(let x=cx+2;x<=W-35;x+=2) path.push({x,y:cy-radius});
+  } else {
+    for(let y=H+20;y>=25;y-=2) {
+      const t=Math.max(0,(H-24-y)/(H-49));
+      const amplitude=scene==='edge'?660:220;
+      path.push({x:x0+amplitude*t*t,y});
+    }
+  }
+  return path;
+}
+
+function drawPath(context,path,color,width) {
+  context.beginPath();
+  path.forEach((p,i)=>i?context.lineTo(p.x,p.y):context.moveTo(p.x,p.y));
+  context.strokeStyle=color; context.lineWidth=width;
+  context.lineCap='round'; context.lineJoin='round'; context.stroke();
+}
+
+function isBlue(r,g,b) {
+  // HSV hue in degrees; foreground = H 185..255, S >= 0.35, V >= 0.15.
+  r/=255;g/=255;b/=255;
+  const max=Math.max(r,g,b),min=Math.min(r,g,b),delta=max-min;
+  if(max<0.15 || !delta || delta/max<0.35) return false;
+  let h;
+  if(max===r) h=60*((g-b)/delta%6);
+  else if(max===g) h=60*((b-r)/delta+2);
+  else h=60*((r-g)/delta+4);
+  if(h<0)h+=360;
+  return h>=185 && h<=255;
+}
+
+function reset() {
+  running=false; $('play').textContent='▶ 播放扫描';
+  points=generatePath($('scene').value);
+  sourceCtx.fillStyle=floors[$('floor').value];sourceCtx.fillRect(0,0,W,H);
+  drawPath(sourceCtx,points,'#176bda',Number($('width').value));
+  if($('scene').value==='gap') {
+    sourceCtx.fillStyle=floors[$('floor').value];sourceCtx.fillRect(0,365,W,44);
+  }
+  const image=sourceCtx.getImageData(0,0,W,H);
+  const binary=binaryCanvas.getContext('2d').createImageData(W,H);
+  mask=new Uint8Array(W*H);
+  for(let i=0;i<mask.length;i++) {
+    const j=i*4;
+    mask[i]=isBlue(image.data[j],image.data[j+1],image.data[j+2])?1:0;
+    binary.data[j]=binary.data[j+1]=binary.data[j+2]=mask[i]*255;
+    binary.data[j+3]=255;
+  }
+  binaryCanvas.getContext('2d').putImageData(binary,0,0);
+  results=[];current=null;seed=W/2;nextY=H-24;holdUntil=0;
+  $('widthText').textContent=$('width').value;
+  $('strideText').textContent=$('stride').value;
+  beginRow();render();
+}
+
+function references(y) {
+  const intersections=[];
+  for(let i=1;i<points.length;i++) {
+    const a=points[i-1],b=points[i];
+    if(Math.abs(a.y-b.y)<1e-7) {
+      if(Math.abs(y-a.y)<0.5) return {ambiguous:true,x:null};
+      continue;
+    }
+    if(y>=Math.min(a.y,b.y) && y<Math.max(a.y,b.y)) {
+      intersections.push(a.x+(b.x-a.x)*(y-a.y)/(b.y-a.y));
+    }
+  }
+  return {ambiguous:intersections.length>1,x:intersections.length===1?intersections[0]:null};
+}
+
+function beginRow() {
+  if(nextY<24) {current=null;running=false;$('play').textContent='▶ 播放扫描';return;}
+  const x=Math.max(0,Math.min(W-1,Math.round(seed)));
+  current={y:nextY,seed:x,left:x,right:x,L:null,R:null,leftEdge:false,rightEdge:false,
+    phase:0,startValue:mask[nextY*W+x],valid:false,mid:null,ref:references(nextY)};
+}
+
+function advancePixels(count) {
+  if(!current || current.phase>=2)return;
+  current.phase=1;
+  const c=current;
+  for(let n=0;n<count && (c.L===null || c.R===null);n++) {
+    if(c.L===null) {
+      if(c.left===0) {c.L=0;c.leftEdge=true;}
+      else {
+        const previous=c.left;c.left--;
+        if(mask[c.y*W+c.left]!==mask[c.y*W+previous]) c.L=c.left+0.5;
+      }
+    }
+    if(c.R===null) {
+      if(c.right===W-1) {c.R=W-1;c.rightEdge=true;}
+      else {
+        const previous=c.right;c.right++;
+        if(mask[c.y*W+c.right]!==mask[c.y*W+previous]) c.R=c.right-0.5;
+      }
+    }
+  }
+  if(c.L!==null && c.R!==null) {
+    c.mid=(c.L+c.R)/2;
+    c.valid=Boolean(c.startValue)&&!c.leftEdge&&!c.rightEdge;
+    c.phase=2;
+    results.push({...c});
+    seed=c.mid;
+    nextY=c.y-Number($('stride').value);
+    holdUntil=performance.now()+Math.max(60,650-Number($('speed').value)*55);
+  }
+}
+
+function stepRow() {
+  running=false;$('play').textContent='▶ 播放扫描';
+  if(current && current.phase>=2)beginRow();
+  if(current)advancePixels(W);
+  render();
+}
+
+function finishScan() {
+  running=false;$('play').textContent='▶ 播放扫描';
+  while(current) {
+    if(current.phase<2)advancePixels(W);
+    if(nextY<24)break;
+    beginRow();
+  }
+  render();
+}
+
+function circle(x,y,r,color) {
+  ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
+}
+
+function render() {
+  ctx.drawImage($('binary').checked?binaryCanvas:source,0,0);
+  if($('truth').checked)drawPath(ctx,points,'#10a979',3);
+  // Coordinate grid has origin at the upper left.
+  ctx.strokeStyle='rgba(50,65,80,.14)';ctx.lineWidth=1;
+  for(let y=40;y<H;y+=80){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  ctx.font='14px system-ui';ctx.fillStyle=$('binary').checked?'#b6c2ca':'#4e6574';
+  ctx.fillText('x →   /   y ↓   从下往上扫描',15,24);
+  for(let i=0;i<results.length;i++) {
+    const p=results[i],previous=results[i-1];
+    ctx.strokeStyle=p.valid?'#f7b42b':'#ed5466';ctx.lineWidth=3;
+    if(previous){ctx.beginPath();ctx.moveTo(previous.mid,previous.y);ctx.lineTo(p.mid,p.y);ctx.stroke();}
+    circle(p.mid,p.y,3,p.valid?'#f7b42b':'#ed5466');
+  }
+  if(current) {
+    const c=current;
+    ctx.strokeStyle='#10bdd4';ctx.lineWidth=1;ctx.setLineDash([7,5]);
+    ctx.beginPath();ctx.moveTo(0,c.y);ctx.lineTo(W,c.y);ctx.stroke();ctx.setLineDash([]);
+    ctx.strokeStyle='#10bdd4';ctx.lineWidth=4;
+    ctx.beginPath();ctx.moveTo(c.left,c.y);ctx.lineTo(c.right,c.y);ctx.stroke();
+    circle(c.seed,c.y,6,'#10bdd4');
+    circle(c.left,c.y,5,'#10bdd4');circle(c.right,c.y,5,'#10bdd4');
+    if(c.L!==null)circle(c.L,c.y,7,c.leftEdge?'#ed5466':'#b756e5');
+    if(c.R!==null)circle(c.R,c.y,7,c.rightEdge?'#ed5466':'#b756e5');
+    if(c.mid!==null)circle(c.mid,c.y,7,c.valid?'#f7b42b':'#ed5466');
+    if($('truth').checked && c.ref.x!==null && c.ref.x>=0 && c.ref.x<W) {
+      circle(c.ref.x,c.y,6,'#10a979');
+      if(c.mid!==null && c.valid){
+        ctx.strokeStyle='#ed5466';ctx.lineWidth=2;
+        ctx.beginPath();ctx.moveTo(c.ref.x,c.y-14);ctx.lineTo(c.mid,c.y-14);ctx.stroke();
+      }
+    }
+    const label=`y=${c.y}  起点=${c.seed}`;
+    ctx.font='bold 16px system-ui';
+    ctx.fillStyle='rgba(17,39,55,.85)';ctx.fillRect(12,Math.max(34,c.y-47),210,30);
+    ctx.fillStyle='white';ctx.fillText(label,20,Math.max(55,c.y-26));
+  }
+  updatePanel();
+}
+
+function updatePanel() {
+  const c=current;
+  const number=n=>n===null||n===undefined?'—':n.toFixed(1).replace(/\.0$/,'');
+  $('rowValue').textContent=c?c.y:'完成';
+  $('seedValue').textContent=c?c.seed:'—';
+  $('leftValue').textContent=c?number(c.L):'—';
+  $('rightValue').textContent=c?number(c.R):'—';
+  $('midValue').textContent=c?number(c.mid):'—';
+  $('errorValue').textContent=c&&c.valid&&c.mid!==null&&c.ref.x!==null?
+    `${(c.mid-c.ref.x).toFixed(1)} px`:'—';
+  for(let i=0;i<4;i++)$('phase'+i).classList.toggle('active',Boolean(c)&&c.phase===i);
+  if(!c){$('status').textContent='扫描完成。点击重置可从底部重新播放。';return;}
+  if(c.phase<2) {
+    $('status').textContent=c.startValue?
+      '起点位于蓝线内：寻找左右两侧第一次 1→0 跳变。':
+      '起点位于背景：继续演示原扫描法，但找到的第一次跳变不保证属于同一段蓝线。';
+  } else if(!c.valid) {
+    const reason=[];
+    if(!c.startValue)reason.push('扫描起点不在蓝线内');
+    if(c.leftEdge||c.rightEdge)reason.push('至少一侧扫到画面边缘仍无跳变');
+    $('status').textContent='丢线 / 无效：'+reason.join('；')+'。红色中点仍被传给上一行，演示误差传播。';
+  } else if(c.ref.ambiguous || c.ref.x===null) {
+    $('status').textContent='找到了蓝色区域的左右边界，但该行没有唯一的路径中心交点。横向段无法用“每行一个中点”完整表示。';
+  } else {
+    const error=Math.abs(c.mid-c.ref.x);
+    $('status').textContent=error>Number($('width').value)*0.18?
+      '边界搜索有效，但中点明显偏移：水平截面穿过弯曲/横向段，黄色中点不等于绿色几何中心。':
+      '本行扫描有效。黄色中点将成为上一行的搜索起点。';
+  }
+}
+
+function animate(now) {
+  const dt=lastTime?Math.min(50,now-lastTime):16;lastTime=now;
+  if(running) {
+    if(!current)beginRow();
+    if(current && current.phase>=2) {
+      if(now>=holdUntil){current.phase=3;render();beginRow();}
+    } else if(current) {
+      advancePixels(Math.max(1,Math.round(dt*(0.1+Number($('speed').value)*0.25))));
+    }
+    render();
+  }
+  requestAnimationFrame(animate);
+}
+
+$('play').addEventListener('click',()=>{
+  if(!current || (current.phase>=2 && nextY<24))reset();
+  running=!running;$('play').textContent=running?'Ⅱ 暂停':'▶ 播放扫描';
+});
+$('step').addEventListener('click',stepRow);
+$('finish').addEventListener('click',finishScan);
+$('reset').addEventListener('click',reset);
+for(const id of ['scene','width','stride','floor'])$(id).addEventListener('change',reset);
+for(const id of ['binary','truth'])$(id).addEventListener('change',render);
+$('width').addEventListener('input',()=>$('widthText').textContent=$('width').value);
+$('stride').addEventListener('input',()=>$('strideText').textContent=$('stride').value);
+reset();requestAnimationFrame(animate);
+// Reproducible paused view of the corner, also usable as a shareable local URL.
+if(globalThis.location && location.hash==='#bend') {
+  while(current && current.y>=232) {
+    stepRow();
+    if(current.y===232)break;
+  }
+}
+</script>
+</body>
+</html>

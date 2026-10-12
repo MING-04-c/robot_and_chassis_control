@@ -1,0 +1,13 @@
+/**:
+  ros__parameters:
+    video_device: "/dev/video0"
+    pixel_format: "MJPG"     # MJPG / YUYV / UYVY
+    image_width: 640
+    image_height: 480
+    framerate: 20            # 整数；最终帧率由摄像头协商决定
+    frame_id: "camera_optical_frame"
+    camera_name: "usb_camera"
+    camera_info_url: ""     # 如 file:///absolute/path/calibration.yaml
+    publish_raw: true       # 发布 bgr8；仅需 MJPEG 压缩帧时设为 false
+    publish_compressed: true
+    jpeg_quality: 85        # 只影响 YUYV/UYVY 转 JPEG，MJPG 原样传输

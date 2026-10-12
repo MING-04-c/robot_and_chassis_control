@@ -1,0 +1,50 @@
+/**:
+  ros__parameters:
+    input_topic: "image_raw"  # 默认命名空间 /camera -> /camera/image_raw
+    frame_timeout_sec: 0.5
+    processing_width: 640     # 按比例缩小，不放大；以下像素参数均基于处理图
+    hue_low: 100              # OpenCV H 范围 0..179，不是 0..360 度
+    hue_high: 130
+    saturation_min: 70        # 灰色背景不应成为强蓝色种子
+    value_min: 18
+    illumination_support: true # 弱蓝色仅在连通区域含足够强蓝色像素时接纳
+    weak_saturation_min: 12
+    weak_value_min: 8
+    weak_seed_pixels: 20
+    blue_excess_min: 0.025    # (2B-G-R)/(B+G+R+1)，避免把白色地板当淡蓝色
+    strong_blue_excess_min: 0.12 # 强蓝色同样需要 B 相对 R/G 的优势
+    weak_support_distance: 6 # 弱蓝候选最多距强蓝种子 6px，禁止向整片背景扩张
+    blur_type: "median"       # median / gaussian / none
+    blur_kernel: 5            # 默认 5x5 中值加强去噪；细线可调 3，1=关闭
+    open_kernel: 3            # 删除细碎毛刺；极细胶带可改回 1
+    close_kernel: 3           # 补小孔/小断裂；1=关闭，过大可能连错线
+    min_component_area: 50    # 删除面积小于此值的连通区域；0=关闭
+    roi_top: 0.0              # 默认全图找线，允许胶带仅在上方/中间可见
+    roi_bottom: 1.0
+    row_step: 6
+    min_line_width: 4
+    max_width_fraction: 0.45  # 过宽横截面标无效，不把急弯/交叉口当普通中线
+    max_center_jump: 50       # 相邻有效行中点最大跳变像素
+    allow_reacquire: true     # 起点在线外时，局部寻找最近蓝像素
+    search_radius: 80
+    initial_search_radius: 640 # 默认覆盖整幅处理图，胶带不必在中间
+    require_bottom_anchor: false # 局部可见即可测偏移；实车控制可额外要求底部连接
+    bottom_anchor_tolerance_rows: 3 # 底部短暂阴影允许从紧邻的几行建立锚点
+    max_missing_rows: 4       # 连续缺失超过此行数后停止向上续接
+    min_valid_rows: 4
+    min_line_aspect: 2.0      # 旋转包围框长度 / 内部厚度，支持斜向和横向胶带
+    min_row_fill: 0.75        # 每行左右边界之间至少 75% 像素属于同一候选
+    min_row_coverage: 0.65    # 候选上下范围内至少 65% 的采样行满足线宽和填充要求
+    max_shape_center_step: 2.0 # 中线跳变 / (平均局部线宽 + 行距) 的上限
+    min_core_fraction: 0.45   # 有实心内部的像素比例，拒绝薄网状/毛刺噪声
+    max_width_spread: 2.5     # 逐行宽度 90%/10% 分位数比，拒绝异常忽宽忽窄
+    max_occlusion_gap: 72    # 硬上限；实际限制按局部线宽×1.5自适应，至少3个行距；0=关闭
+    max_occlusion_offset: 12.0 # 遮挡两端方向/横向对齐容差像素，避免接错线
+    use_occlusion_edges: true # Canny 跨越胶带宽度的非蓝边缘，辅助报告“疑似遮挡”
+    max_blue_fraction: 0.65   # ROI 大面积呈蓝色时标 BLUE_INTERFERENCE
+    lookahead_ratio: 0.60     # 从 ROI 底部往上 60% 处取目标点
+    show_canny: true          # 显示 Canny；橙色标出参与疑似遮挡判定的边缘
+    canny_low: 50
+    canny_high: 150
+    canny_auto_threshold: true # 按 ROI 灰度中位数估计阈值，只用于边缘诊断
+    canny_sigma: 0.33

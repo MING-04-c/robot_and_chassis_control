@@ -1,0 +1,26 @@
+line_follow_controller:
+  ros__parameters:
+    enabled: true                    # 有效蓝线和底盘反馈到齐后开始循迹
+    forward_speed: 0.05               # m/s：0.05 = 5 cm/s，可在线调整
+    max_forward_speed: 0.30           # 前进速度参数上限，m/s
+    steering_gain: 0.8                # 归一化图像偏差 -> rad/s
+    steering_sign: -1.0               # 正偏差在画面右侧 -> 右转；镜像相机可改 +1.0
+    max_angular_speed: 0.5            # rad/s，约 28.6 度/秒
+    error_deadband: 0.02              # 图像归一化偏差死区
+    curve_slowdown: 0.7               # 偏差越大，前进越慢
+    min_speed_factor: 0.3
+    estimated_speed_factor: 0.3       # 估计目标/疑似遮挡时再减速
+    fallback_speed_factor: 0.5        # 前瞻目标回退时再减速
+    linear_acceleration: 0.15         # m/s²；丢线时立即发零，不使用缓降
+    angular_acceleration: 1.0         # rad/s²
+    min_valid_row_fraction: 0.2       # 有效扫描行比例，不是安全置信度
+    require_bottom_connected: true   # 要求胶带与画面底部连接，可在线调整
+    input_timeout_sec: 0.5            # 视觉/底盘状态超时即停车
+    comm_timeout_sec: 2.5             # 通信状态默认约 1 Hz
+    control_period_sec: 0.02          # 50 Hz 发布 cmd_vel
+    reacquire_frames: 3               # 重新找到线后连续 3 帧有效才恢复
+    line_status_topic: /camera/line/status
+    centerline_topic: /camera/line/centerline
+    comm_status_topic: /masc_chassis/comm_status
+    chassis_status_topic: /masc_chassis/chassis_status
+    cmd_vel_topic: /cmd_vel

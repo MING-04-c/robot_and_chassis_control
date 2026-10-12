@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>elite_cs_series_sdk</name>
+  <version>1.3.0</version>
+  <description>Elite Robots CS Series SDK (C++ library for Elibot CS series robotic arms).</description>
+
+  <maintainer email="dukang@elibot.cn">Elite Robots</maintainer>
+  <maintainer email="yanxiaojia@elibot.cn">Elite Robots</maintainer>
+  <author>dukang</author>
+  <author>yanxiaojia</author>
+
+  <license file="LICENSE">MIT</license>
+
+  <url type="website">https://www.eliterobots.com/</url>
+  <url type="repository">https://github.com/Elite-Robots/Elite_Robots_CS_SDK</url>
+  <url type="bugtracker">https://github.com/Elite-Robots/Elite_Robots_CS_SDK/issues</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- System dependencies (via rosdep) -->
+  <depend>boost</depend>
+  <depend>libssh-dev</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

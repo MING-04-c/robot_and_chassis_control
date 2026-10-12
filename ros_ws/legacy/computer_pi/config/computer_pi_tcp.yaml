@@ -1,0 +1,20 @@
+computer_pi_tcp_node:
+  ros__parameters:
+    # Raspberry Pi listens as a TCP server; this computer connects as a client.
+    mode: client
+    host: 169.254.199.100
+    port: 9001
+
+    # Text messages are separated by LF. Set both values to false for raw binary streams.
+    line_mode: true
+    append_newline: true
+    reconnect_period: 2.0
+
+    # Dedicated ROS interfaces prevent data from mixing with other TCP devices.
+    text_topic: /computer_pi/rx
+    bytes_topic: /computer_pi/rx_bytes
+    write_service: /computer_pi/write
+    send_file_service: /computer_pi/send_file
+    tx_string_topic: /computer_pi/tx
+    tx_float_topic: /computer_pi/tx_float
+    tx_int_topic: /computer_pi/tx_int

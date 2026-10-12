@@ -1,0 +1,66 @@
+serial_node:
+  ros__parameters:
+    # ============================================================================
+    # 1. 串口设备和线路参数
+    # ============================================================================
+    # 串口设备路径，也可以使用 /dev/serial/by-id/... 这种稳定路径。
+    device: /dev/ttyUSB0
+
+    # 波特率，必须和外部设备设置完全一致。
+    baudrate: 115200
+
+    # 串口线路格式，默认是 8N1：8 数据位、1 停止位、无校验。
+    # data_bits 可选 5、6、7、8；stop_bits 可选 1、2。
+    data_bits: 8
+    stop_bits: 1
+    # parity 可选 none、odd、even。
+    parity: none
+    # flow_control 可选 none、software、hardware。
+    # none=无流控，software=XON/XOFF，hardware=RTS/CTS。
+    flow_control: none
+
+    # ============================================================================
+    # 2. 收发数据格式
+    # ============================================================================
+    # 发送格式，应用于 /serial/write、/serial/tx、/serial/tx_float、/serial/tx_int。
+    # text/ascii=按普通文本发送，例如 .d0<:>。
+    # hex=按十六进制字节发送，例如 2E 64 30 3C 3A 3E。
+    tx_format: text
+
+    # 接收显示格式，只影响 /serial/rx。
+    # text/ascii=按文本显示，hex=按十六进制显示。
+    # /serial/rx_bytes 始终发布真实字节，不受此项影响。
+    rx_format: text
+
+    # true=收到换行符才发布一帧；false=收到数据块就立即发布。
+    # 不带换行或二进制设备通常设为 false。
+    line_mode: true
+
+    # 是否发布 /serial/rx 文本话题。
+    publish_text: true
+
+    # 是否自动追加换行：文本模式追加 '\n'，HEX 模式追加字节 0A。
+    # 设备要求严格发送固定字节时设为 false。
+    append_newline: true
+
+    # ============================================================================
+    # 3. ROS 话题和服务名称
+    # ============================================================================
+    text_topic: /serial/rx
+    bytes_topic: /serial/rx_bytes
+    write_service: /serial/write
+    send_file_service: /serial/send_file
+    tx_string_topic: /serial/tx
+    tx_float_topic: /serial/tx_float
+    tx_int_topic: /serial/tx_int
+
+    # ============================================================================
+    # 4. 可选：将接收文本解析成力/力矩
+    # ============================================================================
+    # 外部设备每行发送 Fx Fy Fz Tx Ty Tz 六个数时才开启。
+    publish_wrench: false
+    wrench_topic: /serial/wrench
+    wrench_frame_id: base_link
+
+    # 串口断开或设备未插入时，按此周期重试打开，单位：秒。
+    reconnect_period: 2.0

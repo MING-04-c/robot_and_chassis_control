@@ -1,0 +1,55 @@
+# 探测器专用配置。真实串口与模拟设备使用相同的 ROS 接口。
+
+serial_node:
+  ros__parameters:
+    # 串口线路参数，必须和探测器设置一致。
+    device: /dev/ttyCH341USB0
+    baudrate: 115200
+    data_bits: 8
+    stop_bits: 1
+    parity: none
+    flow_control: none
+
+    # 返回帧不保证带换行，先按数据块接收，再由 detactor_node 按头尾组帧。
+    line_mode: false
+    publish_text: true
+    tx_format: text
+    rx_format: text
+    append_newline: false
+    reconnect_period: 2.0
+
+    # 探测器专用 ROS 接口，统一放在 /detactor 下，避免和其他串口串台。
+    text_topic: /detactor/rx
+    bytes_topic: /detactor/rx_bytes
+    write_service: /detactor/write
+    send_file_service: /detactor/send_file
+    tx_string_topic: /detactor/tx
+    tx_float_topic: /detactor/tx_float
+    tx_int_topic: /detactor/tx_int
+    publish_wrench: false
+
+detactor_node:
+  ros__parameters:
+    # 触发一次采集时发给探测器的命令。
+    request_command: .d0<:>
+    # 完整返回帧的开始和结束标记。
+    frame_start: .e
+    frame_end: <:>
+    # 当前滚动窗口取整帧最后 10 个数。
+    latest_window_size: 10
+
+    # 自动采集：true 且 request_period 大于 0 时周期发送采集命令。
+    auto_request: true
+    request_period: 1.0
+
+    # 保存目录：启动后使用此目录。latest.txt 保存当前最新 10 个数，测量文件滚动保存。
+    data_directory: device/detactor/data
+
+    # 设备节点接口。
+    rx_topic: /detactor/rx
+    frame_topic: /detactor/frame
+    latest_topic: /detactor/latest
+    latest_values_topic: /detactor/latest_values
+    write_service: /detactor/write
+    trigger_topic: /detactor/acquire_trigger
+    trigger_service: /detactor/acquire

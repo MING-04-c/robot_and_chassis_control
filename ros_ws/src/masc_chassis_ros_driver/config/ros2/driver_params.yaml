@@ -1,0 +1,62 @@
+/**:
+  ros__parameters:
+    # CAN 参数：SDK 使用已经由 Linux 配置好的 can0，不会替系统执行 ip link。
+    can:
+      interface_name: can0
+      bitrate: 500000
+      expected_protocol_version: 10
+      connect_timeout_ms: 1000
+      auto_reconnect: true
+      reconnect_period_ms: 1000
+
+    # 速度命令周期、超时和最大速度限制。
+    command:
+      period_ms: 20
+      timeout_ms: 100
+      stamped_control: false
+      max_linear_x: 1.5
+      max_linear_y: 1.0
+      max_angular_z: 2.0
+      max_steering_angle: 2.0
+
+    # 停稳自动驻车和收到新命令后的自动解锁策略。
+    auto_lock:
+      enabled: true
+      delay_ms: 3000
+      cmd_filter_alpha: 0.2
+      cmd_zero_linear_threshold: 0.01
+      cmd_zero_angular_threshold: 0.01
+      feedback_linear_stop_threshold: 0.02
+      feedback_angular_stop_threshold: 0.02
+      auto_unlock_on_cmd: true
+
+    # 里程计坐标系、TF 开关和速度比例修正。
+    odom:
+      frame_id: odom
+      child_frame_id: base_link
+      publish_tf: false
+      linear_scale: 1.0
+      angular_scale: 1.0
+
+    imu:
+      frame_id: imu_link
+
+    # ROS 定时器最高检查频率；反馈 topic 仍受 CAN 实际频率限制。
+    publish_rate:
+      odom_hz: 100.0
+      chassis_status_hz: 10.0
+      motor_hz: 50.0
+      motor_status_hz: 10.0
+      imu_hz: 50.0
+      rc_hz: 20.0
+      bms_hz: 1.0
+      comm_hz: 1.0
+      frame_stats_hz: 1.0
+
+    # 各类 CAN 反馈的数据有效期，超过后按超时处理。
+    freshness:
+      motion_feedback_timeout_ms: 200
+      system_feedback_timeout_ms: 500
+      bms_feedback_timeout_ms: 2500
+      imu_feedback_timeout_ms: 100
+      rc_feedback_timeout_ms: 250
