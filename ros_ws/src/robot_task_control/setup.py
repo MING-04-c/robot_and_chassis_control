@@ -12,6 +12,7 @@ setup(
         ("share/" + package_name, ["package.xml", "README.md"]),
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
         ("share/" + package_name + "/config", glob("config/*.yaml")),
+        ("share/" + package_name + "/rviz", glob("rviz/*.rviz")),
         ("share/" + package_name + "/tools", glob("tools/*.py")),
     ],
     install_requires=["setuptools"],
@@ -25,6 +26,7 @@ setup(
             "hk_image_transfer = robot_task_control.hk_image_transfer:main",
             "velocity_mux = robot_task_control.velocity_mux:main",
             "task_controller = robot_task_control.workflow_controller:main",
+            "virtual_detection_task = robot_task_control.virtual_detection_task:main",
         ],
     },
 )

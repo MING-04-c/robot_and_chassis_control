@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro">
+  <!-- 共用末端装配；固定在 tool0，保留用户模型的原始尺寸和安装变换。 -->
+  <xacro:macro name="cs_terminal" params="
+    tf_prefix
+    mesh_base:=package://eli_cs_robot_description/meshes/terminal
+    x:=0.0 y:=0.0 z:=0.0
+    roll:=0.0 pitch:=0.0 yaw:=-1.5707963267948966">
+    <link name="${tf_prefix}terminal_base_link">
+      <visual>
+        <geometry><mesh filename="${mesh_base}/base_link.stl"/></geometry>
+      </visual>
+      <collision>
+        <geometry><mesh filename="${mesh_base}/base_link.stl"/></geometry>
+      </collision>
+    </link>
+    <link name="${tf_prefix}terminal_link_1">
+      <visual><geometry><mesh filename="${mesh_base}/Link_1.stl"/></geometry></visual>
+      <collision><geometry><mesh filename="${mesh_base}/Link_1.stl"/></geometry></collision>
+    </link>
+    <link name="${tf_prefix}terminal_link_2">
+      <visual><geometry><mesh filename="${mesh_base}/Link_2.stl"/></geometry></visual>
+      <collision><geometry><mesh filename="${mesh_base}/Link_2.stl"/></geometry></collision>
+    </link>
+    <joint name="${tf_prefix}tool0-terminal_base_fixed" type="fixed">
+      <parent link="${tf_prefix}tool0"/>
+      <child link="${tf_prefix}terminal_base_link"/>
+      <origin xyz="${x} ${y} ${z}"
+              rpy="${roll} ${pitch} ${yaw}"/>
+    </joint>
+    <!-- Joint_1：相机安装坐标；实测光学外参由相机标定包管理。 -->
+    <joint name="${tf_prefix}terminal_joint_1" type="fixed">
+      <parent link="${tf_prefix}terminal_base_link"/>
+      <child link="${tf_prefix}terminal_link_1"/>
+      <origin xyz="0.05748778 -0.02920351 0.0569" rpy="0 0 0.78539816"/>
+    </joint>
+    <!-- Joint_2：漆膜厚度探头检测点，规划目标需换算回 tool0。 -->
+    <joint name="${tf_prefix}terminal_joint_2" type="fixed">
+      <parent link="${tf_prefix}terminal_base_link"/>
+      <child link="${tf_prefix}terminal_link_2"/>
+      <origin xyz="0 0 0.149" rpy="0 0 0"/>
+    </joint>
+
+  </xacro:macro>
+</robot>

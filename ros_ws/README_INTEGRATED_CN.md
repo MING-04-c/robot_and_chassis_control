@@ -39,4 +39,27 @@ python3 src/robot_task_control/test/test_arm_jazzy_startup.py
 
 检查在独立 ROS 域内使用 mock 硬件，确认四个必要控制器激活、OMPL 初始化和 MoveIt IK 服务可用，不发送运动命令；不代替真机联调。
 
-海康末端相机的 ROS 2 实时内参标定与 AprilTag 测距界面见 [camer_calibration](src/camer_calibration/README.md)，入口为 `ros2 launch camer_calibration hk_tag_view.launch.py`，也支持读取 MVS 本地照片；不需要启动机器人任务。USB 循迹包现名为 `ruier_camer_diver`。
+
+## 新末端模型同步
+
+当前六轴默认模型入口仍为 `eli_cs_robot_description/urdf/cs.urdf.xacro`，已包含新增的三件末端装配。真机驱动、MoveIt、导纳、联合任务及六轴模型预览/仿真继续共用该入口，无需修改原来的启动命令。
+
+- 末端几何和固定安装关系：`eli_cs_robot_description/urdf/cs_macro_terminal.xacro`，仅定义末端，不复制机械臂运动链。
+- STL：`eli_cs_robot_description/meshes/terminal/`，由本次 `robot/meshes/` 同步而来；后续正式部署维护这一份包内资源即可。构建、安装与运行不再依赖包外 `../../../robot` 路径。
+- 默认装配到 `tool0`，平移为零，绕 Z 轴旋转 -90°，沿用用户模型；两条内部固定关节的位置和方向也保持原值。
+- SRDF 仅排除同一刚性末端内部及其腕部安装面的碰撞，其余机械臂与新末端的碰撞检查保持启用。
+- 当前 TCP 继续使用 `tool0`。添加可视/碰撞几何不会自动改变示教器的 TCP、负载或质心；新工具实际接触点和负载参数需按实物确定，不能由 STL 外形推断。
+
+原 `robot/cs_with_terminal.urdf.xacro` 预览入口已转到同一份描述，避免预览和真机各维护一套模型。`robot/robot.urdf` 和原 CAD 网格保留作为原始资料。五轴机器人使用独立模型，未套用这套六轴装配。
+
+旧海康标定包 `src/camer_calibration/` 已清空，原标定包的生成物也已移除。新的深度相机入口为 [geminipro_camer_calibration](src/geminipro_camer_calibration/README.md)，驱动在 `src/gemini_pro_ros2/`。在 `ros_ws` 构建并加载环境后，运行 `ros2 launch geminipro_camer_calibration gemini_pro_view.launch.py`，打开 RGB、对齐深度、实时帧率和拍照/棋盘格标定窗口。当前参数来自深度相机自身，不沿用海康内参；相机到机器人末端的外参尚未标定。
+
+深度相机按需拍照已增加主机 V5.4 格式适配：从同一 SDK FrameSet 保存原始深度、现场比例和同会话参数，文件名及校验结构兼容主机；树莓派仍运行 ROS 2 和随驱动提供的 ARM64 C++ SDK。详见相机包说明。
+
+## 相机外参与测厚接触流程
+
+`terminal_joint_1` 是相机安装坐标，`terminal_joint_2` 是测厚探头检测点；机器人控制点仍为 `tool0`。
+`geminipro_camer_calibration` 根据观测时刻的模型 TF 转换单个或整组检测点，输出基座目标和补偿探头偏移后的 tool0 目标。
+`detect_control` 保存整组基座检测点并只记录一次原位；按顺序逐点规划接近、20 N 停止、保持 5 秒、撤离，每点测完均返回同一原位，再开始下一点。
+完整配置和接口见 `src/detect_control/README.md`；默认只启动任务接口，收到 start 服务才运行。
+默认以相机 joint（terminal_link_1）为检测坐标原点，通过模型 TF 换算触碰位置，不要求先做手眼标定；检测坐标必须与该 joint 的原点和轴向一致。光学坐标与 joint 不一致时需额外提供二者变换。

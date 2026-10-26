@@ -5,9 +5,10 @@
   <xacro:arg name="name" default="cs"/>
   <!-- parameters -->
   <xacro:arg name="prefix" default="" />
+  <xacro:arg name="attach_terminal" default="true"/>
 
   <xacro:include filename="$(find eli_cs_robot_moveit_config)/srdf/cs_macro.srdf.xacro"/>
 
-  <xacro:cs_srdf name="$(arg name)" prefix="$(arg prefix)"/>
+  <xacro:cs_srdf name="$(arg name)" prefix="$(arg prefix)" attach_terminal="$(arg attach_terminal)"/>
 
 </robot>

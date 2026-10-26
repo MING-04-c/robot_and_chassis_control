@@ -14,6 +14,7 @@ find_package(std_srvs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/WriteSerial.srv"
+  "srv/SetSensorUnit.srv"
   "srv/SendFile.srv"
 )
 
@@ -33,7 +34,10 @@ target_compile_features(detactor_node PUBLIC cxx_std_17)
 ament_target_dependencies(detactor_node rclcpp std_msgs std_srvs)
 target_link_libraries(detactor_node "${cpp_typesupport_target}")
 
-add_executable(sensor_node device/sensor/src/sensor_node.cpp)
+add_executable(sensor_node
+  device/sensor/src/sensor_node.cpp
+  device/sensor/src/unit_calibration.cpp
+)
 target_compile_features(sensor_node PUBLIC cxx_std_17)
 ament_target_dependencies(sensor_node rclcpp std_msgs geometry_msgs std_srvs)
 target_link_libraries(sensor_node "${cpp_typesupport_target}")

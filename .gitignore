@@ -8,8 +8,3 @@ install/
 # Python runtime caches
 __pycache__/
 *.py[cod]
-
-# Local camera calibration data
-ros_ws/src/camer_calibration/photos/
-ros_ws/src/camer_calibration/validation/
-ros_ws/src/camer_calibration/results*/

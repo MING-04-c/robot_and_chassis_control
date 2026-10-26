@@ -1,0 +1,38 @@
+detect_controller:
+  ros__parameters:
+    base_frame: base_link
+    tool_frame: tool0
+    probe_frame: terminal_link_2
+    planning_group: cs_manipulator
+    target_topic: /geminipro_calibration/target_base
+    targets_topic: /geminipro_calibration/targets_base
+    targets_file: ~/.ros/detect_control/targets.yaml  # 原子保存已转换到基座的整组检测点
+    max_targets: 100
+    home_joint_tolerance: 0.01        # rad，逐点返回后的原位校验
+    admittance_namespace: /admittance_controller
+    raw_wrench_topic: /sensor/wrench
+    # fixed：使用下方基座坐标目标；camera：接收相机转换后的目标。
+    target_source: camera
+    # 以下固定目标仅为格式示例，必须先改成现场目标；位置是探头检测点而非 tool0。
+    fixed_position: [0.4, 0.0, 0.3]
+    fixed_quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]
+    contact_force: 20.0              # N，用户指定；abs(base_link Fz)
+    overload_force: 40.0             # N，合力保护；示例值
+    initial_force_limit: 5.0         # N，启动时探头应处于未接触状态
+    hold_seconds: 5.0
+    approach_clearance: 0.02         # m，从目标上方 20 mm 开始直线接近
+    max_penetration: 0.005           # m，名义目标下方的实际位置保护余量；到目标后不再主动下探
+    approach_speed: 0.002            # m/s，示例低速 2 mm/s
+    max_tracking_error: 0.005        # m，目标与实际 tool0 跟踪误差上限
+    lateral_tolerance: 0.002         # m，垂直接近时 XY 偏移上限
+    orientation_tolerance_deg: 1.0   # 度；目标到位及下探姿态偏差上限
+    pose_tolerance: 0.003            # m
+    data_timeout: 0.3                # s，关节/原始力/滤波力数据新鲜度
+    target_max_age: 30.0             # s，相机目标观测后允许启动的最长间隔
+    phase_timeout: 60.0              # s，规划/执行/接近各阶段超时
+    service_timeout: 5.0
+    rate: 20.0
+    velocity_scaling: 0.1
+    acceleration_scaling: 0.1
+    workspace_min: [-1.0, -1.0, 0.0]  # m，示例边界，需按现场调整
+    workspace_max: [1.0, 1.0, 1.5]

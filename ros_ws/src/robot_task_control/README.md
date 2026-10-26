@@ -139,7 +139,7 @@ colcon test-result --verbose
 
 `arm_admittance_line_follow.launch.py` 同样默认自动开始并检查机械臂就绪：当前位置导纳保持 2 秒后，AGV 以默认 0.05 m/s 沿 USB 相机识别的蓝线累计有效循迹 2 秒，然后停车；机械臂导纳仍保持开启。无需海康相机或照片接收主机。启动这个联合入口前退出单独的机械臂驱动、导纳和底盘测试会话，避免重复运行节点；`auto_start:=false` 可恢复手动开始。
 
-联合/机械臂整套启动现在分阶段加载：先启动驱动，确认外控运行且四个必要控制器连续正常 10 秒后，再启动 MoveIt、力传感器、导纳、USB 循迹相机和工作流。等待期间状态异常会重新计时；120 秒内无法稳定就取消控制部分启动。用 `arm_control_start_delay:=15.0` 可将稳定等待改为 15 秒，`0.0` 可关闭分阶段等待。此参数不改变导纳到位后保持 2 秒和 AGV 有效循迹 2 秒的任务配置。复用已启动的驱动/导纳时不再重复等待或加载这些节点。
+联合/机械臂整套启动现在分阶段加载：先启动驱动，确认外控运行且四个必要控制器连续正常 5 秒后，再启动 MoveIt、力传感器、导纳、USB 循迹相机和工作流。等待期间状态异常会重新计时；120 秒内无法稳定就取消控制部分启动。用 `arm_control_start_delay:=15.0` 可将稳定等待改为 15 秒，`0.0` 可关闭分阶段等待。此参数不改变导纳到位后保持 2 秒和 AGV 有效循迹 2 秒的任务配置。复用已启动的驱动/导纳时不再重复等待或加载这些节点。
 
 联合入口的任务分为“设备准备检查”和“动作执行”两阶段。分批加载仍属于设备准备阶段：导纳输出和循迹输出保持关闭，速度选择器也保持禁用。任务控制器确认机械臂外控、四个必要控制器、TCP TF、导纳节点和零偏后的新鲜力数据就绪，并通过 `/line_follow_controller/ready` 确认底盘 CAN/状态、图像时间戳、连续蓝线识别与近端循迹几何有效。该检查不会开启循迹或发出运动命令。全部连续就绪 1 秒后打印 `All required devices ready; starting workflow`，再自动执行导纳保持和 AGV 移动；无需另开终端调用开始服务。
 
@@ -196,3 +196,79 @@ ros2 launch robot_task_control keyboard_teleop.launch.py \
 等待 `KEYBOARD READY` 后：W/S 前后，A/D 左右横移，Q/E 原地转向，Z/C 后退转弯，空格/X 停车，+/- 调速，Ctrl+C 停车并退出。默认 0.35 秒无移动按键即输出零速度；终端长按依赖系统按键连发。已有独立底盘驱动可加 `start_driver:=false`，保持只有一个运动控制源。
 
 新版拖车会话工具也保留在 `masc_chassis_user_control` 中，使用方法见该包 README。本次更新记录见 `ros_ws/docs/chassis/INTEGRATION_20261014.md`。
+
+## 单点检测到达测试
+
+新增 `detection_test.launch.py` 与 `config/detection_test.yaml`，不用相机先测试后面的到达流程：
+
+```
+驱动/模型/MoveIt/导纳就绪 → 自动记录当前六轴原位
+→ 虚拟机械臂探头下方 30 mm 生成检测点并保存（真机使用下文固定坐标）
+→ MoveIt 到目标上方 3 mm → 基座 −Z 导纳接近
+→ 20 N 停止 → 保持 5 秒 → +Z 撤离 → 回同一原位
+```
+
+默认启动 mock 机械臂、MoveIt、导纳、检测控制器和测试节点，并打开 RViz。自动在独立 ROS 域 **186** 运行，不使用当前真机控制域。核实硬件插件是 `mock_components/GenericSystem` 后才发布模拟力；探头到虚拟面时注入 21 N，验证 20 N 停止分支，不代表真实物理接触。
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/project/robot_and_chassis_control/ros_ws/install/setup.bash
+ros2 launch robot_task_control detection_test.launch.py
+```
+
+无界面可加 `launch_rviz:=false`。完成日志显示 `DETECTION TEST PASS`，界面/控制器保留供查看，Ctrl+C 退出。观察状态：
+
+```bash
+ROS_DOMAIN_ID=186 ros2 topic echo /detect_controller/status
+ROS_DOMAIN_ID=186 ros2 topic echo /virtual_detection_task/status
+```
+
+真机模式默认将驱动启动纳入任务，无需另开终端启动驱动。先退出之前的检测测试；若已有真机驱动/控制系统，使用下文的复用开关，避免重复启动：
+
+```bash
+ros2 launch robot_task_control detection_test.launch.py simulation:=false
+```
+
+**该命令会在系统就绪后自动开始真机测试。** 此模式继承当前 ROS 域。启动顺序为机械臂驱动（默认 `headless_mode:=true`）→ 全部启动控制器加载完成且外控连接连续稳定 5 秒 → MoveIt、力传感器、导纳及检测界面 → 检测任务确认硬件、控制器和实时数据可用 → 执行检测。5 秒从驱动就绪后开始计时；中途外控停止或控制器异常会重新计时，120 秒未就绪则取消启动。检测任务还会检查外控运行状态，断开时取消任务。默认机器人 IP 为 `169.254.199.150`，力传感器为 `169.254.199.80:9001`，可用 `robot_ip:=... local_ip:=... sensor_host:=... sensor_port:=...` 修改。真机不发布模拟力。按本轮确认，两个位置都在 base_link 中，单位米，并均指 tool0：
+
+- 初始 tool0：`[-0.4, 0.1, 0.4]`，先由 MoveIt 规划到位，保持启动时朝向，再记录实际六轴原位。
+- 检测 tool0：`[-0.3, 0.1, 0.177]`，MoveIt 先到该目标上方 3 mm，再沿基座 −Z 导纳接近。
+- 到检测目标后固定目标并持续阻抗控制，不再主动下探；接近或保持期间真实接触达到 20 N 后停止并保持 5 秒，撤离并返回上述初始点对应的关节原位。未达到 20 N 时持续柔顺等待，不自动宣布检测完成。
+
+启动组件可按需组合（仅作用于真机模式）：
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `start_arm_driver` | `true` | 启动机械臂驱动；设为 false 复用已连接驱动 |
+| `start_arm_control` | `true` | 启动 MoveIt、导纳与可选力传感器；设为 false 复用整个控制系统 |
+| `launch_force_sensor` | `true` | 随控制部分启动力传感器；已有传感器驱动时设为 false |
+| `arm_control_start_delay` | `5.0` | 驱动就绪后连续稳定等待秒数 |
+| `launch_rviz` | `true` | 打开检测专用实时模型窗口 |
+
+只复用机械臂驱动，其余由任务启动：
+
+```bash
+ros2 launch robot_task_control detection_test.launch.py simulation:=false start_arm_driver:=false
+```
+
+复用完整真机控制系统（恢复之前的启动方式）：
+
+```bash
+ros2 launch robot_task_control detection_test.launch.py simulation:=false start_arm_driver:=false start_arm_control:=false
+```
+
+力传感器安装参数仍可通过 `sensor_x/y/z`、`sensor_roll/pitch/yaw` 和 `sensor_config_file` 传入；姿态为弧度。导纳由检测状态机在接近阶段自动启用，无需手动调用服务。本测试不启动底盘、相机或 CAN 配置脚本。
+
+YAML 的 `real_target_frame: tool0` 表示本次按 tool0 检测；以后切换 `terminal_link_2`，即可把同一 `real_target_position` 配置解释为探头尖端目标，届时必须填写对应的实际探头检测坐标。内部统一先换算成探头位姿再交给检测器，求逆补偿后 tool0 测试目标不会被重复减去工具偏移。初始位置始终由 `initial_position` 指定 tool0。
+
+偏移、等待时间和模拟力在 `config/detection_test.yaml`，位移相对实际探头、方向按基座轴。`simulation_point_offset` 仅用于虚拟机械臂，默认向下 30 mm；`point_offset` 只在 `fixed_real_target: false` 时用于真机相对测试，默认向下 5 mm；当前真机使用给定的固定坐标。可用 `test_config:=/绝对路径/detection_test.yaml` 替换。点保存至 `~/.ros/detect_control/virtual_test_targets.yaml`，不覆盖正常多点文件；可用 `targets_file:=...` 指定。无需另外调用启动或启用导纳服务。
+
+检测测试的实时 TF 使用独立监听节点/线程和较短的接收队列，避免 RViz 与任务回调繁忙时积压旧位姿；仿真在全部控制器初始化完成后再稳定等待并启动。TF 时效仍要求 0.3 秒内，真实断流仍停止，不通过放宽超时继续运动。
+
+测试采用专用 RViz 窗口，标题以 `DETECTION TEST - SIM - Domain 186` 开头，通过 TF 显示实时机器人，不叠加静止规划目标模型。绿色球为原位、红色球为目标、黄色球为实际探头位置、青色线为实际走过的轨迹；文字显示检测状态、当前位移与最大位移。完成返回后轨迹仍保留，避免把回原位误认为没有运动。默认 30 mm 仅作用于虚拟机械臂；当前真机使用上述固定初始坐标和固定 tool0 检测坐标。
+
+检测启动排查：`Overrun detected ... 125 Hz` 表示底层控制循环超过 8 ms 周期，启动等待时间与循环频率无关。当前驱动配置及 RTSI 通信均为 125 Hz。若同时出现 `External control lost` 或 `robot_task_running ... false`，外控已停止，此时不能仅凭控制器显示 active 判定可以运动。启动流程先等待全部控制器加载完成，后加载 MoveIt、RViz 和检测程序，减少启动阶段负载重叠；该调整不保证消除树莓派的调度抖动。可用 `launch_rviz:=false` 对比观察时序。外控超时与周期告警保持可见，未通过放宽超时或关闭告警处理。
+
+检测节点的 `/detect_controller/status` 中，`motion_ready` 表示关节、原始力、零偏初始化后的滤波力均未超时，初始受力低于配置限制，导纳服务与 MoveIt 运动接口可用，且没有未结束运动或停止请求；`readiness_message` 给出等待原因。测试任务在该状态和外控状态连续就绪后才调用初始运动服务，避免服务刚出现、力零偏尚未完成时抢先请求导致失败。数据时效和力限制不放宽。
+
+检测初始点与检测点共用 tool0 方向配置（相对 base_link）：`initial_orientation_mode: current` 锁存初始移动前方向；`fixed` 使用 `initial_rpy_deg: [Rx, Ry, Rz]`，单位度，固定轴 RPY，旋转矩阵为 Rz(yaw)·Ry(pitch)·Rx(roll)。示例 `[0,0,0]` 仅为占位，未确认设备角度时保留 current。`orientation_tolerance_deg: 1.0` 限制目标到位和垂直接近/柔顺保持时的角度偏差；MoveIt 目标姿态容差可能因探头长度进一步收紧。初始与预接近之间的一般规划仍只保证目标姿态，不承诺整段轨迹姿态不变。旧自定义 YAML 的弧度 `orientation_tolerance` 继续兼容；显式度制参数优先。

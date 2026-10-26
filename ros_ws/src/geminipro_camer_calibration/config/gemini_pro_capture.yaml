@@ -1,0 +1,29 @@
+/**:
+  ros__parameters:
+    camera_name: camera
+    # 拍照从同一 SDK FrameSet 提取原始深度和参数，不使用 ROS 近似配对。
+    enable_v54_capture: true
+    enable_color: true
+    enable_depth: true
+    enable_ir: false
+    enable_point_cloud: false
+    enable_colored_point_cloud: false
+    color_width: 640
+    color_height: 480
+    color_fps: 30
+    color_format: MJPG
+    depth_width: 640
+    depth_height: 400
+    depth_fps: 30
+    # 实机枚举：640×400/30 FPS 为 Y11（值 11），SDK 自动解包为 uint16。
+    depth_format: Y11
+    depth_registration: true
+    align_mode: SW
+    frame_aggregate_mode: full_frame
+    # 当前 SV1301S_U3 不支持 SDK 帧同步；使用 ROS 时间戳近似配对。
+    enable_frame_sync: false
+    enable_depth_scale: true
+    color_flip: false
+    depth_flip: false
+    # 主机原程序未固定曝光/增益/白平衡；保持驱动默认，不填造曝光数值。
+    time_domain: system

@@ -5,6 +5,8 @@
    <!-- import main macro -->
    <xacro:include filename="$(find eli_cs_robot_description)/urdf/cs_macro.xacro"/>
 
+   <xacro:include filename="$(find eli_cs_robot_description)/urdf/cs_macro_terminal.xacro"/>
+
    <!-- possible 'cs_type' values: cs63, cs66, cs66a, cs68, cs612, cs616, cs618f, cs620, cs625, ls65 -->
    <!-- the default value should raise an error in case this was called without defining the type -->
    <xacro:arg name="cs_type" default="cs63"/>
@@ -48,6 +50,16 @@
 
    <!-- initial position for simulations (Fake Hardware, Gazebo, Ignition) -->
    <xacro:arg name="initial_positions_file" default="$(find eli_cs_robot_description)/config/initial_positions.yaml"/>
+
+   <!-- 同一末端装配供真机、MoveIt、导纳和模型预览共同使用。 -->
+   <xacro:arg name="attach_terminal" default="true"/>
+   <xacro:arg name="terminal_mesh_base" default="package://eli_cs_robot_description/meshes/terminal"/>
+   <xacro:arg name="terminal_x" default="0.0"/>
+   <xacro:arg name="terminal_y" default="0.0"/>
+   <xacro:arg name="terminal_z" default="0.0"/>
+   <xacro:arg name="terminal_roll" default="0.0"/>
+   <xacro:arg name="terminal_pitch" default="0.0"/>
+   <xacro:arg name="terminal_yaw" default="-1.5707963267948966"/>
 
    <!-- convert to property to use substitution in function -->
    <xacro:property name="initial_positions_file" default="$(arg initial_positions_file)"/>
@@ -93,6 +105,14 @@
      >
      <origin xyz="0 0 0" rpy="0 0 0" />          <!-- position robot in the world -->
    </xacro:cs_robot>
+
+   <xacro:if value="$(arg attach_terminal)">
+     <xacro:cs_terminal tf_prefix="$(arg tf_prefix)"
+       mesh_base="$(arg terminal_mesh_base)"
+       x="$(arg terminal_x)" y="$(arg terminal_y)" z="$(arg terminal_z)"
+       roll="$(arg terminal_roll)" pitch="$(arg terminal_pitch)" yaw="$(arg terminal_yaw)"/>
+   </xacro:if>
+
 
    <xacro:if value="$(arg sim_gazebo)">
     <!-- Gazebo plugins -->

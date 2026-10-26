@@ -137,8 +137,19 @@ def main():
                             "mock_components/GenericSystem" in msg
                             for msg in descriptions
                         )
+                        assert all(
+                            all(
+                                name in description
+                                for name in (
+                                    "terminal_base_link",
+                                    "terminal_link_1",
+                                    "terminal_link_2",
+                                )
+                            )
+                            for description in descriptions
+                        ), "New terminal assembly missing from driver description"
                         print(
-                            "PASS: four controllers active; MoveIt IK ready; only mock driver publishes robot description"
+                            "PASS: four controllers active; MoveIt IK ready; new terminal present; only mock driver publishes robot description"
                         )
                         return
                     time.sleep(0.5)

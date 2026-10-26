@@ -11,11 +11,18 @@ def generate_launch_description():
         get_package_share_directory("eli_cs_robot_serial"), "device", "sensor", "data")
     return LaunchDescription([
         DeclareLaunchArgument("data_directory", default_value=default_data_directory),
+        DeclareLaunchArgument(
+            "data_source", default_value="auto",
+            description="auto: raw until SI ready; verified: SI only; raw: device values only",
+        ),
         Node(
             package="eli_cs_robot_serial",
             executable="sensor_plot.py",
             name="sensor_plot",
             output="screen",
-            parameters=[{"data_directory": LaunchConfiguration("data_directory")}],
+            parameters=[{
+                "data_directory": LaunchConfiguration("data_directory"),
+                "data_source": LaunchConfiguration("data_source"),
+            }],
         ),
     ])

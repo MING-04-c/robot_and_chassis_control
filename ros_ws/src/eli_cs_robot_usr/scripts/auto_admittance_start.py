@@ -19,9 +19,10 @@ class AutoAdmittanceStart(Node):
         self.done = False
         self.success = False
         self.wait_only = bool(self.declare_parameter('wait_only', False).value)
-        self.settle_seconds = float(self.declare_parameter('settle_seconds', 10.0).value)
+        self.settle_seconds = float(self.declare_parameter('settle_seconds', 5.0).value)
         if not math.isfinite(self.settle_seconds) or self.settle_seconds < 0:
             raise ValueError('settle_seconds must be finite and nonnegative')
+        self.wait_for_all_controllers = bool(self.declare_parameter('wait_for_all_controllers', False).value)
         self.ready_since = None
         self.started = monotonic()
         self.running = False
@@ -57,7 +58,13 @@ class AutoAdmittanceStart(Node):
             states = {item.name: item.state for item in future.result().controller}
             required = ('scaled_joint_trajectory_controller', 'joint_state_broadcaster',
                         'speed_scaling_state_broadcaster', 'tcp_pose_broadcaster')
+            if self.wait_for_all_controllers:
+                required += ('io_and_status_controller', 'force_torque_sensor_broadcaster')
             self.controllers_active = all(states.get(name) == 'active' for name in required)
+            if self.wait_for_all_controllers:
+                self.controllers_active = self.controllers_active and all(
+                    states.get(name) == 'inactive'
+                    for name in ('forward_position_controller', 'freedrive_controller'))
             self.checked = monotonic()
             if not self.controllers_active:
                 self.ready_since = None

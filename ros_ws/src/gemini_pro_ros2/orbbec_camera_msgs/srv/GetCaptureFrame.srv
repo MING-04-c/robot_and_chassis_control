@@ -1,0 +1,7 @@
+# 返回下一组完整 SDK FrameSet 的原始数据，仅用于按需拍照。
+---
+bool success
+string message
+sensor_msgs/CompressedImage color
+sensor_msgs/Image depth_raw
+string metadata_json

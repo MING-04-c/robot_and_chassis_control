@@ -95,10 +95,39 @@ try:
     # The planner's URDF is valid for planning but has different hardware fields.
     # It must not be offered to controller_manager as a competing description.
     assert planning["robot_description"] != driver
+    # 真机与规划器的硬件字段不同，但末端几何和安装关系必须一致。
+    descriptions = [ET.fromstring(driver), ET.fromstring(planning["robot_description"])]
+    terminal_signatures = []
+    for description in descriptions:
+        signatures = []
+        for name in ("terminal_base_link", "terminal_link_1", "terminal_link_2"):
+            link = description.find(f"link[@name='{name}']")
+            assert link is not None, name
+            for kind in ("visual", "collision"):
+                mesh = link.find(f"{kind}/geometry/mesh")
+                assert mesh is not None and "/meshes/terminal/" in mesh.attrib["filename"]
+                signatures.append((name, kind, tuple(sorted(mesh.attrib.items()))))
+        for name in (
+            "tool0-terminal_base_fixed",
+            "terminal_joint_1",
+            "terminal_joint_2",
+        ):
+            joint = description.find(f"joint[@name='{name}']")
+            assert joint is not None and joint.attrib["type"] == "fixed"
+            signatures.append(
+                (
+                    name,
+                    joint.find("parent").attrib,
+                    joint.find("child").attrib,
+                    joint.find("origin").attrib,
+                )
+            )
+        terminal_signatures.append(signatures)
+    assert terminal_signatures[0] == terminal_signatures[1]
     assert by_executable["task_controller"]["auto_start"] is True
     assert by_executable["task_controller"]["require_arm_ready"] is True
     assert by_executable["auto_admittance_start.py"]["wait_only"] is True
-    assert by_executable["auto_admittance_start.py"]["settle_seconds"] == 10.0
+    assert by_executable["auto_admittance_start.py"]["settle_seconds"] == 5.0
     order = [executable for executable, _ in seen]
     assert (
         order.index("ros2_control_node")
@@ -124,7 +153,7 @@ try:
     )
     assert service.run() == 0
     standalone = {executable: values for executable, values in seen}
-    assert standalone["auto_admittance_start.py"]["settle_seconds"] == 10.0
+    assert standalone["auto_admittance_start.py"]["settle_seconds"] == 5.0
     assert "ros2_control_node" not in standalone
     assert (
         "pose_target_publisher" not in standalone
@@ -165,7 +194,7 @@ try:
         and "dataset_capture_node.py" not in combined
     )
     assert combined["auto_admittance_start.py"]["wait_only"] is True
-    assert combined["auto_admittance_start.py"]["settle_seconds"] == 10.0
+    assert combined["auto_admittance_start.py"]["settle_seconds"] == 5.0
     assert combined["move_group"]["publish_robot_description"] is False
     seen.clear()
     service = LaunchService()

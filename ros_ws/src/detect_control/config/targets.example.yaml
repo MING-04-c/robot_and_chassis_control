@@ -1,0 +1,10 @@
+# 仅说明多点文件格式；这些位置和朝向不是现场实测值，使用前必须修改。
+schema: detect_targets_v1
+units: m
+frame_id: base_link
+# 已转换到基座坐标的探头检测点，不能把相机相对坐标直接填在这里。
+targets:
+  - position: [0.4, 0.0, 0.3]
+    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]
+  - position: [0.4, 0.05, 0.3]
+    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]

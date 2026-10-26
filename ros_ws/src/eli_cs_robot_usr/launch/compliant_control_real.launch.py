@@ -117,7 +117,7 @@ def generate_launch_description():
         DeclareLaunchArgument("cs_type", default_value="ls65"),
         DeclareLaunchArgument("launch_rviz", default_value="true"),
         DeclareLaunchArgument("auto_start_admittance", default_value="true"),
-        DeclareLaunchArgument("arm_control_start_delay", default_value="10.0"),
+        DeclareLaunchArgument("arm_control_start_delay", default_value="5.0"),
         DeclareLaunchArgument("admittance_enabled_on_startup", default_value="false"),
         DeclareLaunchArgument("launch_coordinator", default_value="false"),
         DeclareLaunchArgument("launch_executor", default_value="false"),

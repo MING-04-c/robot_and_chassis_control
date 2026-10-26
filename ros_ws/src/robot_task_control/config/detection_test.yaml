@@ -1,0 +1,28 @@
+# 检测测试：仿真为相对虚拟点；真机先到固定初始 tool0 点，再检测固定 tool0 测试点。
+virtual_detection_task:
+  ros__parameters:
+    base_frame: base_link
+    probe_frame: terminal_link_2
+    fixed_real_target: true
+    real_target_frame: tool0  # 本轮初始点与检测点均按 tool0；以后可改为 terminal_link_2
+    real_target_position: [-0.3, 0.1, 0.177]  # base_link 下所选 real_target_frame 的检测位置，m
+    point_offset: [0.0, 0.0, -0.005]  # fixed_real_target=false 时才使用的真机相对偏移，m
+    simulation_point_offset: [0.0, 0.0, -0.03]  # 仅虚拟机械臂：30 mm，便于观察
+    readiness_seconds: 2.0
+    startup_timeout: 90.0
+    task_timeout: 90.0
+    simulated_contact_force: 21.0    # 仅 mock 硬件使用；触发 20 N 停止
+
+detect_controller:
+  ros__parameters:
+    initial_position_enabled: true
+    initial_position: [-0.4, 0.1, 0.4]  # base_link 下 tool0 初始位置，m
+    initial_orientation_mode: current  # current：锁存当前方向；fixed：使用下方度制 RPY
+    initial_rpy_deg: [0.0, 0.0, 0.0]   # 示例占位，current 模式不使用；固定轴 Rx/Ry/Rz
+    orientation_tolerance_deg: 1.0    # 目标到位与下探方向偏差上限，度；规划可能进一步收紧
+    target_source: camera            # 由测试节点发布已换算的基座探头目标
+    approach_clearance: 0.003        # 目标上方 3 mm，测试位移较小
+    max_penetration: 0.005
+    approach_speed: 0.002
+    contact_force: 20.0
+    hold_seconds: 5.0

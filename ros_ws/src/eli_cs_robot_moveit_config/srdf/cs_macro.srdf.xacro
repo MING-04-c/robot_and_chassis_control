@@ -4,7 +4,7 @@
     This is a format for representing semantic information about the robot structure.
     A URDF file must exist for this robot as well, where the joints and the links that are referenced are defined
 -->
-  <xacro:macro name="cs_srdf" params="name prefix">
+  <xacro:macro name="cs_srdf" params="name prefix attach_terminal:=true">
     <!--GROUPS - Representation of a set of joints and links. This can be useful for specifying DOF to plan for, defining arms, end effectors, etc-->
     <!--LINKS - When a link is specified, the parent joint of that link (if it exists) is automatically included-->
     <!--JOINTS - When a joint is specified, the child link of that joint (which will always exist) is automatically included-->
@@ -40,6 +40,15 @@
     </group_state>
     <!--END EFFECTOR - Purpose - Represent information about an end effector.-->
     <!--VIRTUAL JOINT - Purpose - this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->
+    <!-- 同一刚性装配内部和腕部安装面允许接触；其余机械臂碰撞检查保留。 -->
+    <xacro:if value="${attach_terminal}">
+      <disable_collisions link1="${prefix}terminal_base_link" link2="${prefix}terminal_link_1" reason="Adjacent"/>
+      <disable_collisions link1="${prefix}terminal_base_link" link2="${prefix}terminal_link_2" reason="Adjacent"/>
+      <disable_collisions link1="${prefix}terminal_link_1" link2="${prefix}terminal_link_2" reason="RigidAssembly"/>
+      <disable_collisions link1="${prefix}wrist_3_link" link2="${prefix}terminal_base_link" reason="Adjacent"/>
+      <disable_collisions link1="${prefix}wrist_3_link" link2="${prefix}terminal_link_1" reason="RigidAssembly"/>
+      <disable_collisions link1="${prefix}wrist_3_link" link2="${prefix}terminal_link_2" reason="RigidAssembly"/>
+    </xacro:if>
     <!--DISABLE COLLISIONS - By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot. This tag disables collision checking between a specified pair of links. -->
     <disable_collisions link1="${prefix}base_link" link2="${prefix}base_link_inertia" reason="Adjacent" />
     <disable_collisions link1="${prefix}base_link_inertia" link2="${prefix}shoulder_link" reason="Adjacent" />

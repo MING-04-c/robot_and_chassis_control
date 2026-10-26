@@ -332,7 +332,7 @@ def generate_launch_description():
             DeclareLaunchArgument("auto_start", default_value="false"),
             DeclareLaunchArgument("require_arm_ready", default_value="false"),
             DeclareLaunchArgument("check_devices_on_startup", default_value="false"),
-            DeclareLaunchArgument("arm_control_start_delay", default_value="10.0"),
+            DeclareLaunchArgument("arm_control_start_delay", default_value="5.0"),
             DeclareLaunchArgument("start_chassis", default_value="true"),
             DeclareLaunchArgument("use_velocity_mux", default_value="true"),
             DeclareLaunchArgument("chassis_pid_enabled", default_value="true"),
