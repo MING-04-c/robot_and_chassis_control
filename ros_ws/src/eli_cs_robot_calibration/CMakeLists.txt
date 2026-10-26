@@ -18,6 +18,7 @@ add_library(calibration
   src/calibration.cpp
   src/calibration_consumer.cpp
 )
+target_compile_features(calibration PUBLIC cxx_std_17)
 target_include_directories(
   calibration
   PUBLIC

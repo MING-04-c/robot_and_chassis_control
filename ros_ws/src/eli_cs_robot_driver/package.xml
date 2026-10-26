@@ -33,7 +33,7 @@
   <depend>hardware_interface</depend>
   <depend>pluginlib</depend>
   <depend>controller_manager_msgs</depend>
-  <depend>controller_manager</depend>
+  <exec_depend>controller_manager</exec_depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>
   
@@ -46,6 +46,7 @@
   <exec_depend>joint_state_publisher</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>position_controllers</exec_depend>
+  <exec_depend>pose_broadcaster</exec_depend>
   <exec_depend>velocity_controllers</exec_depend>
   <exec_depend>ros2_controllers_test_nodes</exec_depend>
   <exec_depend>rviz2</exec_depend>

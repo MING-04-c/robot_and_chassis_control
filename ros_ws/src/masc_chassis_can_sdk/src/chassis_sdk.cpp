@@ -109,10 +109,13 @@ bool ChassisSdk::Connect() {
     }
 
     m_last_motion_command_update_time = std::chrono::steady_clock::now();
-    m_motion_thread_running = true;
+    const bool transmit_motion = m_config.m_motion_command_transmit_enabled;
+    m_motion_thread_running = transmit_motion;
     lock.unlock();
 
-    m_motion_thread = std::thread(&ChassisSdk::MotionCommandLoop, this);
+    if (transmit_motion) {
+        m_motion_thread = std::thread(&ChassisSdk::MotionCommandLoop, this);
+    }
     NotifyHealth();
     return true;
 }

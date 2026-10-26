@@ -99,14 +99,100 @@ ros2 service call /task_controller/stop std_srvs/srv/Trigger '{}'
 
 ## 验证与限制
 
+测试按用途保留以下 5 个文件，重复的导纳就绪检查和循迹启动检查已合并：
+
+| 文件 | 验证内容 |
+| --- | --- |
+| `test_local_control.py` | 三种任务流程、PID、速度切换和停止行为 |
+| `test_device_startup.py` | 设备就绪后自动启用导纳、先机械臂后底盘、就绪超时 |
+| `test_arm_description_launch.py` | 启动参数、驱动描述、启动顺序及 USB 循迹话题配置 |
+| `test_arm_jazzy_startup.py` | 使用模拟硬件启动真实 ROS 控制器和 MoveIt |
+| `test_hk_capture_transfer.py` | HK 照片保存与传输 |
+
+这些测试使用模拟输入或模拟硬件，不作为实际任务启动步骤。
+
 当前 ARM64 / ROS 2 Jazzy 已编译 HK 驱动、USB 图像识别、循迹控制、底盘和新任务控制器。无硬件测试覆盖真实 PID 的到位/超时/停止、工作流模式切换、速度选择、拍照保存与失败、原 MIMG JPEG/raw 接收兼容。
 
 ```bash
 source install/setup.bash
 /usr/bin/python3 src/robot_task_control/test/test_local_control.py
 /usr/bin/python3 src/robot_task_control/test/test_hk_capture_transfer.py
-colcon test --packages-select camer_diver masc_chassis_user_control
+colcon test --packages-select ruier_camer_diver masc_chassis_user_control
 colcon test-result --verbose
 ```
 
 尚未连接真实两路摄像头、外部检测主机、机械臂和 CAN 底盘做联合验证；当前环境仍缺少完整机械臂 MoveIt 构建依赖。树莓派上双相机带宽、实时性与检测画质需要实测。Gazebo 和旧底盘/机械臂控制通信桥不参与部署；原图像传输代码已独立恢复，归档源仍保留在 legacy。
+
+## 三种独立控制流程
+
+以下入口不启动 HK 相机、拍照或外传，也不包含底盘距离任务。每次只运行其中一个入口。仅机械臂导纳和导纳＋循迹入口默认自动开始；仅底盘循迹入口仍通过 `/task_controller/start` 手动开始。
+
+| 用途 | 启动文件 | 流程配置 | 实际节点 |
+|---|---|---|---|
+| 机械臂导纳＋底盘循迹 | `arm_admittance_line_follow.launch.py` | `config/arm_admittance_line_follow.yaml` | 机械臂驱动、MoveIt IK/导纳、力传感器、底盘驱动、USB 相机、识别、循迹和速度选择器 |
+| 仅机械臂导纳 | `arm_admittance_only.launch.py` | `config/arm_admittance_only.yaml` | 机械臂驱动、MoveIt IK/导纳与力传感器；不启动底盘或速度选择器 |
+| 仅底盘循迹 | `line_follow_only.launch.py` | `config/line_follow_only.yaml` | 底盘驱动、USB 相机、识别、循迹和速度选择器；不启动机械臂、力传感器或距离 PID |
+
+导纳流程默认读取步骤开始时的 TCP 位姿，以零相对位移、当前姿态开启导纳，保持 2 秒后完成步骤；正常完成后继续柔顺保持，直到 stop。联合流程随后累计有效循迹 2 秒，期间机械臂导纳继续保持，循迹结束底盘停车。这里的 2 秒可在对应 YAML 中修改；增加循迹时长时同时检查 `step_timeout_sec`。
+
+`arm_admittance_only.launch.py` 会自动等待机器人外控程序运行、轨迹/关节状态/速度缩放/TCP 位姿四个控制器激活，并收到零偏采集后的新鲜力数据，再捕获当前位置开启导纳，无需调用 start、enable 或 hold_current_pose 服务。采集零偏时工具应保持无外部接触。已有机械臂驱动在运行时，可传 `start_arm_driver:=false` 复用；需要手动开始时传 `auto_start:=false`。
+
+`arm_admittance_line_follow.launch.py` 同样默认自动开始并检查机械臂就绪：当前位置导纳保持 2 秒后，AGV 以默认 0.05 m/s 沿 USB 相机识别的蓝线累计有效循迹 2 秒，然后停车；机械臂导纳仍保持开启。无需海康相机或照片接收主机。启动这个联合入口前退出单独的机械臂驱动、导纳和底盘测试会话，避免重复运行节点；`auto_start:=false` 可恢复手动开始。
+
+联合/机械臂整套启动现在分阶段加载：先启动驱动，确认外控运行且四个必要控制器连续正常 10 秒后，再启动 MoveIt、力传感器、导纳、USB 循迹相机和工作流。等待期间状态异常会重新计时；120 秒内无法稳定就取消控制部分启动。用 `arm_control_start_delay:=15.0` 可将稳定等待改为 15 秒，`0.0` 可关闭分阶段等待。此参数不改变导纳到位后保持 2 秒和 AGV 有效循迹 2 秒的任务配置。复用已启动的驱动/导纳时不再重复等待或加载这些节点。
+
+联合入口的任务分为“设备准备检查”和“动作执行”两阶段。分批加载仍属于设备准备阶段：导纳输出和循迹输出保持关闭，速度选择器也保持禁用。任务控制器确认机械臂外控、四个必要控制器、TCP TF、导纳节点和零偏后的新鲜力数据就绪，并通过 `/line_follow_controller/ready` 确认底盘 CAN/状态、图像时间戳、连续蓝线识别与近端循迹几何有效。该检查不会开启循迹或发出运动命令。全部连续就绪 1 秒后打印 `All required devices ready; starting workflow`，再自动执行导纳保持和 AGV 移动；无需另开终端调用开始服务。
+
+设备检查默认最多等待 120 秒，等待时每 5 秒打印未就绪项。图像过期、缺线或底盘不允许移动时，会停在准备阶段；不会先让机械臂进入导纳再等相机。`setup_can.sh` 仍需在启动前手动配置 CAN；本检查只读取驱动状态。此入口未启用海康，不检查海康。任务开始后的运行保护仍由各控制节点处理，启动检查不保证后续不会丢线或断线。
+
+如果机械臂驱动和独立导纳已分别启动并验证正常，可保持这两个终端运行，联合入口加 `start_arm_driver:=false start_moveit:=false`，仅补充底盘、USB 循迹及任务控制器。这样复用已有导纳和力传感器，避免重复节点和集中启动的资源开销；任务仍按“当前位置导纳保持 2 秒 → AGV 循迹 2 秒 → 停车”自动执行。只退出上一套联合启动会话，不要同时运行两套底盘或任务控制器。外控断开时任务会等待机械臂恢复，不会直接跳到 AGV 移动。
+
+重新构建本包后使用：
+
+```bash
+cd /你的路径/robot_and_chassis_control/ros_ws
+source /opt/ros/<实际发行版>/setup.bash
+source scripts/raspberry_pi_env.bash
+colcon build --packages-select robot_task_control
+source scripts/raspberry_pi_env.bash
+
+# 三选一；机械臂相关参数仍可传入 robot_ip、local_ip、sensor_host。
+ros2 launch robot_task_control arm_admittance_line_follow.launch.py
+ros2 launch robot_task_control arm_admittance_only.launch.py
+ros2 launch robot_task_control line_follow_only.launch.py
+
+# 另一个已 source 环境的终端：
+ros2 service call /task_controller/start std_srvs/srv/Trigger '{}'
+ros2 service call /task_controller/stop std_srvs/srv/Trigger '{}'
+```
+
+USB 设备与循迹速度可继续通过 `line_camera_device`、`line_follow_speed` 覆盖；`workflow_file` 可替换对应流程。三个入口不启动独立 MoveIt 轨迹执行器，导纳所需 MoveIt IK 与模型仍保留。循迹模式不依赖 PID 服务，任务控制器仅在配置启用距离 PID 时才在循迹前发送 PID stop。
+
+## 底盘更新：新版循迹与键盘控制
+
+来自 `masc_chassis` 的更新已合入统一工作区：
+
+- 循迹现在结合近端真实中线和前瞻方向，并增加方向死区、角速度平滑与近端缺线停车。
+- 默认图像前方朝下（`down`），车身参考点位于画面上边缘上方，适配更新代码中的相机安装方向。安装不同时须修改方向与车身参考；控制参数见 `masc_chassis_user_control/config/line_follow.yaml`。
+- 现有三种任务流程继续使用原 YAML。涉及循迹的入口自动启用 USB 自适应曝光，图像、识别、预览与曝光统一使用 `/line_camera/*`，HK 拍照不受影响。
+- 合入低速渐增命令无法自动解锁的修正，以及拖车专用会话禁止周期运动帧发送的支持；正常运动默认保持发送开启。
+
+查看新版循迹标注画面：
+
+```bash
+ros2 launch robot_task_control line_follow_only.launch.py \
+  line_show_window:=true line_follow_speed:=0.05
+```
+
+`line_adaptive_exposure:=false` 可关闭 USB 曝光补偿；默认 true，需要 `v4l-utils`（已加入包依赖）。补偿只控制 `line_camera_device` 指定的 USB 设备，不调 HK 曝光。`line_image_forward_direction`、`line_vehicle_reference_y_ratio` 可覆盖安装方向与纵向参考；其他增益和横向参考可通过节点参数修改。
+
+键盘是独立底盘控制入口，不启动相机、机械臂、循迹或距离 PID。**先退出其他统一/循迹启动会话**，再在交互终端运行；仅调用工作流 stop 仍会保留速度选择器，不适合直接启动另一套键盘控制。
+
+```bash
+ros2 launch robot_task_control keyboard_teleop.launch.py \
+  linear_speed:=0.05 angular_speed:=0.2
+```
+
+等待 `KEYBOARD READY` 后：W/S 前后，A/D 左右横移，Q/E 原地转向，Z/C 后退转弯，空格/X 停车，+/- 调速，Ctrl+C 停车并退出。默认 0.35 秒无移动按键即输出零速度；终端长按依赖系统按键连发。已有独立底盘驱动可加 `start_driver:=false`，保持只有一个运动控制源。
+
+新版拖车会话工具也保留在 `masc_chassis_user_control` 中，使用方法见该包 README。本次更新记录见 `ros_ws/docs/chassis/INTEGRATION_20261014.md`。

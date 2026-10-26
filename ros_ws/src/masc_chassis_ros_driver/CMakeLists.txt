@@ -145,6 +145,17 @@ if(MASC_CHASSIS_USE_ROS2)
     install(FILES README.md COMMUNICATION_IMPLEMENTATION.md SUPERVISOR_PROMPT.md
         DESTINATION share/${PROJECT_NAME}
     )
+    if(BUILD_TESTING)
+        find_package(ament_cmake_gtest REQUIRED)
+        ament_add_gtest(test_auto_lock_controller
+            test/test_auto_lock_controller.cpp src/auto_lock_controller.cpp)
+        target_include_directories(test_auto_lock_controller PRIVATE include)
+        ament_target_dependencies(test_auto_lock_controller
+            rclcpp geometry_msgs masc_chassis_msgs nav_msgs sensor_msgs std_msgs
+            std_srvs tf2 tf2_geometry_msgs tf2_ros)
+        target_link_libraries(test_auto_lock_controller
+            masc_chassis_can_sdk::masc_chassis_can_sdk)
+    endif()
     ament_package()
 else()
     install(TARGETS masc_chassis_ros_driver_node

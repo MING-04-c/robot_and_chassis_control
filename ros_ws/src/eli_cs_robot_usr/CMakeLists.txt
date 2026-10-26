@@ -98,11 +98,19 @@ install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(PROGRAMS scripts/auto_admittance_start.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(FILES README.md
   DESTINATION share/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_trajectory_timing test/test_trajectory_timing.cpp)
+  target_include_directories(test_trajectory_timing PRIVATE src)
+  ament_target_dependencies(test_trajectory_timing trajectory_msgs)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files

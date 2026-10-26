@@ -9,15 +9,16 @@ from uuid import uuid4
 
 import rclpy
 import yaml
+from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import Pose, PoseArray, WrenchStamped
 from masc_chassis_msgs.msg import TaskStatus
 from masc_chassis_msgs.srv import TaskControl
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
+from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool, Trigger
-from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -52,13 +53,17 @@ class WorkflowController(Node):
                 "auto_start", bool(self.workflow.get("auto_start", False))
             ).value
         )
-        self.step_timeout = float(self.declare_parameter("step_timeout_sec", 90.0).value)
+        self.step_timeout = float(
+            self.declare_parameter("step_timeout_sec", 90.0).value
+        )
         if not math.isfinite(self.step_timeout) or self.step_timeout <= 0.0:
             raise ValueError("step_timeout_sec must be finite and positive")
-        self.control_service = str(self.declare_parameter(
-            "control_service", "/chassis/task_control").value)
-        self.status_topic = str(self.declare_parameter(
-            "chassis_status_topic", "/chassis/task_status").value)
+        self.control_service = str(
+            self.declare_parameter("control_service", "/chassis/task_control").value
+        )
+        self.status_topic = str(
+            self.declare_parameter("chassis_status_topic", "/chassis/task_status").value
+        )
         self.target_topic = str(
             self.declare_parameter(
                 "target_topic", "/moveit_pose_executor/target_poses"
@@ -84,9 +89,7 @@ class WorkflowController(Node):
         self.status_subscription = self.create_subscription(
             TaskStatus, self.status_topic, self.on_chassis_status, 20
         )
-        self.target_publisher = self.create_publisher(
-            PoseArray, self.target_topic, 10
-        )
+        self.target_publisher = self.create_publisher(PoseArray, self.target_topic, 10)
         self.compliant_target_publisher = self.create_publisher(
             PoseArray, self.compliant_target_topic, 10
         )
@@ -98,24 +101,85 @@ class WorkflowController(Node):
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.control_client = self.create_client(
-            TaskControl, self.control_service
+        self.control_client = self.create_client(TaskControl, self.control_service)
+        self.use_velocity_mux = bool(
+            self.declare_parameter("use_velocity_mux", False).value
         )
-        self.use_velocity_mux = bool(self.declare_parameter("use_velocity_mux", False).value)
+        self.stop_pid_before_follow = bool(
+            self.declare_parameter("stop_pid_before_follow", True).value
+        )
         self.mux_run_ready = not self.use_velocity_mux
-        self.mux_enable_client = self.create_client(SetBool, "/chassis_velocity_mux/enable")
-        self.mux_mode_client = self.create_client(SetBool, "/chassis_velocity_mux/line_follow_mode")
-        self.follow_enable_client = self.create_client(SetBool, "/line_follow_controller/enable")
-        self.require_image_receiver = bool(self.declare_parameter("require_image_receiver", False).value)
-        self.image_ready_client = self.create_client(Trigger, "/hk_image_transfer/ready")
+        self.mux_enable_client = self.create_client(
+            SetBool, "/chassis_velocity_mux/enable"
+        )
+        self.mux_mode_client = self.create_client(
+            SetBool, "/chassis_velocity_mux/line_follow_mode"
+        )
+        self.follow_enable_client = self.create_client(
+            SetBool, "/line_follow_controller/enable"
+        )
+        self.require_image_receiver = bool(
+            self.declare_parameter("require_image_receiver", False).value
+        )
+        self.image_ready_client = self.create_client(
+            Trigger, "/hk_image_transfer/ready"
+        )
         self.capture_client = self.create_client(Trigger, "/dataset_capture/capture")
         self.follow_status = None
         self.follow_status_time = None
-        self.create_subscription(String, "/line_follow/status", self.on_follow_status, 10)
+        self.create_subscription(
+            String, "/line_follow/status", self.on_follow_status, 10
+        )
         self.execute_client = self.create_client(Trigger, self.execute_service)
         self.admittance_enable_client = self.create_client(
             SetBool, "/admittance_controller/enable"
         )
+        self.require_arm_ready = bool(
+            self.declare_parameter("require_arm_ready", False).value
+        )
+        self.robot_task_running = False
+        self.arm_controllers_active = False
+        self.arm_controllers_checked = float("-inf")
+        self.arm_check_requested = float("-inf")
+        self.arm_check_future = None
+        self.arm_wait_logged = False
+        self.arm_controllers_client = self.create_client(
+            ListControllers, "/controller_manager/list_controllers"
+        )
+        self.robot_task_subscription = self.create_subscription(
+            Bool,
+            "/io_and_status_controller/robot_task_running",
+            self.on_robot_task_running,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self.check_devices_on_startup = bool(
+            self.declare_parameter("check_devices_on_startup", False).value
+        )
+        self.device_check_timeout = float(
+            self.declare_parameter("device_check_timeout_sec", 120.0).value
+        )
+        self.device_ready_stable_sec = float(
+            self.declare_parameter("device_ready_stable_sec", 1.0).value
+        )
+        if (
+            not math.isfinite(self.device_check_timeout)
+            or self.device_check_timeout <= 0
+            or not math.isfinite(self.device_ready_stable_sec)
+            or self.device_ready_stable_sec < 0
+        ):
+            raise ValueError(
+                "device check timing parameters must be finite; timeout > 0 and stable duration >= 0"
+            )
+        self.check_arm_devices = any(
+            step["action"] in ("arm_move", "arm_poses") for step in self.steps
+        )
+        self.check_line_devices = any(
+            step["action"] == "line_follow" for step in self.steps
+        )
+        self.follow_ready_client = self.create_client(
+            Trigger, "/line_follow_controller/ready"
+        )
+        self.reset_device_checks()
         self.start_server = self.create_service(
             Trigger, "~/start", self.on_start_request
         )
@@ -166,9 +230,7 @@ class WorkflowController(Node):
                 raise ValueError(
                     f"workflow step {index} has unsupported action: {action}"
                 )
-            if action in ("chassis_execute", "wait_chassis") and not step.get(
-                "task"
-            ):
+            if action in ("chassis_execute", "wait_chassis") and not step.get("task"):
                 raise ValueError(f"workflow step {index} requires task")
             timeout = float(step.get("step_timeout_sec", 90.0))
             if not math.isfinite(timeout) or timeout <= 0.0:
@@ -179,10 +241,14 @@ class WorkflowController(Node):
             if action == "line_follow":
                 progress_timeout = float(step.get("progress_timeout_sec", 3.0))
                 if not math.isfinite(progress_timeout) or progress_timeout <= 0.0:
-                    raise ValueError(f"workflow step {index} has invalid progress_timeout_sec")
+                    raise ValueError(
+                        f"workflow step {index} has invalid progress_timeout_sec"
+                    )
                 duration = float(step.get("seconds", -1.0))
                 if not math.isfinite(duration) or duration <= 0.0:
-                    raise ValueError(f"workflow step {index} line_follow.seconds must be positive")
+                    raise ValueError(
+                        f"workflow step {index} line_follow.seconds must be positive"
+                    )
             if action == "arm_poses":
                 WorkflowController.validate_pose_values(step.get("poses"), index)
             if action == "arm_move":
@@ -322,6 +388,7 @@ class WorkflowController(Node):
         self.step_started = monotonic()
         self.phase = "ready"
         self.active = True
+        self.reset_device_checks()
         response.success = True
         response.message = f"workflow '{self.workflow_name}' started"
         self.get_logger().info(response.message)
@@ -331,15 +398,23 @@ class WorkflowController(Node):
         del request
         self.fail_workflow("stopped by user")
         response.success = True
-        response.message = "Stop requested for chassis and admittance; see controller logs"
+        response.message = (
+            "Stop requested for chassis and admittance; see controller logs"
+        )
         return response
 
     def add_callback(self, future, callback):
         generation = self.generation
         index = self.step_index
+
         def guarded(result):
-            if self.active and generation == self.generation and index == self.step_index:
+            if (
+                self.active
+                and generation == self.generation
+                and index == self.step_index
+            ):
                 callback(result)
+
         future.add_done_callback(guarded)
 
     def on_follow_status(self, message):
@@ -375,12 +450,20 @@ class WorkflowController(Node):
             if not self.image_ready_client.service_is_ready():
                 return
             self.phase = "image_receiver_pending"
-            self.add_callback(self.image_ready_client.call_async(Trigger.Request()),
-                              lambda result: self.checked_bool(result, "capture_ready"))
+            self.add_callback(
+                self.image_ready_client.call_async(Trigger.Request()),
+                lambda result: self.checked_bool(result, "capture_ready"),
+            )
             return
-        if self.phase in ("ready", "capture_ready") and self.capture_client.service_is_ready():
+        if (
+            self.phase in ("ready", "capture_ready")
+            and self.capture_client.service_is_ready()
+        ):
             self.phase = "capture_pending"
-            self.add_callback(self.capture_client.call_async(Trigger.Request()), self.on_capture_response)
+            self.add_callback(
+                self.capture_client.call_async(Trigger.Request()),
+                self.on_capture_response,
+            )
 
     def on_capture_response(self, future):
         try:
@@ -398,41 +481,63 @@ class WorkflowController(Node):
             self.fail_workflow("line_follow requires use_velocity_mux=true")
             return
         if self.phase == "ready":
-            if not (self.follow_enable_client.service_is_ready() and self.mux_mode_client.service_is_ready()):
+            if not (
+                self.follow_enable_client.service_is_ready()
+                and self.mux_mode_client.service_is_ready()
+            ):
                 return
             self.follow_status = None
             self.follow_status_time = None
             self.follow_tracking_seconds = 0.0
             self.follow_last_tick = monotonic()
             self.follow_last_tracking = monotonic()
+            if not self.stop_pid_before_follow:
+                self.phase = "follow_select"
+                return
             if not self.control_client.service_is_ready():
                 return
             self.cancelled_execution_ids.update(self.execution_ids.values())
             request = TaskControl.Request()
             request.command = TaskControl.Request.STOP
             self.phase = "follow_pid_stop_pending"
-            self.add_callback(self.control_client.call_async(request), self.on_pid_stopped_for_follow)
+            self.add_callback(
+                self.control_client.call_async(request), self.on_pid_stopped_for_follow
+            )
         elif self.phase == "follow_select":
             self.phase = "follow_select_pending"
-            self.request_bool(self.mux_mode_client, True,
-                              lambda result: self.checked_bool(result, "follow_enable"))
+            self.request_bool(
+                self.mux_mode_client,
+                True,
+                lambda result: self.checked_bool(result, "follow_enable"),
+            )
         elif self.phase == "follow_enable":
             self.phase = "follow_enable_pending"
-            self.request_bool(self.follow_enable_client, True,
-                              lambda result: self.checked_bool(result, "follow_tracking"))
+            self.request_bool(
+                self.follow_enable_client,
+                True,
+                lambda result: self.checked_bool(result, "follow_tracking"),
+            )
         elif self.phase == "follow_tracking":
             now = monotonic()
             dt = min(now - self.follow_last_tick, 0.2)
             self.follow_last_tick = now
-            fresh = self.follow_status_time is not None and now - self.follow_status_time <= 1.0
+            fresh = (
+                self.follow_status_time is not None
+                and now - self.follow_status_time <= 1.0
+            )
             if fresh and self.follow_status == "tracking":
                 self.follow_tracking_seconds += dt
                 self.follow_last_tracking = now
             if self.follow_tracking_seconds >= float(step["seconds"]):
                 self.phase = "follow_disable_pending"
-                self.request_bool(self.follow_enable_client, False,
-                                  lambda result: self.checked_bool(result, "follow_restore_pid"))
-            elif now - self.follow_last_tracking > float(step.get("progress_timeout_sec", 3.0)):
+                self.request_bool(
+                    self.follow_enable_client,
+                    False,
+                    lambda result: self.checked_bool(result, "follow_restore_pid"),
+                )
+            elif now - self.follow_last_tracking > float(
+                step.get("progress_timeout_sec", 3.0)
+            ):
                 self.fail_workflow(f"line following unavailable: {self.follow_status}")
         elif self.phase == "follow_restore_pid":
             self.phase = "follow_restore_pending"
@@ -459,8 +564,11 @@ class WorkflowController(Node):
         self.latest_chassis_status[task_name] = data
         if message.state == TaskStatus.RUNNING:
             self.running_task_ids.add(task_name)
-        if (message.state == TaskStatus.FAILED and self.active
-                and message.execution_id not in self.cancelled_execution_ids):
+        if (
+            message.state == TaskStatus.FAILED
+            and self.active
+            and message.execution_id not in self.cancelled_execution_ids
+        ):
             self.fail_workflow(f"chassis task '{task_name}' failed: {message.message}")
             return
         step = self.current_step()
@@ -479,31 +587,26 @@ class WorkflowController(Node):
         state = data.get("state")
         if state == 1:
             if not self.seen_running:
-                self.get_logger().info(
-                    f"Chassis task '{expected_task}' is running"
-                )
+                self.get_logger().info(f"Chassis task '{expected_task}' is running")
             self.seen_running = True
             return
         if state == 3:
             self.fail_workflow(
-                f"chassis task '{expected_task}' failed: "
-                f"{data.get('message', '')}"
+                f"chassis task '{expected_task}' failed: " f"{data.get('message', '')}"
             )
         elif state == 2:
-            self.get_logger().info(
-                f"Chassis task '{expected_task}' completed"
-            )
+            self.get_logger().info(f"Chassis task '{expected_task}' completed")
             self.complete_step()
 
     def advance(self):
         if not self.active or self.failed:
             return
+        if not self.devices_checked and not self.advance_device_checks():
+            return
         step = self.current_step()
         if step is None:
             self.active = False
-            self.get_logger().info(
-                f"Workflow '{self.workflow_name}' completed"
-            )
+            self.get_logger().info(f"Workflow '{self.workflow_name}' completed")
             if self.arm_control_mode == "admittance":
                 self.get_logger().info(
                     "Admittance remains enabled at the last arm target"
@@ -512,16 +615,23 @@ class WorkflowController(Node):
         action = step["action"]
         now_ns = self.get_clock().now().nanoseconds
 
-        if monotonic() - self.step_started > float(step.get("step_timeout_sec", self.step_timeout)):
-            self.fail_workflow(f"step {self.step_index} timed out in phase {self.phase}")
+        if monotonic() - self.step_started > float(
+            step.get("step_timeout_sec", self.step_timeout)
+        ):
+            self.fail_workflow(
+                f"step {self.step_index} timed out in phase {self.phase}"
+            )
             return
         if not self.mux_run_ready:
             if self.phase == "ready" and self.mux_enable_client.service_is_ready():
                 if not self.mux_mode_client.service_is_ready():
                     return
                 self.phase = "mux_start_pending"
-                self.request_bool(self.mux_mode_client, False,
-                                  lambda result: self.checked_bool(result, "mux_enable_run"))
+                self.request_bool(
+                    self.mux_mode_client,
+                    False,
+                    lambda result: self.checked_bool(result, "mux_enable_run"),
+                )
             elif self.phase == "mux_enable_run":
                 self.phase = "mux_enable_pending"
                 self.request_bool(self.mux_enable_client, True, self.on_mux_run_ready)
@@ -544,7 +654,9 @@ class WorkflowController(Node):
             if self.phase == "ready":
                 task_name = self.resolve_task(step)
                 if task_name not in self.execution_ids:
-                    self.fail_workflow(f"task '{task_name}' has not been executed in this run")
+                    self.fail_workflow(
+                        f"task '{task_name}' has not been executed in this run"
+                    )
                     return
                 self.seen_running = task_name in self.running_task_ids
                 self.phase = "waiting_chassis"
@@ -559,13 +671,115 @@ class WorkflowController(Node):
         elif action == "arm_move":
             self.advance_arm_move(step, now_ns)
 
+    def reset_device_checks(self):
+        self.devices_checked = not self.check_devices_on_startup
+        self.devices_check_started = monotonic()
+        self.devices_stable_since = None
+        self.device_check_logged = float("-inf")
+        self.device_check_requested = float("-inf")
+        self.device_check_result_time = float("-inf")
+        self.device_check_future = None
+        self.line_devices_ready = False
+        self.line_devices_reason = "waiting for chassis/USB readiness service"
+
+    def on_line_devices_ready(self, future):
+        if future is not self.device_check_future:
+            return
+        try:
+            response = future.result()
+            self.line_devices_ready = response.success
+            self.line_devices_reason = response.message
+            self.device_check_result_time = monotonic()
+        except Exception as exc:
+            self.line_devices_ready = False
+            self.line_devices_reason = str(exc)
+        if not self.line_devices_ready:
+            self.devices_stable_since = None
+
+    def advance_device_checks(self):
+        now = monotonic()
+        missing = []
+        if self.check_arm_devices:
+            if not self.arm_ready():
+                missing.append("robot external control/controllers")
+            if (
+                not self.admittance_enable_client.service_is_ready()
+                or self.compliant_target_publisher.get_subscription_count() == 0
+            ):
+                missing.append("admittance node")
+            now_ns = self.get_clock().now().nanoseconds
+            if (
+                self.last_compliant_wrench_ns is None
+                or now_ns - self.last_compliant_wrench_ns > 500_000_000
+            ):
+                missing.append("force bias/fresh wrench data")
+            try:
+                self.tf_buffer.lookup_transform("base_link", "tool0", Time())
+            except TransformException:
+                missing.append("robot TCP transform")
+        if self.check_line_devices:
+            future = self.device_check_future
+            if (
+                future is not None
+                and not future.done()
+                and now - self.device_check_requested > 1.5
+            ):
+                self.follow_ready_client.remove_pending_request(future)
+                future.cancel()
+                self.line_devices_ready = False
+                self.line_devices_reason = "readiness service timeout"
+            if (
+                future is None or future.done()
+            ) and now - self.device_check_requested >= 0.3:
+                if self.follow_ready_client.service_is_ready():
+                    self.device_check_requested = now
+                    self.device_check_future = self.follow_ready_client.call_async(
+                        Trigger.Request()
+                    )
+                    self.add_callback(
+                        self.device_check_future, self.on_line_devices_ready
+                    )
+            if not self.line_devices_ready or now - self.device_check_result_time > 1.0:
+                missing.append("chassis/USB tracking: " + self.line_devices_reason)
+            if not all(
+                client.service_is_ready()
+                for client in (
+                    self.follow_enable_client,
+                    self.mux_enable_client,
+                    self.mux_mode_client,
+                )
+            ):
+                missing.append("line follower/velocity selector services")
+        if missing:
+            self.devices_stable_since = None
+            if now - self.device_check_logged >= 5.0:
+                self.get_logger().info("Device check waiting: " + "; ".join(missing))
+                self.device_check_logged = now
+        elif self.devices_stable_since is None:
+            self.devices_stable_since = now
+        elif now - self.devices_stable_since >= self.device_ready_stable_sec:
+            self.devices_checked = True
+            self.step_started = now
+            self.get_logger().info("All required devices ready; starting workflow")
+            return True
+        if now - self.devices_check_started > self.device_check_timeout:
+            self.fail_workflow(
+                "device startup check timed out: "
+                + ("; ".join(missing) or "inputs unstable")
+            )
+        return False
+
     def advance_chassis_control(self, step, action, now_ns):
         del now_ns
         if self.phase != "ready" or not self.control_client.service_is_ready():
             return
-        if any(self.get_node_names().count(name) > 1
-               for name in ("task_controller", "target_pid_controller")):
-            self.fail_workflow("duplicate task/PID controllers; close the previous launch")
+        if any(
+            self.get_node_names().count(name) > 1
+            for name in ("task_controller", "target_pid_controller")
+        ):
+            self.fail_workflow(
+                "duplicate task/PID controllers; close the previous launch"
+            )
             return
         request = TaskControl.Request()
         request.command = CONTROL_COMMANDS[action]
@@ -580,7 +794,9 @@ class WorkflowController(Node):
         if action == "chassis_stop":
             self.cancelled_execution_ids.update(self.execution_ids.values())
         self.phase = "control_pending"
-        self.add_callback(self.control_client.call_async(request), self.on_control_response)
+        self.add_callback(
+            self.control_client.call_async(request), self.on_control_response
+        )
         self.get_logger().info(f"Calling local {action}: {request.task}")
 
     def on_control_response(self, future):
@@ -601,11 +817,16 @@ class WorkflowController(Node):
             self.phase = "arm_disable_pending"
             request = SetBool.Request()
             request.data = False
-            self.add_callback(self.admittance_enable_client.call_async(request),
-                              self.on_arm_disable_response)
+            self.add_callback(
+                self.admittance_enable_client.call_async(request),
+                self.on_arm_disable_response,
+            )
             return
         if self.phase == "ready":
-            if not self.execute_client.service_is_ready() or self.target_publisher.get_subscription_count() == 0:
+            if (
+                not self.execute_client.service_is_ready()
+                or self.target_publisher.get_subscription_count() == 0
+            ):
                 return
             target = self.make_pose_array(step)
             target.header.stamp = self.get_clock().now().to_msg()
@@ -613,9 +834,7 @@ class WorkflowController(Node):
             delivery_delay = float(step.get("delivery_delay", 0.2))
             self.deadline_ns = now_ns + int(delivery_delay * 1_000_000_000)
             self.phase = "arm_delivery"
-            self.get_logger().info(
-                f"Published {len(target.poses)} robot pose(s)"
-            )
+            self.get_logger().info(f"Published {len(target.poses)} robot pose(s)")
         elif self.phase == "arm_delivery" and now_ns >= self.deadline_ns:
             self.phase = "arm_pending"
             future = self.execute_client.call_async(Trigger.Request())
@@ -707,16 +926,67 @@ class WorkflowController(Node):
         )
         return target
 
+    def on_robot_task_running(self, message):
+        self.robot_task_running = message.data
+
+    def arm_ready(self):
+        if not self.require_arm_ready:
+            return True
+        now = monotonic()
+        if (
+            self.arm_check_future is None or self.arm_check_future.done()
+        ) and now - self.arm_check_requested >= 1.0:
+            if self.arm_controllers_client.service_is_ready():
+                self.arm_check_requested = now
+                self.arm_check_future = self.arm_controllers_client.call_async(
+                    ListControllers.Request()
+                )
+                self.arm_check_future.add_done_callback(self.on_arm_controllers)
+        ready = (
+            self.robot_task_running
+            and self.robot_task_subscription.get_publisher_count() > 0
+            and self.arm_controllers_active
+            and now - self.arm_controllers_checked <= 2.5
+        )
+        if not ready and not self.arm_wait_logged:
+            self.get_logger().info(
+                "Waiting for robot external control and active arm controllers"
+            )
+            self.arm_wait_logged = True
+        if ready:
+            self.arm_wait_logged = False
+        return ready
+
+    def on_arm_controllers(self, future):
+        try:
+            states = {item.name: item.state for item in future.result().controller}
+            required = (
+                "scaled_joint_trajectory_controller",
+                "joint_state_broadcaster",
+                "speed_scaling_state_broadcaster",
+                "tcp_pose_broadcaster",
+            )
+            self.arm_controllers_active = all(
+                states.get(name) == "active" for name in required
+            )
+            self.arm_controllers_checked = monotonic()
+        except Exception as exc:
+            self.arm_controllers_active = False
+            self.get_logger().warn(f"Cannot check arm controller readiness: {exc}")
+
     def advance_arm_move(self, step, now_ns):
         mode = step["control_mode"]
         if self.phase == "ready":
+            if not self.arm_ready():
+                return
             if not self.admittance_enable_client.service_is_ready():
                 return
             if mode == "admittance":
                 if self.compliant_target_publisher.get_subscription_count() == 0:
                     return
                 wrench_age = (
-                    None if self.last_compliant_wrench_ns is None
+                    None
+                    if self.last_compliant_wrench_ns is None
                     else (now_ns - self.last_compliant_wrench_ns) / 1_000_000_000.0
                 )
                 if wrench_age is None or wrench_age > 0.5:
@@ -771,9 +1041,8 @@ class WorkflowController(Node):
             return
         self.target_publisher.publish(self.pending_arm_target)
         delivery_delay = float(self.current_step().get("delivery_delay", 0.2))
-        self.deadline_ns = (
-            self.get_clock().now().nanoseconds
-            + int(delivery_delay * 1_000_000_000)
+        self.deadline_ns = self.get_clock().now().nanoseconds + int(
+            delivery_delay * 1_000_000_000
         )
         self.phase = "arm_delivery"
         self.get_logger().info(
@@ -813,9 +1082,8 @@ class WorkflowController(Node):
         if error < self.arm_best_error - 0.002:
             self.arm_best_error = error
             self.arm_last_progress_ns = now_ns
-        if (
-            elapsed >= float(step.get("motion_timeout_sec", 20.0))
-            or stalled >= float(step.get("progress_timeout_sec", 5.0))
+        if elapsed >= float(step.get("motion_timeout_sec", 20.0)) or stalled >= float(
+            step.get("progress_timeout_sec", 5.0)
         ):
             self.stop_admittance_after_failure(
                 f"arm did not settle within {float(step.get('arrival_tolerance', 0.01)):.3f} m: "
@@ -897,9 +1165,7 @@ class WorkflowController(Node):
         self.failed = True
         self.active = False
         self.phase = "failed"
-        self.get_logger().error(
-            f"Workflow '{self.workflow_name}' stopped: {message}"
-        )
+        self.get_logger().error(f"Workflow '{self.workflow_name}' stopped: {message}")
         step = self.current_step()
         if step and step["action"] in ("chassis_execute", "wait_chassis"):
             self.get_logger().error(

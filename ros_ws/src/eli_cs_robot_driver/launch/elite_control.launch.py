@@ -173,7 +173,10 @@ def launch_setup(context, *args, **kwargs):
     initial_joint_controllers = PathJoinSubstitution(
         [FindPackageShare(runtime_config_package), "config", controllers_file_value]
     )
-    
+    # Controllers no longer inherit the manager's global arguments in Jazzy.
+    # Resolve substitutions once and pass this same file to every spawner.
+    controller_parameters = ParameterFile(initial_joint_controllers, allow_substs=True)
+    controller_parameters_path = str(controller_parameters.evaluate(context))
 
     rviz_config_file = PathJoinSubstitution(
         [FindPackageShare(description_package), "rviz", "view_robot.rviz"]
@@ -194,7 +197,7 @@ def launch_setup(context, *args, **kwargs):
         parameters=[
             robot_description,
             update_rate_config_file,
-            ParameterFile(initial_joint_controllers, allow_substs=True),
+            controller_parameters,
         ],
         output="screen",
         condition=IfCondition(use_fake_hardware),
@@ -202,12 +205,14 @@ def launch_setup(context, *args, **kwargs):
 
     
     eli_control_node = Node(
-        package="eli_cs_robot_driver",
-        executable="eli_ros2_control_node",
+        # Use the installed ros2_control loop (clock, overrun handling and FIFO
+        # setup) with our hardware plugin, rather than the old Humble loop.
+        package="controller_manager",
+        executable="ros2_control_node",
         parameters=[
             robot_description,
             update_rate_config_file,
-            ParameterFile(initial_joint_controllers, allow_substs=True),
+            controller_parameters,
         ],
         output="screen",
         condition=UnlessCondition(use_fake_hardware),
@@ -270,6 +275,8 @@ def launch_setup(context, *args, **kwargs):
                 "/controller_manager",
                 "--controller-manager-timeout",
                 controller_spawner_timeout,
+                "--param-file",
+                controller_parameters_path,
             ]
             + inactive_flags,
         )
@@ -300,6 +307,8 @@ def launch_setup(context, *args, **kwargs):
             "/controller_manager",
             "--controller-manager-timeout",
             controller_spawner_timeout,
+            "--param-file",
+            controller_parameters_path,
         ],
         condition=IfCondition(activate_joint_controller),
     )
@@ -312,6 +321,8 @@ def launch_setup(context, *args, **kwargs):
             "/controller_manager",
             "--controller-manager-timeout",
             controller_spawner_timeout,
+            "--param-file",
+            controller_parameters_path,
             "--inactive",
         ],
         condition=UnlessCondition(activate_joint_controller),

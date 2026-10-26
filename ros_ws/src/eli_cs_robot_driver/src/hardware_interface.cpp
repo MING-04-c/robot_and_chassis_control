@@ -554,7 +554,28 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
     transformForceTorque();
 
     system_interface_initialized_ = 1.0;
-    robot_task_running_copy_ = ((runtime_state_ == ELITE::TaskStatus::PLAYING) && is_robot_connected_);
+    const bool task_running = (runtime_state_ == ELITE::TaskStatus::PLAYING) && is_robot_connected_;
+    robot_task_running_copy_ = task_running;
+    if (task_running != logged_task_running_) {
+        const auto clock_now = std::chrono::steady_clock::now();
+        if (task_running) {
+            max_control_write_gap_ms_ = 0.0;
+            last_control_write_ = clock_now;
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "External control ready: runtime=%d, sockets_connected=true, command_timeout=%.1f ms",
+                        static_cast<int>(runtime_state_), recv_timeout_ * 1000.0);
+        } else {
+            const double last_gap = last_control_write_.time_since_epoch().count() == 0 ? 0.0 :
+                std::chrono::duration<double, std::milli>(clock_now - last_control_write_).count();
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "External control lost: runtime=%d, sockets_connected=%s, robot_mode=%d, safety_mode=%d, "
+                        "last_write_gap=%.1f ms, max_write_gap=%.1f ms, command_timeout=%.1f ms",
+                        static_cast<int>(runtime_state_), is_robot_connected_ ? "true" : "false",
+                        static_cast<int>(robot_mode_copy_), static_cast<int>(safety_mode_copy_),
+                        last_gap, std::max(last_gap, max_control_write_gap_ms_), recv_timeout_ * 1000.0);
+        }
+        logged_task_running_ = task_running;
+    }
 
     return hardware_interface::return_type::OK;
 }
@@ -564,16 +585,29 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::write(const rc
     (void)period;
     // If there is no interpreting task running on the robot, we do not want to send anything.
     if (runtime_state_ == ELITE::TaskStatus::PLAYING && is_robot_connected_) {
+        const auto clock_now = std::chrono::steady_clock::now();
+        const double gap_ms = last_control_write_.time_since_epoch().count() == 0 ? 0.0 :
+            std::chrono::duration<double, std::milli>(clock_now - last_control_write_).count();
+        max_control_write_gap_ms_ = std::max(max_control_write_gap_ms_, gap_ms);
+        last_control_write_ = clock_now;
+        bool sent = false;
         if (position_controller_running_) {
-            eli_driver_->writeServoj(position_commands_, recv_timeout_ * 1000, false);
+            sent = eli_driver_->writeServoj(position_commands_, recv_timeout_ * 1000, false);
 
         } else if (velocity_controller_running_) {
-            eli_driver_->writeSpeedj(velocity_commands_, recv_timeout_ * 1000);
+            sent = eli_driver_->writeSpeedj(velocity_commands_, recv_timeout_ * 1000);
 
         } else if (freedrive_controller_running_ && freedrive_activated_) {
-            eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_NOOP, recv_timeout_ * 1000);
+            sent = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_NOOP, recv_timeout_ * 1000);
         } else {
-            eli_driver_->writeIdle(recv_timeout_ * 1000);
+            sent = eli_driver_->writeIdle(recv_timeout_ * 1000);
+        }
+        if ((!sent || gap_ms >= recv_timeout_ * 500.0) &&
+            clock_now - last_control_warning_ >= std::chrono::seconds(2)) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "External command write: sent=%s, interval=%.1f ms, command_timeout=%.1f ms",
+                        sent ? "true" : "false", gap_ms, recv_timeout_ * 1000.0);
+            last_control_warning_ = clock_now;
         }
     }
 

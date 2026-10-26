@@ -3,18 +3,30 @@ line_follow_controller:
     enabled: true                    # 有效蓝线和底盘反馈到齐后开始循迹
     forward_speed: 0.05               # m/s：0.05 = 5 cm/s，可在线调整
     max_forward_speed: 0.30           # 前进速度参数上限，m/s
-    steering_gain: 0.8                # 归一化图像偏差 -> rad/s
-    steering_sign: -1.0               # 正偏差在画面右侧 -> 右转；镜像相机可改 +1.0
+    image_forward_direction: down    # 实际轮子/车身在画面上方，前方朝画面下方
+    vehicle_reference_x_ratio: 0.5   # 虚拟车身参考横坐标；对准车身中心线后校准
+    vehicle_reference_y_ratio: -0.05 # 画面上方5%的虚拟参考，需按轮轴位置校准
+    lookahead_distance_ratio: 0.45   # 从车身参考向前看的距离 / 图像高度
+    near_edge_margin_ratio: 0.25    # 上方轮子近端区域，地面检查起点向前移图高25%
+    max_near_gap_ratio: 0.35         # 从可见地面检查起点起，缺线超过图高35%停车
+    heading_gain: 0.5                 # 车身参考到前瞻点的方向误差 -> rad/s
+    max_heading_error_rad: 1.2        # 偏离前进轴超过约69度则停车
+    steering_gain: 1.2                # 近端中线横向误差 -> rad/s
+    steering_sign: -1.0               # down 下有效转向符号为 +1，保持已校正的左右关系
     max_angular_speed: 0.5            # rad/s，约 28.6 度/秒
-    error_deadband: 0.02              # 图像归一化偏差死区
+    error_deadband: 0.03              # 横向偏差连续死区，抑制直线小抖动
+    heading_deadband_rad: 0.035      # 方向误差连续死区，约2度
+    steering_filter_time_sec: 0.2    # 转向低通时间常数；0关闭，过大会拖慢弯道响应
     curve_slowdown: 0.7               # 偏差越大，前进越慢
     min_speed_factor: 0.3
     estimated_speed_factor: 0.3       # 估计目标/疑似遮挡时再减速
     fallback_speed_factor: 0.5        # 前瞻目标回退时再减速
     linear_acceleration: 0.15         # m/s²；丢线时立即发零，不使用缓降
-    angular_acceleration: 1.0         # rad/s²
+    angular_acceleration: 0.5         # rad/s²，限制转向变化速度
     min_valid_row_fraction: 0.2       # 有效扫描行比例，不是安全置信度
-    require_bottom_connected: true   # 要求胶带与画面底部连接，可在线调整
+    allow_curved_candidates: true    # 横向分类的弯线需通过实际前方几何检查
+    min_forward_span_ratio: 0.15     # 观测中线前后跨度至少为图高15%
+    require_bottom_connected: false  # 允许有效可见中线；true 强制胶带连接画面底部
     input_timeout_sec: 0.5            # 视觉/底盘状态超时即停车
     comm_timeout_sec: 2.5             # 通信状态默认约 1 Hz
     control_period_sec: 0.02          # 50 Hz 发布 cmd_vel

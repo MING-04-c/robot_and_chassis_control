@@ -115,6 +115,8 @@ struct CanConfig {
     std::uint8_t m_expected_protocol_version = kProtocolVersionV10;
     /// How long Connect() waits for a valid system_version_feedback (0x205) frame.
     int m_connect_timeout_ms = 1000;
+    /// Disable periodic 0x100 transmission for tow-only sessions; feedback and services remain active.
+    bool m_motion_command_transmit_enabled = true;
     /// Period for SDK-owned motion_control_cmd (0x100) sending.
     int m_motion_command_period_ms = 20;
     /// If SetMotionCommand() is not refreshed within this time, SDK sends zero motion.

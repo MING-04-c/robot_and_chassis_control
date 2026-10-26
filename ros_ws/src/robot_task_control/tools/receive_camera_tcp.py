@@ -39,7 +39,10 @@ def receive_frame(connection):
         raise ValueError("Unsupported message type")
     payload_length = header.get("payload_length")
     if header.get("version") == 1 and header.get("encoding") == "jpeg":
-        if not isinstance(payload_length, int) or not 1 <= payload_length <= MAX_JPEG_LENGTH:
+        if (
+            not isinstance(payload_length, int)
+            or not 1 <= payload_length <= MAX_JPEG_LENGTH
+        ):
             raise ValueError("Invalid JPEG length")
     elif header.get("version") == 2:
         width, height, step = (header.get(key) for key in ("width", "height", "step"))
@@ -49,8 +52,11 @@ def receive_frame(connection):
             raise ValueError("Invalid byte order")
         if not isinstance(header.get("encoding"), str) or not header["encoding"]:
             raise ValueError("Missing ROS image encoding")
-        if (not isinstance(payload_length, int) or payload_length != step * height
-                or payload_length > MAX_RAW_LENGTH):
+        if (
+            not isinstance(payload_length, int)
+            or payload_length != step * height
+            or payload_length > MAX_RAW_LENGTH
+        ):
             raise ValueError("Invalid raw image length")
     else:
         raise ValueError("Unsupported image protocol version or encoding")
@@ -82,7 +88,7 @@ def decode_for_display(header, payload, cv2, np):
     if step < width * channels:
         raise ValueError("Raw row is shorter than image width")
     rows = np.frombuffer(payload, dtype=np.uint8).reshape(height, step)
-    pixels = rows[:, :width * channels].reshape(height, width, channels)
+    pixels = rows[:, : width * channels].reshape(height, width, channels)
     if encoding == "rgb8":
         return cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
     if encoding == "rgba8":
@@ -95,13 +101,25 @@ def decode_for_display(header, payload, cv2, np):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Receive MASC JPEG or raw images over direct TCP")
-    parser.add_argument("--host", default="169.254.199.100", help="Camera computer Ethernet IP")
+    parser = argparse.ArgumentParser(
+        description="Receive MASC JPEG or raw images over direct TCP"
+    )
+    parser.add_argument(
+        "--host", default="169.254.199.100", help="Camera computer Ethernet IP"
+    )
     parser.add_argument("--port", type=int, default=9002)
-    parser.add_argument("--latest", type=Path, help="Overwrite this .jpg or .raw and its .json metadata")
+    parser.add_argument(
+        "--latest", type=Path, help="Overwrite this .jpg or .raw and its .json metadata"
+    )
     parser.add_argument("--save-dir", type=Path, help="Save every received frame")
-    parser.add_argument("--show", action="store_true", help="Display supported image encodings with OpenCV")
-    parser.add_argument("--count", type=int, default=0, help="Stop after N frames; 0 means continuous")
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Display supported image encodings with OpenCV",
+    )
+    parser.add_argument(
+        "--count", type=int, default=0, help="Stop after N frames; 0 means continuous"
+    )
     args = parser.parse_args()
     if args.count < 0:
         parser.error("--count must be nonnegative")
@@ -115,7 +133,9 @@ def main():
     try:
         while args.count == 0 or received < args.count:
             try:
-                with socket.create_connection((args.host, args.port), timeout=5.0) as connection:
+                with socket.create_connection(
+                    (args.host, args.port), timeout=5.0
+                ) as connection:
                     connection.settimeout(15.0)
                     print("Connected to %s:%d" % (args.host, args.port), flush=True)
                     while args.count == 0 or received < args.count:
@@ -126,14 +146,20 @@ def main():
                             write_latest(args.latest, header, payload)
                         if args.save_dir:
                             name = "frame_%08d_%d%s" % (
-                                header["sequence"], header["stamp_ns"], suffix
+                                header["sequence"],
+                                header["stamp_ns"],
+                                suffix,
                             )
                             write_latest(args.save_dir / name, header, payload)
                         print(
                             "frame %d: %dx%d, %s, %d bytes, timestamp %d"
                             % (
-                                header["sequence"], header["width"], header["height"],
-                                header["encoding"], len(payload), header["stamp_ns"]
+                                header["sequence"],
+                                header["width"],
+                                header["height"],
+                                header["encoding"],
+                                len(payload),
+                                header["stamp_ns"],
                             ),
                             flush=True,
                         )

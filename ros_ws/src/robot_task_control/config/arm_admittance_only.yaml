@@ -1,0 +1,21 @@
+# 导纳以步骤开始时的当前 TCP 为目标，无预设位移；完成后保持柔顺。
+workflow:
+  name: arm_admittance_only
+  auto_start: false
+  steps:
+  - action: arm_move
+    control_mode: admittance
+    frame_id: base_link
+    end_effector_frame: tool0
+    max_position_distance: 0.01
+    arrival_tolerance: 0.005
+    after_arrival_delay_sec: 2.0
+    motion_timeout_sec: 60.0
+    progress_timeout_sec: 10.0
+    target_pose:
+      position_mode: relative
+      position:
+      - 0.0
+      - 0.0
+      - 0.0
+      orientation: current

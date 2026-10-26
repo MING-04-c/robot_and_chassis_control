@@ -16,7 +16,6 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
-find_package(controller_manager REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(backward_ros REQUIRED)
 find_package(elite-cs-series-sdk 1.2.0 REQUIRED)
@@ -192,22 +191,8 @@ install(
   DESTINATION lib/${PROJECT_NAME}
 )
 
-#
-# eli_ros2_control_node
-#
-add_executable(
-  eli_ros2_control_node
-  src/control_node.cpp
-)
-ament_target_dependencies(
-  eli_ros2_control_node
-  controller_manager
-  rclcpp
-)
-install(
-  TARGETS eli_ros2_control_node
-  DESTINATION lib/${PROJECT_NAME}
-)
+# 控制循环由 Jazzy 官方 controller_manager/ros2_control_node 提供。
+# 本包仅构建硬件插件，无需链接或维护另一份控制管理器。
 
 # install resources file
 install(

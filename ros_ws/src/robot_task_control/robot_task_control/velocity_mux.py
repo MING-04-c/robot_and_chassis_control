@@ -10,21 +10,24 @@ from std_srvs.srv import SetBool
 
 class VelocityMux(Node):
     def __init__(self):
-        super().__init__('chassis_velocity_mux')
-        self.timeout = float(self.declare_parameter('command_timeout_sec', 0.1).value)
+        super().__init__("chassis_velocity_mux")
+        self.timeout = float(self.declare_parameter("command_timeout_sec", 0.1).value)
         if not 0.02 <= self.timeout <= 0.5:
-            raise ValueError('command_timeout_sec must be 0.02..0.5')
-        self.enabled = True
-        self.source = 'pid'
+            raise ValueError("command_timeout_sec must be 0.02..0.5")
+        self.enabled = bool(self.declare_parameter("enabled_on_startup", True).value)
+        self.source = "pid"
         self.command = None
         self.received = None
-        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        for source in ('pid', 'line_follow'):
+        self.publisher = self.create_publisher(Twist, "/cmd_vel", 10)
+        for source in ("pid", "line_follow"):
             self.create_subscription(
-                Twist, f'/robot_control/{source}/cmd_vel',
-                lambda message, source=source: self.on_command(source, message), 10)
-        self.create_service(SetBool, '~/line_follow_mode', self.on_mode)
-        self.create_service(SetBool, '~/enable', self.on_enable)
+                Twist,
+                f"/robot_control/{source}/cmd_vel",
+                lambda message, source=source: self.on_command(source, message),
+                10,
+            )
+        self.create_service(SetBool, "~/line_follow_mode", self.on_mode)
+        self.create_service(SetBool, "~/enable", self.on_enable)
         self.create_timer(0.02, self.tick)
 
     def reset(self):
@@ -37,7 +40,7 @@ class VelocityMux(Node):
             self.received = monotonic()
 
     def on_mode(self, request, response):
-        self.source = 'line_follow' if request.data else 'pid'
+        self.source = "line_follow" if request.data else "pid"
         self.reset()
         response.success = True
         response.message = self.source
@@ -47,13 +50,16 @@ class VelocityMux(Node):
         self.enabled = request.data
         self.reset()
         response.success = True
-        response.message = 'enabled' if self.enabled else 'stopped'
+        response.message = "enabled" if self.enabled else "stopped"
         return response
 
     def tick(self):
         command = Twist()
-        if (self.enabled and self.received is not None
-                and monotonic() - self.received <= self.timeout):
+        if (
+            self.enabled
+            and self.received is not None
+            and monotonic() - self.received <= self.timeout
+        ):
             command = self.command
         self.publisher.publish(command)
 

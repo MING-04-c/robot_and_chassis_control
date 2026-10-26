@@ -211,6 +211,8 @@ void ChassisRosDriverNode::LoadParameters() {
     m_auto_reconnect = DeclareParameter(this, "can.auto_reconnect", true);
     m_reconnect_period_ms = DeclareParameter(this, "can.reconnect_period_ms", 1000);
 
+    m_can_config.m_motion_command_transmit_enabled =
+        DeclareParameter(this, "command.transmit_enabled", true);
     m_can_config.m_motion_command_period_ms = DeclareParameter(this, "command.period_ms", 20);
     m_can_config.m_motion_command_timeout_ms = DeclareParameter(this, "command.timeout_ms", 100);
     m_stamped_control = DeclareParameter(this, "command.stamped_control", false);
@@ -482,6 +484,11 @@ void ChassisRosDriverNode::CommandTimerCallback() {
     }
 
     const auto now = Now(this);
+    if (!m_can_config.m_motion_command_transmit_enabled) {
+        // Tow-only session: neither periodic motion nor automatic mode requests.
+        m_auto_lock_controller.Reset();
+        return;
+    }
     auto command = m_command_filter.BuildCommand(twist, has_command, stamp, now);
     const auto auto_lock_result = m_auto_lock_controller.Update(BuildAutoLockInput(command, now));
     SendAutoLockMotionModeRequest(auto_lock_result);

@@ -147,7 +147,8 @@ class CameraImageTcpNode(Node):
         if self.delivery_mode not in ("photos", "stream"):
             raise ValueError("delivery_mode must be photos or stream")
         self.image_topic = self.declare_parameter(
-            "image_topic", "/dataset_capture/captured_image").value
+            "image_topic", "/dataset_capture/captured_image"
+        ).value
         listen_ip = self.declare_parameter("listen_ip", DEFAULT_BIND_IP).value
         allowed_client_ip = self.declare_parameter(
             "allowed_client_ip", DEFAULT_ALLOWED_CLIENT_IP
@@ -157,14 +158,21 @@ class CameraImageTcpNode(Node):
         self.image_format = self.declare_parameter("image_format", "jpeg").value
         self.jpeg_quality = self.declare_parameter("jpeg_quality", 80).value
         for parameter_name, address in (
-            ("listen_ip", listen_ip), ("allowed_client_ip", allowed_client_ip)
+            ("listen_ip", listen_ip),
+            ("allowed_client_ip", allowed_client_ip),
         ):
             try:
                 parsed = ipaddress.IPv4Address(address)
             except ipaddress.AddressValueError as exc:
                 raise ValueError("%s must be an IPv4 address" % parameter_name) from exc
-            if parsed.is_unspecified or parsed.is_multicast or parsed == ipaddress.IPv4Address("255.255.255.255"):
-                raise ValueError("%s must be a single host IPv4 address" % parameter_name)
+            if (
+                parsed.is_unspecified
+                or parsed.is_multicast
+                or parsed == ipaddress.IPv4Address("255.255.255.255")
+            ):
+                raise ValueError(
+                    "%s must be a single host IPv4 address" % parameter_name
+                )
         if not 1 <= listen_port <= 65535:
             raise ValueError("listen_port must be between 1 and 65535")
         if self.image_format not in ("jpeg", "raw"):
@@ -181,42 +189,65 @@ class CameraImageTcpNode(Node):
         self.server = ImageTcpServer(
             (listen_ip, listen_port), self.frames, allowed_client_ip
         )
-        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
         self.server_thread.start()
         self.create_service(Trigger, "~/ready", self.on_ready)
         self.subscription = self.create_subscription(
-            Image, self.image_topic, self.on_image,
-            10 if self.delivery_mode == "photos" else qos_profile_sensor_data
+            Image,
+            self.image_topic,
+            self.on_image,
+            10 if self.delivery_mode == "photos" else qos_profile_sensor_data,
         )
         self.get_logger().info(
             "%s TCP %s listening on %s:%d, allowing %s, topic %s"
-            % (self.image_format, self.delivery_mode, listen_ip, listen_port, allowed_client_ip, self.image_topic)
+            % (
+                self.image_format,
+                self.delivery_mode,
+                listen_ip,
+                listen_port,
+                allowed_client_ip,
+                self.image_topic,
+            )
         )
 
     def on_ready(self, request, response):
         del request
         response.success = self.server.has_clients() and (
-            not isinstance(self.frames, PhotoQueue) or self.frames.has_space())
-        response.message = "receiver connected" if response.success else "no image receiver connected"
+            not isinstance(self.frames, PhotoQueue) or self.frames.has_space()
+        )
+        response.message = (
+            "receiver connected" if response.success else "no image receiver connected"
+        )
         return response
 
     def on_image(self, msg):
         if not self.server.has_clients():
             return
         now = time.monotonic()
-        if self.delivery_mode == "stream" and now - self.last_publish_time < 1.0 / self.max_fps:
+        if (
+            self.delivery_mode == "stream"
+            and now - self.last_publish_time < 1.0 / self.max_fps
+        ):
             return
         if self.image_format == "raw":
             # Preserve Image.data exactly, including row padding described by step.
             payload = bytes(msg.data)
-            if msg.width <= 0 or msg.height <= 0 or msg.step <= 0 or len(payload) != msg.step * msg.height:
+            if (
+                msg.width <= 0
+                or msg.height <= 0
+                or msg.step <= 0
+                or len(payload) != msg.step * msg.height
+            ):
                 self.get_logger().error("Invalid ROS Image dimensions or data length")
                 return
             header = {
                 "version": RAW_PROTOCOL_VERSION,
                 "type": "image",
                 "sequence": self.sequence + 1,
-                "stamp_ns": msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec,
+                "stamp_ns": msg.header.stamp.sec * 1_000_000_000
+                + msg.header.stamp.nanosec,
                 "frame_id": msg.header.frame_id,
                 "topic": self.image_topic,
                 "width": int(msg.width),
@@ -243,7 +274,8 @@ class CameraImageTcpNode(Node):
                 "version": JPEG_PROTOCOL_VERSION,
                 "type": "image",
                 "sequence": self.sequence + 1,
-                "stamp_ns": msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec,
+                "stamp_ns": msg.header.stamp.sec * 1_000_000_000
+                + msg.header.stamp.nanosec,
                 "frame_id": msg.header.frame_id,
                 "topic": self.image_topic,
                 "width": int(frame.shape[1]),
@@ -256,7 +288,9 @@ class CameraImageTcpNode(Node):
         header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
         packet = MAGIC + struct.pack("!I", len(header_bytes)) + header_bytes + payload
         if self.frames.publish(self.sequence, packet) is False:
-            self.get_logger().error("Photo send queue is full; photo remains saved locally")
+            self.get_logger().error(
+                "Photo send queue is full; photo remains saved locally"
+            )
         self.last_publish_time = now
 
     def close(self):

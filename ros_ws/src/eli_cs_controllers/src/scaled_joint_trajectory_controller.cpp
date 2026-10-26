@@ -48,9 +48,17 @@ controller_interface::return_type ScaledJointTrajectoryController::update(const 
     }
 
     // 如果控制器当前处于非激活状态，则跳过轨迹执行
-    if (get_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+    if (get_node()->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
         return controller_interface::return_type::OK;
     }
+
+#ifdef ELITE_JTC_NEW_API
+    auto& trajectory = current_trajectory_;
+    auto& new_trajectory = new_trajectory_msg_;
+#else
+    auto& trajectory = traj_external_point_ptr_;
+    auto& new_trajectory = traj_msg_external_point_ptr_;
+#endif
 
     // 局部 lambda：计算每个关节当前与期望之间的误差
     auto compute_error_for_joint = [&](JointTrajectoryPoint& error, int index, const JointTrajectoryPoint& current,
@@ -73,13 +81,13 @@ controller_interface::return_type ScaledJointTrajectoryController::update(const 
     const auto active_goal = *rt_active_goal_.readFromRT();
 
     // 检查是否有新的外部轨迹消息到来
-    auto current_external_msg = traj_external_point_ptr_->get_trajectory_msg();
-    auto new_external_msg = traj_msg_external_point_ptr_.readFromRT();
+    auto current_external_msg = trajectory->get_trajectory_msg();
+    auto new_external_msg = new_trajectory.readFromRT();
     if (current_external_msg != *new_external_msg && !(rt_has_pending_goal_ && !active_goal)) {
         fill_partial_goal(*new_external_msg);
         sort_to_local_joint_order(*new_external_msg);
         // TODO: 在这里可以集成额外的位置/速度补偿逻辑
-        traj_external_point_ptr_->update(*new_external_msg);
+        trajectory->update(*new_external_msg);
     }
 
     // 从状态接口读取当前机器人状态
@@ -102,37 +110,37 @@ controller_interface::return_type ScaledJointTrajectoryController::update(const 
         time_data_.initRT(time_data);
 
         bool first_sample = false;
-        if (!traj_external_point_ptr_->is_sampled_already()) {
+        if (!trajectory->is_sampled_already()) {
             first_sample = true;
             if (params_.open_loop_control) {
                 // 开环控制时，起始点使用上一次命令值
-                traj_external_point_ptr_->set_point_before_trajectory_msg(traj_time, last_commanded_state_);
+                trajectory->set_point_before_trajectory_msg(traj_time, last_commanded_state_);
             } else {
                 // 闭环控制时，起始点使用当前真实状态
-                traj_external_point_ptr_->set_point_before_trajectory_msg(traj_time, state_current_);
+                trajectory->set_point_before_trajectory_msg(traj_time, state_current_);
             }
         }
 
         // 根据 traj_time 从轨迹中采样目标点
         joint_trajectory_controller::TrajectoryPointConstIter start_segment_itr, end_segment_itr;
         const bool valid_point =
-            traj_external_point_ptr_->sample(traj_time, interpolation_method_, state_desired_, start_segment_itr, end_segment_itr);
+            trajectory->sample(traj_time, interpolation_method_, state_desired_, start_segment_itr, end_segment_itr);
 
         if (valid_point) {
-            const rclcpp::Time traj_start = traj_external_point_ptr_->time_from_start();
+            const rclcpp::Time traj_start = trajectory->time_from_start();
             const rclcpp::Time segment_time_from_start = traj_start + start_segment_itr->time_from_start;
             double time_difference = time.seconds() - segment_time_from_start.seconds();
             bool tolerance_violated_while_moving = false;
             bool outside_goal_tolerance = false;
             bool within_goal_time = true;
-            const bool before_last_point = end_segment_itr != traj_external_point_ptr_->end();
+            const bool before_last_point = end_segment_itr != trajectory->end();
 
             // 如果已经到达末点且命令超时，则中止执行
             if (!before_last_point && !rt_is_holding_ && cmd_timeout_ > 0.0 &&
                 time_difference > cmd_timeout_) {
                 RCLCPP_WARN(get_node()->get_logger(), "Aborted due to command timeout");
-                traj_msg_external_point_ptr_.reset();
-                traj_msg_external_point_ptr_.initRT(set_hold_position());
+                new_trajectory.reset();
+                new_trajectory.initRT(set_hold_position());
             }
 
             // 检查每个关节的状态容差与目标容差
@@ -202,8 +210,8 @@ controller_interface::return_type ScaledJointTrajectoryController::update(const 
                     rt_active_goal_.writeFromNonRT(RealtimeGoalHandlePtr());
                     rt_has_pending_goal_ = false;
                     RCLCPP_WARN(get_node()->get_logger(), "Aborted due to state tolerance violation");
-                    traj_msg_external_point_ptr_.reset();
-                    traj_msg_external_point_ptr_.initRT(set_hold_position());
+                    new_trajectory.reset();
+                    new_trajectory.initRT(set_hold_position());
                 } else if (!before_last_point) {
                     if (!outside_goal_tolerance) {
                         auto res = std::make_shared<FollowJTrajAction::Result>();
@@ -212,8 +220,8 @@ controller_interface::return_type ScaledJointTrajectoryController::update(const 
                         rt_active_goal_.writeFromNonRT(RealtimeGoalHandlePtr());
                         rt_has_pending_goal_ = false;
                         RCLCPP_INFO(get_node()->get_logger(), "Goal reached, success!");
-                        traj_msg_external_point_ptr_.reset();
-                        traj_msg_external_point_ptr_.initRT(set_success_trajectory_point());
+                        new_trajectory.reset();
+                        new_trajectory.initRT(set_success_trajectory_point());
                     } else if (!within_goal_time) {
                         auto result = std::make_shared<FollowJTrajAction::Result>();
                         result->set__error_code(FollowJTrajAction::Result::GOAL_TOLERANCE_VIOLATED);
@@ -222,25 +230,29 @@ controller_interface::return_type ScaledJointTrajectoryController::update(const 
                         rt_has_pending_goal_ = false;
                         RCLCPP_WARN(get_node()->get_logger(), "Aborted due goal_time_tolerance exceeding by %f seconds",
                                     time_difference);
-                        traj_msg_external_point_ptr_.reset();
-                        traj_msg_external_point_ptr_.initRT(set_hold_position());
+                        new_trajectory.reset();
+                        new_trajectory.initRT(set_hold_position());
                     }
                 }
             } else if (tolerance_violated_while_moving && !rt_has_pending_goal_) {
                 // 无活动 goal 且出现容差失败，则保持当前点
                 RCLCPP_ERROR(get_node()->get_logger(), "Holding position due to state tolerance violation");
-                traj_msg_external_point_ptr_.reset();
-                traj_msg_external_point_ptr_.initRT(set_hold_position());
+                new_trajectory.reset();
+                new_trajectory.initRT(set_hold_position());
             } else if (!before_last_point && !within_goal_time && !rt_has_pending_goal_) {
                 RCLCPP_ERROR(get_node()->get_logger(), "Exceeded goal_time_tolerance: holding position...");
-                traj_msg_external_point_ptr_.reset();
-                traj_msg_external_point_ptr_.initRT(set_hold_position());
+                new_trajectory.reset();
+                new_trajectory.initRT(set_hold_position());
             }
         }
     }
 
     // 发布当前轨迹状态给 base class 的状态话题
+#ifdef ELITE_JTC_NEW_API
+    publish_state(time, state_desired_, state_current_, state_error_);
+#else
     publish_state(state_desired_, state_current_, state_error_);
+#endif
     return controller_interface::return_type::OK;
 }
 

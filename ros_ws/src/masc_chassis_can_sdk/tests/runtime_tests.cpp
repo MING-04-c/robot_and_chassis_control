@@ -392,6 +392,41 @@ void TestMotionModeSupportByChassisType() {
     unsupported_producer.join();
 }
 
+void TestTowOnlySuppressesPeriodicMotion() {
+    auto transport = std::make_unique<MockTransport>();
+    auto *bus = transport.get();
+    ChassisSdk sdk(std::move(transport));
+    CanConfig config;
+    config.m_motion_command_transmit_enabled = false;
+    config.m_connect_timeout_ms = 500;
+    std::thread producer([bus]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        bus->PushRx(MakeVersionFrame(kProtocolVersionV10));
+    });
+    assert(sdk.Configure(config));
+    assert(sdk.Connect());
+    producer.join();
+    MotionCommand command;
+    command.m_target_linear_x_mps = 0.5;
+    sdk.SetMotionCommand(command);
+    CanFrame frame;
+    assert(!bus->WaitForTx(&frame, 80));
+    assert(sdk.SendTowMode(true));
+    assert(bus->WaitForTx(&frame, 100));
+    assert(frame.m_id == chassis_protocol::kTowModeCmdId && frame.m_data[0] == 1);
+    assert(!bus->WaitForTx(&frame, 80));
+    bus->PushRx(MakeSystemFrame());
+    for (int i = 0; i < 50 && !sdk.GetSystemFeedback().has_value(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    assert(sdk.GetSystemFeedback().has_value());
+    assert(sdk.SendTowMode(false));
+    assert(bus->WaitForTx(&frame, 100));
+    assert(frame.m_id == chassis_protocol::kTowModeCmdId && frame.m_data[0] == 0);
+    assert(!bus->WaitForTx(&frame, 80));
+    sdk.Disconnect();
+}
+
 void TestMotionCommandTimeoutZeroing() {
     auto transport = std::make_unique<MockTransport>();
     auto *transport_ptr = transport.get();
@@ -444,5 +479,6 @@ int main() {
     TestSendTowMode();
     TestMotionModeSupportByChassisType();
     TestMotionCommandTimeoutZeroing();
+    TestTowOnlySuppressesPeriodicMotion();
     return 0;
 }

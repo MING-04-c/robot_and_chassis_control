@@ -21,7 +21,14 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/robot_trajectory/robot_trajectory.h>
+#if __has_include(<moveit/trajectory_processing/iterative_time_parameterization.h>)
 #include <moveit/trajectory_processing/iterative_time_parameterization.h>
+#define ELITE_HAS_IPTP
+#elif __has_include(<moveit/trajectory_processing/iterative_time_parameterization.hpp>)
+#include <moveit/trajectory_processing/iterative_time_parameterization.hpp>
+#define ELITE_HAS_IPTP
+#endif
+#include "trajectory_timing.hpp"
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -420,6 +427,7 @@ private:
       return;
     }
 
+#ifdef ELITE_HAS_IPTP
     moveit::core::RobotState trajectory_start_state(move_group_->getRobotModel());
     trajectory_start_state.setToDefaultValues();
     trajectory_start_state.setVariablePositions(
@@ -440,6 +448,15 @@ private:
       return;
     }
     robot_trajectory.getRobotTrajectoryMsg(trajectory_message);
+#else
+    // Jazzy's Cartesian service already applies the configured velocity and
+    // acceleration scaling. Preserve those waypoints and reject invalid timing.
+    if (!has_valid_trajectory_timing(trajectory_message.joint_trajectory)) {
+      response->success = false;
+      response->message = "MoveIt returned a Cartesian trajectory without valid timestamps";
+      return;
+    }
+#endif
 
     // 时间参数完整后，执行整条笛卡尔轨迹。
     const auto execution_result = move_group_->execute(trajectory_message);

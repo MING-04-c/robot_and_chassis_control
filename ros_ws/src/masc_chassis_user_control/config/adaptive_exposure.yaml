@@ -1,0 +1,27 @@
+line_exposure_controller:
+  ros__parameters:
+    adaptive_enabled: true
+    exposure_min: 20                 # V4L2 相机原生曝光整数值
+    exposure_max: 200                # 保守上限，避免长曝光和严重过亮
+    change_ratio: 0.15               # 每次增减约15%
+    minimum_step: 5
+    cooldown_sec: 1.5                # 等待曝光生效后再评估
+    confirm_bad_checks: 3            # 连续3次低质量才调整（约1.5秒）
+    max_adjustments_per_episode: 8   # 持续不确定时最多8次，避免无休止搜索
+    quality_min: 0.35
+    blue_value_low: 20.0
+    blue_value_high: 180.0
+    scene_dark_value: 55.0
+    clipped_fraction_high: 0.12
+    min_blue_pixels: 25
+    hue_low: 100
+    hue_high: 130
+    saturation_min: 70
+    blue_excess_min: 0.12
+    roi_top: 0.20                    # 排除上方部分轮子区域
+    roi_bottom: 0.95
+    roi_left: 0.05
+    roi_right: 0.95
+    image_topic: /camera/image_raw
+    line_status_topic: /camera/line/status
+    input_timeout_sec: 1.0

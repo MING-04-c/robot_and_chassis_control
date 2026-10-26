@@ -16,13 +16,14 @@
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
+  <exec_depend>controller_manager_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>masc_chassis_msgs</exec_depend>
   <exec_depend>eli_cs_robot_usr</exec_depend>
   <exec_depend>eli_cs_robot_driver</exec_depend>
   <exec_depend>masc_chassis_ros_driver</exec_depend>
   <exec_depend>hik_camera_ros2_driver</exec_depend>
-  <exec_depend>camer_diver</exec_depend>
+  <exec_depend>ruier_camer_diver</exec_depend>
   <exec_depend>masc_chassis_user_control</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

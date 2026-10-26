@@ -11,7 +11,6 @@
 #include <memory>
 #include <string>
 
-#include "ament_index_cpp/get_package_share_directory.hpp"
 #include "rclcpp/exceptions/exceptions.hpp"
 
 namespace fs = std::filesystem;
@@ -21,8 +20,6 @@ public:
     CalibrationCorrection()
         : Node("cs_calibration",
                rclcpp::NodeOptions().allow_undeclared_parameters(true).automatically_declare_parameters_from_overrides(true)) {
-        std::string output_package_name;
-
         try {
             // The robot's IP address
             robot_ip_ = this->get_parameter("robot_ip").as_string();

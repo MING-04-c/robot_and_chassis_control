@@ -84,6 +84,12 @@ ament_target_dependencies(
   ${THIS_PACKAGE_DEPENDENCIES}
 )
 
+# ros2_controllers 4.x (Jazzy) renamed the protected trajectory buffers and
+# added the timestamp argument to publish_state(). Keep the older API path.
+if(joint_trajectory_controller_VERSION VERSION_GREATER_EQUAL "4.0.0")
+  target_compile_definitions(${PROJECT_NAME} PRIVATE ELITE_JTC_NEW_API)
+endif()
+
 target_compile_options(${PROJECT_NAME} PRIVATE -Wpedantic -Werror=return-type)
 
 # prevent pluginlib from using boost
@@ -118,5 +124,14 @@ ament_export_include_directories(
 ament_export_libraries(
   ${PROJECT_NAME}
 )
+
+if(BUILD_TESTING AND joint_trajectory_controller_VERSION VERSION_GREATER_EQUAL "4.0.0")
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_scaled_trajectory_jazzy test/test_scaled_trajectory_jazzy.cpp)
+  target_link_libraries(test_scaled_trajectory_jazzy ${PROJECT_NAME})
+  ament_target_dependencies(test_scaled_trajectory_jazzy ${THIS_PACKAGE_DEPENDENCIES})
+  set_tests_properties(test_scaled_trajectory_jazzy PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=189;ROS_LOCALHOST_ONLY=1;ROS_LOG_DIR=/tmp/eli-scaled-trajectory-tests")
+endif()
 
 ament_package()

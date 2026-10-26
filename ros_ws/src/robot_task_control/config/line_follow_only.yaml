@@ -1,0 +1,9 @@
+# 循迹累计有效 tracking 2 秒后停车；可修改 seconds 和 step_timeout_sec。
+workflow:
+  name: line_follow_only
+  auto_start: false
+  steps:
+  - action: line_follow
+    seconds: 2.0
+    progress_timeout_sec: 3.0
+    step_timeout_sec: 30.0

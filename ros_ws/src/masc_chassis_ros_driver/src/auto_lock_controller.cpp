@@ -18,10 +18,6 @@ double LowPass(double previous, double input, double alpha) {
     return previous + alpha * (input - previous);
 }
 
-double SnapToZero(double value, double threshold) {
-    return std::fabs(value) <= threshold ? 0.0 : value;
-}
-
 }  // namespace
 
 void AutoLockController::Configure(const AutoLockConfig &config) {
@@ -191,25 +187,20 @@ void AutoLockController::UpdateFilteredCommand(
                     command.m_target_steering_angle_rad, m_config.m_cmd_filter_alpha);
     }
 
-    m_filtered_command.m_target_linear_x_mps =
-        SnapToZero(m_filtered_command.m_target_linear_x_mps,
-                   m_config.m_cmd_zero_linear_threshold);
-    m_filtered_command.m_target_linear_y_mps =
-        SnapToZero(m_filtered_command.m_target_linear_y_mps,
-                   m_config.m_cmd_zero_linear_threshold);
-    m_filtered_command.m_target_angular_z_radps =
-        SnapToZero(m_filtered_command.m_target_angular_z_radps,
-                   m_config.m_cmd_zero_angular_threshold);
-    m_filtered_command.m_target_steering_angle_rad =
-        SnapToZero(m_filtered_command.m_target_steering_angle_rad,
-                   m_config.m_cmd_zero_angular_threshold);
+    // Preserve the filter accumulator. Snapping it to zero on every update
+    // prevents low-speed ramped commands from ever triggering an unlock.
+
 }
 
 bool AutoLockController::IsFilteredCommandZero() const {
-    return m_filtered_command.m_target_linear_x_mps == 0.0 &&
-           m_filtered_command.m_target_linear_y_mps == 0.0 &&
-           m_filtered_command.m_target_angular_z_radps == 0.0 &&
-           m_filtered_command.m_target_steering_angle_rad == 0.0;
+    return std::fabs(m_filtered_command.m_target_linear_x_mps) <=
+               m_config.m_cmd_zero_linear_threshold &&
+           std::fabs(m_filtered_command.m_target_linear_y_mps) <=
+               m_config.m_cmd_zero_linear_threshold &&
+           std::fabs(m_filtered_command.m_target_angular_z_radps) <=
+               m_config.m_cmd_zero_angular_threshold &&
+           std::fabs(m_filtered_command.m_target_steering_angle_rad) <=
+               m_config.m_cmd_zero_angular_threshold;
 }
 
 bool AutoLockController::IsMotionFeedbackStopped(

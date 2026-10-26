@@ -258,3 +258,7 @@ ROS2 参数文件使用：
 
 ROS 节点、话题、`comm_status`、`can_frame_stats` 和常见异常判断见
 [`../docs/ros_comm_check.md`](../docs/ros_comm_check.md)。
+
+拖车专用驱动可在启动参数中设置 `command.transmit_enabled: false`：禁止 SDK 周期发送
+运动帧0x100，并禁止驱动自动模式切换；反馈接收和拖车服务保持工作。默认true。
+此参数在启动时读取；正常运动必须重新以true启动，不可把反馈接收正常当成允许运动。

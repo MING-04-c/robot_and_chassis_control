@@ -2,6 +2,18 @@
 
 本包通过 MoveIt 将末端位姿转换为关节轨迹，并在到达目标后根据六维力传感器的数据进行平移柔顺控制。
 
+真机分开启动时，先在一个终端保持 `eli_cs_robot_driver elite_control.launch.py` 运行，再在另一个已加载 ROS 与工作区环境的终端执行：
+
+```bash
+ros2 launch eli_cs_robot_usr compliant_control_real.launch.py launch_rviz:=false sensor_host:=169.254.199.80
+```
+
+此入口默认自动等待外控程序运行、四个机械臂控制器激活以及零偏采集后的新鲜力数据，然后捕获当前 TCP 位姿开启导纳，无需手动调用服务。零偏采集时工具应无外部接触。默认不启动目标输入、轨迹执行器或阶段协调器；需要这些功能时显式启用对应参数，并设置 `auto_start_admittance:=false`。统一任务入口会关闭这个独立自动开启节点，由工作流管理导纳。
+
+独立自动开启时，就绪条件需连续保持 `arm_control_start_delay` 秒（默认 10 秒），中途断线或数据失效会重新计时。需要延长时在启动命令后加 `arm_control_start_delay:=15.0`。联合入口则先等机械臂连接稳定，再加载控制部分，避免同时启动所有节点。
+
+真机入口禁止 MoveIt 再次发布 `/robot_description`，硬件描述只由驱动的 robot_state_publisher 发布，避免规划模型中的默认连接参数覆盖真机参数。
+
 真机柔顺参数位于：
 
 ```text

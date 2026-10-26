@@ -13,12 +13,23 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     usr = FindPackageShare("eli_cs_robot_usr")
     moveit_cfg = FindPackageShare("eli_cs_robot_moveit_config")
+    auto_start = Node(
+        package="eli_cs_robot_usr", executable="auto_admittance_start.py",
+        name="auto_admittance_start", output="screen",
+        condition=IfCondition(LaunchConfiguration("auto_start_admittance")),
+        parameters=[{"settle_seconds": ParameterValue(
+            LaunchConfiguration("arm_control_start_delay"), value_type=float)}],
+    )
     moveit = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([moveit_cfg, "launch", "cs_moveit.launch.py"])),
         launch_arguments={
             "cs_type": LaunchConfiguration("cs_type"), "use_fake_hardware": "false",
             "use_sim_time": "false", "launch_rviz": LaunchConfiguration("launch_rviz"),
             "launch_servo": "false",
+            # The driver's robot_state_publisher owns /robot_description.
+            # MoveIt's planning URDF omits the real hardware connection arguments;
+            # publishing it races the driver at controller-manager startup.
+            "publish_robot_description": "false",
         }.items(),
     )
     admittance = Node(
@@ -105,15 +116,17 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("cs_type", default_value="ls65"),
         DeclareLaunchArgument("launch_rviz", default_value="true"),
-        DeclareLaunchArgument("admittance_enabled_on_startup", default_value="true"),
-        DeclareLaunchArgument("launch_coordinator", default_value="true"),
-        DeclareLaunchArgument("launch_executor", default_value="true"),
+        DeclareLaunchArgument("auto_start_admittance", default_value="true"),
+        DeclareLaunchArgument("arm_control_start_delay", default_value="10.0"),
+        DeclareLaunchArgument("admittance_enabled_on_startup", default_value="false"),
+        DeclareLaunchArgument("launch_coordinator", default_value="false"),
+        DeclareLaunchArgument("launch_executor", default_value="false"),
         DeclareLaunchArgument(
             "use_cartesian_path", default_value="true",
             description="Use Cartesian interpolation; false uses pose planning for a single target.",
         ),
-        DeclareLaunchArgument("interactive_input", default_value="true"),
-        DeclareLaunchArgument("launch_target_publisher", default_value="true"),
+        DeclareLaunchArgument("interactive_input", default_value="false"),
+        DeclareLaunchArgument("launch_target_publisher", default_value="false"),
         DeclareLaunchArgument("angles_in_degrees", default_value="true"),
         DeclareLaunchArgument("launch_sensor", default_value="true"),
         DeclareLaunchArgument("sensor_host", default_value="169.254.199.80"),
@@ -133,5 +146,5 @@ def generate_launch_description():
                 "device", "sensor", "config", "sensor_tcp.yaml",
             ]),
         ),
-        moveit, sensor_mount_tf, sensor, executor, admittance, coordinator, publisher,
+        moveit, sensor_mount_tf, sensor, executor, admittance, auto_start, coordinator, publisher,
     ])

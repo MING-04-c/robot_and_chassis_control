@@ -3,6 +3,7 @@
 
 // System
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <string>
@@ -16,7 +17,6 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 // ros2_control hardware_interface
-#include <hardware_interface/visibility_control.h>
 #include <hardware_interface/hardware_info.hpp>
 #include <hardware_interface/system_interface.hpp>
 #include <hardware_interface/types/hardware_interface_return_values.hpp>
@@ -90,6 +90,10 @@ class EliteCSPositionHardwareInterface : public hardware_interface::SystemInterf
 
     bool is_robot_connected_;
     bool is_last_power_on_;
+    bool logged_task_running_{false};
+    std::chrono::steady_clock::time_point last_control_write_{};
+    std::chrono::steady_clock::time_point last_control_warning_{};
+    double max_control_write_gap_ms_{0.0};
 
     // param
     double recv_timeout_;

@@ -1,0 +1,54 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Enabled: true
+  Class: ""
+  Global Options:
+    Background Color: 35; 35; 35
+    Fixed Frame: camera_optical_frame
+    Frame Rate: 15
+  Displays:
+    - Class: rviz_default_plugins/Axes
+      Name: Camera optical frame
+      Enabled: true
+      Reference Frame: <Fixed Frame>
+      Length: 0.1
+      Radius: 0.003
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Tag coordinates and distance
+      Enabled: true
+      Namespaces: {}
+      Topic:
+        Value: /camera_calibration/markers
+        Depth: 5
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+    - Class: rviz_default_plugins/Image
+      Name: Live AprilTag image
+      Enabled: true
+      Topic:
+        Value: /camera_calibration/debug_image
+        Depth: 1
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+      Transport Hint: raw
+      Normalize Range: true
+      Min Value: 0
+      Max Value: 1
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.2
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.4
+      Pitch: -1.0
+      Yaw: 1.57
+      Target Frame: <Fixed Frame>
+Window Geometry:
+  Width: 1280
+  Height: 800

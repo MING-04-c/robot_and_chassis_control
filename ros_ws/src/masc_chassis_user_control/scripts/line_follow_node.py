@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Drive the chassis from camer_diver observations; stop on lost/stale input."""
+"""Drive the chassis from ruier_camer_diver observations; stop on lost/stale input."""
 
 import json
+import os
 import time
 from dataclasses import replace
 
+import cv2
 import rclpy
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import Image
 from geometry_msgs.msg import PolygonStamped, Twist
 from masc_chassis_msgs.msg import ChassisStatus, CommStatus
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from std_msgs.msg import String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 
-from line_follow_control import ControlConfig, line_command, slew
+from line_follow_control import ControlConfig, line_command, motion_preview, slew, smooth_yaw, tracking_geometry
 
 
 class LineFollowNode(Node):
@@ -28,6 +32,19 @@ class LineFollowNode(Node):
         self.config.validate()
         self.enabled = self.declare_parameter('enabled', True).value
         self.dry_run = self.declare_parameter('dry_run', False, fixed).value
+        self.show_window = self.declare_parameter('show_window', False, fixed).value
+        self.bridge = CvBridge()
+        self.window_name = 'MASC line following - body reference'
+        self.geometry = None
+        self.exposure_status = None
+        self.last_state = 0.0
+        self.last_debug_time = 0.0
+        if self.show_window and not (os.getenv('DISPLAY') or os.getenv('WAYLAND_DISPLAY')):
+            self.get_logger().warning('No desktop display; use /line_follow/debug_image remotely')
+            self.show_window = False
+        if self.show_window:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.window_name, 1100, 700)
         self.input_timeout = self.declare_parameter('input_timeout_sec', 0.5, fixed).value
         self.comm_timeout = self.declare_parameter('comm_timeout_sec', 2.5, fixed).value
         self.control_period = self.declare_parameter('control_period_sec', 0.02, fixed).value
@@ -52,28 +69,45 @@ class LineFollowNode(Node):
         self.status = None
         self.status_time = self.path_time = self.comm_time = self.chassis_time = None
         self.path_header = None
+        self.path_points = []
         self.path_valid = False
         self.connected = False
         self.chassis_allowed = False
         self.good_frames = 0
+        self.ready_frames = 0
         self.previous_v = self.previous_w = 0.0
         self.last_tick = time.monotonic()
         self.reason = None
         self.cmd_pub = self.create_publisher(Twist, topics['cmd_vel_topic'], 10)
         self.state_pub = self.create_publisher(String, '/line_follow/status', 10)
+        self.debug_pub = self.create_publisher(Image, '/line_follow/debug_image', qos_profile_sensor_data)
+        debug_image_topic = self.declare_parameter(
+            'debug_image_topic', '/camera/line/debug_image', fixed).value
+        self.create_subscription(
+            Image, debug_image_topic, self.on_debug_image,
+            QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
         self.create_subscription(String, topics['line_status_topic'], self.on_status, 10)
         self.create_subscription(PolygonStamped, topics['centerline_topic'],
                                  self.on_path, qos_profile_sensor_data)
         self.create_subscription(CommStatus, topics['comm_status_topic'], self.on_comm, 10)
         self.create_subscription(ChassisStatus, topics['chassis_status_topic'],
                                  self.on_chassis, 10)
+        self.create_subscription(String, '/line_follow/exposure_status', self.on_exposure_status, 10)
         self.create_service(SetBool, '~/enable', self.on_enable)
+        self.create_service(Trigger, '~/ready', self.on_ready)
         self.add_on_set_parameters_callback(self.on_parameters)
         self.create_timer(self.control_period, self.tick)
         self.get_logger().info(
             f'Line following ready: enabled={self.enabled}, '
             f'forward_speed={self.config.forward_speed:.3f} m/s; '
             f'{topics["line_status_topic"]} -> {topics["cmd_vel_topic"]}')
+
+    def on_exposure_status(self, message):
+        try:
+            value = json.loads(message.data)
+            self.exposure_status = value if isinstance(value, dict) else None
+        except ValueError:
+            self.exposure_status = None
 
     def on_parameters(self, parameters):
         updates = {}
@@ -89,7 +123,8 @@ class LineFollowNode(Node):
         except (ValueError, TypeError) as error:
             return SetParametersResult(successful=False, reason=str(error))
         self.config = candidate
-        if enabled != self.enabled:
+        if enabled != self.enabled or updates.keys() & {
+                "image_forward_direction", "vehicle_reference_x_ratio", "vehicle_reference_y_ratio"}:
             self.good_frames = 0
         self.enabled = enabled
         if not enabled or candidate.forward_speed == 0.0:
@@ -102,14 +137,47 @@ class LineFollowNode(Node):
         response.message = 'enabled' if self.enabled else 'disabled'
         return response
 
+    def on_ready(self, request, response):
+        """Check real inputs without enabling the follower or issuing motion."""
+        del request
+        reason = self.blocked_reason(time.monotonic(), check_enabled=False)
+        if reason is None:
+            observation = dict(self.status) if isinstance(self.status, dict) else {}
+            geometry, reason = tracking_geometry(
+                self.path_points, observation.get('image_width'),
+                observation.get('image_height'), self.config)
+            if reason is None:
+                observation.update({key: geometry[key] for key in (
+                    'error_normalized', 'heading_error_rad', 'target_fallback')})
+                observation['curve_geometry_valid'] = True
+                observation['target_estimated'] = False
+                _, _, reason = line_command(observation, self.config)
+                if reason == 'tracking' and self.ready_frames < self.reacquire_frames:
+                    reason = 'reacquiring'
+        response.success = reason == 'tracking'
+        response.message = 'chassis and USB tracking inputs ready' if response.success else str(reason)
+        return response
+
     def on_status(self, message):
         try:
             status = json.loads(message.data)
-            _, _, reason = line_command(status, self.config)
+            candidate = dict(status) if isinstance(status, dict) else status
+            if isinstance(candidate, dict):
+                _, geometry_reason = tracking_geometry(
+                    self.path_points, candidate.get('image_width'),
+                    candidate.get('image_height'), self.config)
+                candidate['curve_geometry_valid'] = (
+                    geometry_reason is None and self.path_time is not None
+                    and time.monotonic() - self.path_time <= self.input_timeout)
+            _, _, reason = line_command(candidate, self.config)
         except (ValueError, TypeError):
             status, reason = None, 'invalid_json'
         self.status = status
         self.status_time = time.monotonic()
+        if reason == 'tracking' and self.blocked_reason(self.status_time, check_enabled=False) is None:
+            self.ready_frames = min(self.reacquire_frames, self.ready_frames + 1)
+        else:
+            self.ready_frames = 0
         if reason == 'tracking':
             self.good_frames = min(self.reacquire_frames, self.good_frames + 1)
         else:
@@ -119,8 +187,10 @@ class LineFollowNode(Node):
     def on_path(self, message):
         self.path_header = message.header
         self.path_time = time.monotonic()
-        self.path_valid = bool(message.polygon.points)
+        self.path_points = [(point.x, point.y) for point in message.polygon.points]
+        self.path_valid = bool(self.path_points)
         if not self.path_valid:
+            self.ready_frames = 0
             self.good_frames = 0
             self.stop()
 
@@ -128,6 +198,7 @@ class LineFollowNode(Node):
         self.connected = message.comm_state == CommStatus.COMM_STATE_CONNECTED
         self.comm_time = time.monotonic()
         if not self.connected and not self.dry_run:
+            self.ready_frames = 0
             self.good_frames = 0
             self.stop()
 
@@ -144,11 +215,12 @@ class LineFollowNode(Node):
         )
         self.chassis_time = time.monotonic()
         if not self.chassis_allowed and not self.dry_run:
+            self.ready_frames = 0
             self.good_frames = 0
             self.stop()
 
-    def blocked_reason(self, now):
-        if not self.enabled:
+    def blocked_reason(self, now, check_enabled=True):
+        if check_enabled and not self.enabled:
             return 'disabled'
         if not self.dry_run and (
                 not self.connected or self.comm_time is None
@@ -172,6 +244,82 @@ class LineFollowNode(Node):
             return 'stale_image_stamp'
         return None
 
+    def on_debug_image(self, message):
+        if not self.show_window and self.debug_pub.get_subscription_count() == 0:
+            return
+        now = time.monotonic()
+        if now - self.last_debug_time < 0.2:
+            return
+        self.last_debug_time = now
+        try:
+            image = self.bridge.imgmsg_to_cv2(message, desired_encoding='bgr8').copy()
+            # ruier_camer_diver's grid is two image rows plus a 64-pixel header.
+            width = image.shape[1] // 2
+            height = (image.shape[0] - 64) // 2
+            if width <= 0 or height <= 0:
+                return
+            text = f'CONTROL: {self.reason or "waiting"} / forward={self.config.image_forward_direction}'
+            if self.exposure_status and self.exposure_status.get('ready'):
+                mode = 'adaptive' if self.exposure_status.get('enabled') else 'fixed'
+                text += f' / EXP={self.exposure_status.get("exposure")} {mode}'
+            cv2.rectangle(image, (0, 0), (image.shape[1], 64), (0, 0, 0), -1)
+            cv2.putText(image, text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            geometry = self.geometry
+            if geometry is not None:
+                def pixel(x, y):
+                    return (int(max(0, min(width - 1, x))),
+                            int(max(0, min(height - 1, y))) + 64)
+                reference = pixel(geometry['reference_x'], geometry['reference_y'])
+                near = pixel(geometry['near_x'], geometry['near_y'])
+                ground = pixel(0, geometry['ground_start_y'])
+                cv2.line(image, ground, (width - 1, ground[1]), (180, 180, 180), 1)
+                cv2.putText(image, 'GROUND CHECK START', (5, ground[1] - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1, cv2.LINE_AA)
+                target = pixel(geometry['target_x'], geometry['target_y'])
+                cv2.line(image, (reference[0], 64), (reference[0], height + 63),
+                         (255, 0, 255), 1)
+                cv2.drawMarker(image, reference, (255, 0, 255),
+                               cv2.MARKER_CROSS, 20, 2)
+                cv2.circle(image, near, 8, (255, 255, 0), 2)
+                cv2.circle(image, target, 10, (0, 140, 255), 2)
+                cv2.arrowedLine(image, reference, target, (0, 140, 255), 2)
+                cv2.line(image, (reference[0], near[1]), near, (255, 255, 0), 2)
+                cv2.putText(image, 'GOAL (not wheel angle)', (target[0] + 12, target[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 140, 255), 1, cv2.LINE_AA)
+                forward = -1 if self.config.image_forward_direction == 'up' else 1
+                front = (reference[0], max(64, min(height + 63, reference[1] + forward * 70)))
+                cv2.arrowedLine(image, reference, front, (210, 210, 210), 1)
+                cv2.putText(image, 'FRONT', front, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4, (210, 210, 210), 1, cv2.LINE_AA)
+                if self.previous_v > 0.0:
+                    offsets = motion_preview(self.previous_v, self.previous_w, self.config)
+                    trail = [(int(max(0, min(width - 1, reference[0] + dx))),
+                              int(max(64, min(height + 63, reference[1] + dy))))
+                             for dx, dy in offsets]
+                    for first, second in zip(trail, trail[1:]):
+                        cv2.line(image, first, second, (0, 255, 0), 3)
+                    cv2.arrowedLine(image, trail[-5], trail[-1], (0, 255, 0), 3, tipLength=0.5)
+                    cv2.putText(image, 'MOTION CMD (schematic)', (reference[0] + 8, front[1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1, cv2.LINE_AA)
+                detail = (f'CONTROL green=motion; orange=goal; magenta=body; cyan=near; '
+                          f'near error={geometry["error_normalized"]:+.3f}; yaw={self.previous_w:+.2f} rad/s')
+            else:
+                detail = 'CONTROL waiting for a fresh near line; green point is the detector target'
+            cv2.putText(image, detail, (10, 47), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4, (255, 255, 255), 1, cv2.LINE_AA)
+            output = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
+            output.header = message.header
+            self.debug_pub.publish(output)
+            if self.show_window:
+                cv2.imshow(self.window_name, image)
+                if cv2.waitKey(1) & 0xFF in (27, ord('q')):
+                    self.set_parameters([rclpy.parameter.Parameter('enabled', value=False)])
+                    self.show_window = False
+                    cv2.destroyWindow(self.window_name)
+        except (CvBridgeError, cv2.error) as error:
+            self.get_logger().warning(f'Control preview failed: {error}')
+
     def stop(self):
         self.previous_v = self.previous_w = 0.0
         self.cmd_pub.publish(Twist())
@@ -180,10 +328,25 @@ class LineFollowNode(Node):
         now = time.monotonic()
         dt = min(now - self.last_tick, self.control_period * 2.0)
         self.last_tick = now
+        observation = dict(self.status) if isinstance(self.status, dict) else {}
+        self.geometry, geometry_reason = tracking_geometry(
+            self.path_points, observation.get('image_width'),
+            observation.get('image_height'), self.config)
+        if any(t is None or now - t > self.input_timeout
+               for t in (self.status_time, self.path_time)):
+            self.geometry = None
+            geometry_reason = 'camera_timeout'
         reason = self.blocked_reason(now)
         v = w = 0.0
         if reason is None:
-            v, w, reason = line_command(self.status, self.config)
+            if geometry_reason is not None:
+                reason = geometry_reason
+            else:
+                observation.update({key: self.geometry[key] for key in (
+                    'error_normalized', 'heading_error_rad', 'target_fallback')})
+                observation['curve_geometry_valid'] = True
+                observation['target_estimated'] = False
+                v, w, reason = line_command(observation, self.config)
             if reason == 'tracking' and self.good_frames < self.reacquire_frames:
                 v = w = 0.0
                 reason = 'reacquiring'
@@ -191,7 +354,7 @@ class LineFollowNode(Node):
             self.good_frames = 0
         if reason == 'tracking':
             v = slew(self.previous_v, v, self.config.linear_acceleration, dt)
-            w = slew(self.previous_w, w, self.config.angular_acceleration, dt)
+            w = smooth_yaw(self.previous_w, w, self.config, dt)
         else:
             v = w = 0.0
         self.previous_v, self.previous_w = v, w
@@ -201,10 +364,12 @@ class LineFollowNode(Node):
         if reason != self.reason:
             self.reason = reason
             self.get_logger().info(f'Line following state: {reason}')
-        if not hasattr(self, 'last_state') or now - self.last_state >= 0.5:
+        if now - self.last_state >= 0.5:
             self.last_state = now
             self.state_pub.publish(String(data=json.dumps({
                 'state': reason, 'enabled': self.enabled,
+                'image_forward_direction': self.config.image_forward_direction,
+                'geometry': self.geometry,
                 'forward_speed_mps': self.config.forward_speed,
                 'command_linear_x_mps': v, 'command_angular_z_radps': w,
             }, separators=(',', ':'))))
@@ -222,6 +387,8 @@ def main(args=None):
         if node is not None:
             if rclpy.ok():
                 node.stop()
+            if node.show_window:
+                cv2.destroyWindow(node.window_name)
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
