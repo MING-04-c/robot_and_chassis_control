@@ -19,18 +19,12 @@ sensor_node:
     unit_switch_delay_ms: 300
     # 停止采集 01 与退出 debug 31 之间等待 1 秒，避免设备漏收停止命令。
     stop_exit_delay_ms: 1000
-    # 自动识别时忽略 unit 声明；仅 auto_calibrate_unit=false 时使用人工单位。
-    unit: "N"
-    auto_calibrate_unit: true
-    target_unit: "N"  # 识别后硬件停留档位：N、kgf 或 keep；ROS 输出始终为 N/N·m
-    unit_calibration_samples: 100
-    unit_calibration_zero_each_group: true  # 实验：每组采样前清零，含目标单位复核组
-    unit_calibration_timeout: 5.0       # 每组采样最长等待，秒
-    unit_calibration_min_force: 0.05    # 单轴或三轴绝对值合计的最小幅值，避免近零比值
-    unit_calibration_ratio_tolerance: 0.2  # 相对 9.80665 的允许偏差 20%
-    unit_calibration_max_noise: 0.1     # 单轴相对波动上限；近零/高噪声轴不提供单位证据
-    # /sensor/toggle_unit 固定发送 HEX：AA 55 35 0D 0A。
-    # 1=460800；2、3 的实际波特率待设备手册确认。
+    # 厂家确认：重新上电默认 kg 档。异常退出后先重新上电再启动。
+    unit: "kg"
+    auto_calibrate_unit: false         # 不再用两组数据比较单位
+    switch_unit_on_startup: true       # 已知 kg 档启动，35 切换一次到 N
+    restore_kg_on_shutdown: true       # 正常退出时从 N 切回 kg
+    target_unit: "N"                  # 控制期间硬件用 N，ROS 始终输出 N/N·m
     baud_code: 0
 
     # 单位验证通过后发布 N/N·m；原始数据始终保留。

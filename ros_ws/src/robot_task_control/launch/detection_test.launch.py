@@ -109,6 +109,12 @@ def launch_setup(context):
             ]
         )
     else:
+        actions.append(include(
+            "eli_cs_robot_serial", "detactor.launch.py",
+            {"config_file": LaunchConfiguration("detactor_config_file"),
+             "auto_request": "false", "data_directory": "~/.ros/eli_cs_robot_serial/detactor"},
+            condition=IfCondition(LaunchConfiguration("start_thickness_detector")),
+        ))
         actions.append(
             include(
                 "eli_cs_robot_driver",
@@ -283,6 +289,11 @@ def generate_launch_description():
                 description="Real mode: start MoveIt, admittance and optional force sensor.",
             ),
             DeclareLaunchArgument("arm_control_start_delay", default_value="5.0"),
+            DeclareLaunchArgument("start_thickness_detector", default_value="true",
+                                  description="真机时启用测厚仪；已有测厚节点则设 false，仿真不启用"),
+            DeclareLaunchArgument("detactor_config_file", default_value=PathJoinSubstitution([
+                FindPackageShare("eli_cs_robot_serial"), "device", "detactor", "config", "detactor.yaml"
+            ])),
             DeclareLaunchArgument(
                 "launch_force_sensor",
                 default_value="true",

@@ -126,7 +126,7 @@ python3 capture_transfer.py receive --bind 0.0.0.0 --port 9030 --output ./receiv
 再在树莓派发送（示例 IP `192.168.1.100` 请换成实际主机 IP）：
 
 ```bash
-ros2 run geminipro_camer_calibration capture_transfer.py send --archive ~/Desktop/rgbd_batch_01.zip --host 192.168.1.100 --port 9030
+ros2 run geminipro_camer_calibration capture_transfer.py send --archive ~/Desktop/rgbd_batch_01.zip --host 169.254.199.120 --port 9030
 ```
 
 接收程序等待一个数据包，验证压缩包 SHA256、ZIP 成员及每组源文件清单，完成后保存 `rgbd_received_时间戳.zip` 并返回确认；一次接收完成即退出。发送端只有收到成功确认才打印 `TCP_SEND_PASS`。接收后解压 ZIP，主机处理程序读取各 `camera_v5_4_*/attempt_XX` 目录中的原 V5.4 文件即可。

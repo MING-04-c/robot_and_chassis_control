@@ -3,6 +3,9 @@
 import os
 from pathlib import Path
 import time
+import tempfile
+
+import yaml
 import unittest
 
 os.environ["ROS_DOMAIN_ID"] = "188"
@@ -202,6 +205,73 @@ class DeviceStartupTest(unittest.TestCase):
             mux.destroy_node()
             fake.destroy_node()
             rclpy.shutdown()
+
+    def test_force_readiness_depends_on_workflow_control_modes(self):
+        """位置规划不等待力数据，含导纳的流程仍必须等待；接口缺失不能放行。"""
+        for modes in (("moveit",), ("admittance",), ("moveit", "admittance")):
+            with self.subTest(modes=modes), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "workflow.yaml"
+                config.write_text(yaml.safe_dump({"workflow": {
+                    "steps": [{
+                        "action": "arm_move", "control_mode": mode,
+                        "target_pose": {"position": [0.0, 0.0, 0.0], "orientation": "current"},
+                    } for mode in modes],
+                }}))
+                rclpy.init(args=["--ros-args", "-p", f"workflow_file:={config}",
+                                 "-p", "device_ready_stable_sec:=0.1"])
+                fake = Node("fake_mode_readiness")
+                controller = WorkflowController()
+                executor = SingleThreadedExecutor()
+                executor.add_node(fake)
+                executor.add_node(controller)
+                broadcaster = TransformBroadcaster(fake)
+                controller.arm_ready = lambda: True
+                force = fake.create_publisher(
+                    WrenchStamped, "/admittance_controller/measured_wrench", 10)
+                send_force = False
+
+                def feedback():
+                    transform = TransformStamped()
+                    transform.header.stamp = fake.get_clock().now().to_msg()
+                    transform.header.frame_id = "base_link"
+                    transform.child_frame_id = "tool0"
+                    transform.transform.rotation.w = 1.0
+                    broadcaster.sendTransform(transform)
+                    if send_force:
+                        force.publish(WrenchStamped())
+
+                def enable(request, response):
+                    response.success = True
+                    return response
+
+                fake.create_service(SetBool, "/admittance_controller/enable", enable)
+                fake.create_subscription(PoseArray, controller.compliant_target_topic, lambda _: None, 10)
+                fake.create_subscription(PoseArray, controller.target_topic, lambda _: None, 10)
+                fake.create_timer(0.02, feedback)
+
+                def pump(seconds):
+                    deadline = time.monotonic() + seconds
+                    ready = False
+                    while time.monotonic() < deadline:
+                        executor.spin_once(timeout_sec=0.02)
+                        ready = controller.advance_device_checks()
+                    return ready
+
+                try:
+                    self.assertFalse(pump(0.5))  # 无执行接口/无力数据时先不放行。
+                    fake.create_service(Trigger, controller.execute_service, enable)
+                    if modes == ("moveit",):
+                        self.assertTrue(pump(0.6))
+                        self.assertIsNone(controller.last_compliant_wrench_ns)
+                    else:
+                        self.assertFalse(pump(0.6))
+                        send_force = True
+                        self.assertTrue(pump(0.6))
+                finally:
+                    executor.shutdown()
+                    controller.destroy_node()
+                    fake.destroy_node()
+                    rclpy.shutdown()
 
     def test_device_timeout_does_not_enter_task(self):
         config = (

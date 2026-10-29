@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <ctime>
 #include <vector>
@@ -44,6 +45,19 @@ public:
     const auto write_service = declare_parameter<std::string>("write_service", "/detactor/write");
     const auto trigger_topic = declare_parameter<std::string>("trigger_topic", "/detactor/acquire_trigger");
     const auto trigger_service = declare_parameter<std::string>("trigger_service", "/detactor/acquire");
+    measurement_unit_ = declare_parameter<std::string>("measurement_unit", "unknown");
+    if (measurement_unit_ != "unknown" && measurement_unit_ != "um" && measurement_unit_ != "mm") {
+      throw std::invalid_argument("measurement_unit must be unknown, um or mm");
+    }
+    measurement_pub_ = create_publisher<std_msgs::msg::String>(
+      "/detactor/measurement", rclcpp::QoS(1).transient_local());
+    latest_srv_ = create_service<std_srvs::srv::Trigger>(
+      "/detactor/latest_measurement",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        response->success = !latest_measurement_.empty();
+        response->message = response->success ? latest_measurement_ : "No valid detector reply received";
+      });
 
     frame_pub_ = create_publisher<std_msgs::msg::String>(frame_topic, 10);
     latest_pub_ = create_publisher<std_msgs::msg::String>(latest_topic, 10);
@@ -156,7 +170,7 @@ private:
     try {
       size_t parsed = 0;
       value = std::stod(text, &parsed);
-      return parsed == text.size();
+      return parsed == text.size() && std::isfinite(value);
     } catch (const std::exception &) {
       return false;
     }
@@ -202,6 +216,19 @@ private:
       }
     }
 
+    // 设备帧末尾为最新值；直接取末尾，避免历史窗口显示顺序影响本次读数。
+    // 即使与上次值相同，新有效回包仍更新序号和接收时间。
+    const builtin_interfaces::msg::Time stamp = now();
+    double latest_value = 0.0;
+    to_double(latest_tokens.back(), latest_value);
+    std::ostringstream measurement;
+    measurement << std::setprecision(17)
+      << "{\"schema\":\"paint_thickness_measurement_v1\",\"sequence\":" << acquisition_count_
+      << ",\"value\":" << latest_value << ",\"unit\":\"" << measurement_unit_
+      << "\",\"received_at_ros\":{\"sec\":" << stamp.sec
+      << ",\"nanosec\":" << stamp.nanosec << "}}";
+    latest_measurement_ = measurement.str();
+    measurement_pub_->publish(std_msgs::msg::String().set__data(latest_measurement_));
     save_latest(latest_tokens, acquisition_count_);
   }
 
@@ -317,6 +344,10 @@ private:
   }
 
   std::string request_command_;
+  std::string measurement_unit_;
+  std::string latest_measurement_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr measurement_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr latest_srv_;
   std::string frame_start_;
   std::string frame_end_;
   int latest_window_size_;

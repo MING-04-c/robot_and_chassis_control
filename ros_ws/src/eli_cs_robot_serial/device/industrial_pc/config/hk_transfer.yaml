@@ -1,0 +1,12 @@
+hk_image_transfer:
+  ros__parameters:
+    # 树莓派监听；工控机 169.254.199.120 主动连接本机 9002。
+    listen_ip: 0.0.0.0
+    allowed_client_ip: 169.254.199.120
+    listen_port: 9002
+    # 只取触发拍照输出，不能替换成 /camera/image 实时视频。
+    delivery_mode: photos
+    image_topic: /dataset_capture/captured_image
+    image_format: jpeg
+    jpeg_quality: 95
+    max_fps: 10.0  # 仅 stream 模式使用；拍照不按帧率丢弃。

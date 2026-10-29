@@ -1,7 +1,7 @@
 # MASC 蓝线循迹控制
 
 本包将 `ruier_camer_diver` 的观测中线转换为底盘 `linear.x` 和 `angular.z` 指令。
-默认前进速度 0.05 m/s（5 cm/s），支持在线调速。
+默认前进速度 0.075 m/s（7.5 cm/s），支持在线调速。
 
 ## 车头相机与车身参考
 
@@ -37,7 +37,7 @@ source install/setup.bash
 
 ```bash
 ros2 launch masc_chassis_user_control line_follow.launch.py \
-  show_window:=true forward_speed:=0.05 image_forward_direction:=down
+  show_window:=true forward_speed:=0.075 image_forward_direction:=down
 ```
 
 一条命令包含 USB 相机、蓝线识别、底盘驱动和循迹控制。
@@ -115,23 +115,23 @@ ros2 param set /line_follow_controller forward_speed 0.0
 
 | 参数 | 默认值 | 用途 |
 | --- | --- | --- |
-| `forward_speed` | 0.05 | m/s，前进速度 |
+| `forward_speed` | 0.075 | m/s，前进速度 |
 | `max_forward_speed` | 0.30 | m/s，参数上限 |
 | `image_forward_direction` | down | 从车身参考出发选择前方中线；不表示光流方向 |
 | `vehicle_reference_x_ratio` | 0.5 | 虚拟车身参考横坐标/图宽 |
 | `vehicle_reference_y_ratio` | -0.05 | 虚拟车身参考纵坐标/图高 |
 | `lookahead_distance_ratio` | 0.45 | 从参考点向前的图像距离/图高 |
 | `near_edge_margin_ratio` | 0.25 | 从车身侧边缘向前跳过轮子遮挡区的图高比例 |
-| `max_near_gap_ratio` | 0.35 | 从可见地面起点计算缺线距离，超过此图高比例停车 |
-| `steering_gain` | 1.2 | 近端横向位置纠偏比例 |
-| `heading_gain` | 0.5 | 从车身参考指向前瞻点的方向纠偏比例 |
+| `max_near_gap_ratio` | 0.40 | 从可见地面起点计算缺线距离，超过此图高比例停车 |
+| `steering_gain` | 0.65 | 近端横向位置纠偏比例 |
+| `heading_gain` | 0.35 | 从车身参考指向前瞻点的方向纠偏比例 |
 | `steering_sign` | -1.0 | 当前 down 方向下保持有效转向符号 +1；与方向共同决定转向 |
-| `max_angular_speed` | 0.5 | rad/s，转向上限 |
-| `error_deadband` | 0.03 | 归一化近端偏差连续死区 |
-| `heading_deadband_rad` | 0.035 | 方向死区，约2度 |
+| `max_angular_speed` | 0.25 | rad/s，直线温和纠偏上限；弯道使用 curve_max_angular_speed |
+| `error_deadband` | 0.06 | 归一化近端偏差连续死区 |
+| `heading_deadband_rad` | 0.05 | 方向死区，约2.9度 |
 | `steering_filter_time_sec` | 0.2 | 转向平滑时间常数，秒；0关闭 |
-| `angular_acceleration` | 0.5 | rad/s²，转向速度变化上限 |
-| `linear_acceleration` | 0.15 | m/s²，正常加减速限制 |
+| `angular_acceleration` | 0.35 | rad/s²，直线转向变化上限；弯道使用 curve_angular_acceleration |
+| `linear_acceleration` | 0.08 | m/s²，正常加减速限制 |
 | `require_bottom_connected` | false | 可见中线不必贴到底边 |
 
 左右方向已按现场反馈校正；当前 down 配 -1.0 保持校正后的有效映射。
@@ -184,7 +184,7 @@ ros2 topic echo --once /masc_chassis/chassis_status
 ## 转向平滑与手动拖动
 
 默认对近端横向误差和方向误差分别使用连续死区，然后对目标角速度进行
-0.2秒时间常数的低通平滑，并限制角加速度为0.5 rad/s²。
+0.2秒时间常数的低通平滑，并限制角加速度为0.35 rad/s²。
 持续偏离仍会纠偏；细小识别波动不再立即触发明显转向。
 `cmd_vel` 保持50 Hz，不通过降低发送频率来抑制抖动。
 丢线、禁用、超时和底盘状态禁止运动时绕过平滑，立即输出零指令。
@@ -194,9 +194,9 @@ ros2 topic echo --once /masc_chassis/chassis_status
 
 ```bash
 ros2 param set /line_follow_controller steering_filter_time_sec 0.2
-ros2 param set /line_follow_controller angular_acceleration 0.5
-ros2 param set /line_follow_controller error_deadband 0.03
-ros2 param set /line_follow_controller heading_deadband_rad 0.035
+ros2 param set /line_follow_controller angular_acceleration 0.35
+ros2 param set /line_follow_controller error_deadband 0.06
+ros2 param set /line_follow_controller heading_deadband_rad 0.05
 ```
 
 需要更平滑可将时间常数小幅提高到0.3；若弯道反应变慢或偏离增大，调回0.15～0.2，
@@ -334,3 +334,60 @@ ros2 launch masc_chassis_user_control keyboard_teleop.launch.py linear_speed:=0.
 ## 本机机械臂与底盘统一工作区
 
 统一任务入口、USB `/line_camera/*` 话题映射和三种独立流程见 `robot_task_control/README.md`。统一工作流中的循迹默认关闭，由任务控制器开启；本文件独立 line_follow.launch.py 默认自动循迹。键盘也可通过 `ros2 launch robot_task_control keyboard_teleop.launch.py` 启动。请先退出其他底盘启动会话，再启动键盘控制。
+## 连续可信段循迹
+
+循迹每帧从车身近端开始，仅使用第一段连续实测中线，纵向缺口超过
+`max_trusted_gap_ratio`（默认图高 0.06）时检查缺口两端。只有两端各有至少图高10%的
+连续实测支撑、切向角差不超过0.25 rad、双向切线位置偏差不超过图宽4%，
+且前方累计缺口不超过 `max_bridge_gap_ratio`（默认图高0.30），才允许作为同一条线续接。
+若切线不满足同向对齐，但延长线在两端之间的缺口内部、图像范围内相交，
+也允许按同一条有转角的线低速续接；转角上限 `bridge_intersection_angle_rad` 为0.85 rad（约49°）。
+仅在缺口以外相交不放行。上游视觉 YAML 的 extended_join_* 同时保留对应两段实测候选，
+避免第二段在进入控制器前被单候选筛选删除。
+几何验证通过后默认 `bridge_speed_factor=1.0`，按同一条线跟随，不额外乘缺口系数或上游疑似遮挡系数。前瞻点落在已确认缺口内部时，在两端之间插值控制目标，避免回退点跳变；插值不写入实测蓝线掩膜。橙线和 GAP: JOINED 表示已确认续接。
+两端不吻合、仅有单端或缺口过大则截断。把 max_bridge_gap_ratio 设为0可关闭缺口通过。
+两端方向改用实测支撑点的中位数成对斜率和拟合位置，降低单个端点毛刺的影响；
+上游已加入局部明度补偿和按实测点数自适应的霍夫线段拟合，规则与参数见
+工作区 `docs/chassis/LINE_FOLLOW_REFERENCE_20261029.md`。
+前瞻落在已接受的范围内，段变短时减速，不足最小跨度或有效比例时发零速度。
+近端跨度门槛 `min_forward_span_ratio` 为0.05，有效比例门槛 `min_valid_row_fraction`
+为0.06，允许尚有短实测线段时继续低速推进。两侧支撑长度通过
+`bridge_support_span_ratio` 配置，默认0.10；这些比例不是概率或米制距离。
+新画面中线变清楚、实测段变长，前瞻范围随之延伸；不沿缓存路线盲行。
+曝光节点与控制使能独立，停车后仍可继续调整曝光。
+预览红叉为实测段末端。阈值是图像比例，不是标定后的地面停车距离。
+
+`robot_task_control/line_follow_only.launch.py` 使用 `until_untrusted: true`，
+开始后跟随可信段，不再按2秒结束；视觉不足先零速等待5秒，恢复后继续，未恢复才结束本轮，
+结束后需再次 start。预览及 `/line_follow/status` 同时显示 input_state（当前输入是否可走）
+和 last_blocked_reason（上次阻塞原因），禁用后仍保留。INPUT: tracking 且 CONTROL: disabled
+表示输入已恢复，但任务未使能；不代表此刻图像仍不可行。
+默认单轮总超时 90 秒。机械臂联合入口仍保留原来的 2 秒测试时长。
+
+为减轻直线 S 形摆动，当前采用较宽的回中死区（横向归一化0.06、方向0.05 rad）和较低纠偏增益（位置0.65、方向0.35）；最大转速0.25 rad/s，角加速度0.35 rad/s²。正常跟线的线速度变化率0.08 m/s²，偏差减速系数0.4。未确认区域仍保留置信度减速；已通过两端几何验证的缺口默认系数1.0，并清除该续接路径上的重复疑似遮挡减速；丢线、故障和数据失效仍立即停车。树莓派实车效果需要沿现有轨迹再验证，弯道跟不上时应结合画面状态调整。
+
+## 弯道优先跟随走向
+
+当前可信线段的实际走向偏离车身前方约7°，或近端切线与前瞻走向相差约7°后，逐渐启用转弯优先控制；约14°时达到完整强度。近端拟合使用实测点的稳健斜率，不把整条直线仅向左/右平移误当成弯道；出弯后车身尚未对准倾斜直线时，仍优先跟随其走向。`geometry.bend_angle_rad`、`curve_strength`、`path_heading_rad` 可在 `/line_follow/status` 查看，预览标题显示 CURVE。图像角度不是已标定的地面转角。
+
+弯道时中心容差由半图宽6%逐渐放到18%，中心纠偏力度降到原来的35%；方向增益从0.35逐渐提高至0.55，并优先使用近端到前瞻点的路径走向。转速上限由0.25过渡到0.28 rad/s（约16°/秒），弯道角加速度限制0.30 rad/s²。这样允许沿弯道有一定偏离，避免往中线拉的动作抵消转弯；直线保持原来的柔和参数。中心容差内的弯道偏差不再额外引起同等程度减速，正常前进设定仍为0.075 m/s。
+
+相关参数在 `config/line_follow.yaml` 的 `curve_*` 项。模式按0～1强度连续过渡，并以0.35秒时间常数渐进进入，减少第一次转向过大，仍经过原来的转向滤波；单端/不合格缺口、丢线、过期、底盘故障与紧急停止规则不放宽。
+
+## 90°停止横线
+
+启用 `stop_marker_enabled` 后同时订阅 `/camera/line/mask`，用实测蓝线掩膜检测与局部主线垂直、两侧均有横向延伸的停止条，普通 L 形拐弯不算站点。横线后沿 `image_forward_direction` 仍有主线为 intermediate，没有继续线且视野足够为 final；证据含糊或标记仍在画面边缘时为 unknown。连续3张新图像确认，不用重复旧帧累计。
+
+从距离图像中间25%图高处开始减速，近端限速0.008m/s；横线交点到高度50%±1%时直接零速，覆盖速度平滑器，再用新图像确认其仍在容差内；停车后已确认的途中/终点类别锁存，不能因后方线条一时反光而变换类别。这里是单张处理图像的中间，480高默认容差约±5像素，不能保证真实底盘恰好零像素。`stop_marker.error_ratio` 报告实际像素归一化误差，发生过冲会报告 overshoot，不能当成终点完成，也不会自动倒车。
+
+途中站锁存停车，只有到位后收到新的开始消息才继续，提前发送不会留存；最终站不允许这个消息继续。
+
+```bash
+ros2 topic pub --once /line_follow/resume std_msgs/msg/Empty '{}'
+```
+
+已恢复通过的同一根横线会去重。当前整体任务只在最终站完成循迹，途中站等消息时不启动后续机械臂。`/line_follow/status` 提供 `stop_marker` 对象和 stop_marker_approaching/intermediate/final/unknown/missing/confirming/settling/overshoot 状态。横线临近时突然失去识别会停车等恢复；未能确认最终站不会被当成走完。掩膜与路径均须新鲜，掩膜过期也停车。
+
+图像中 STOP TARGET 画出停车目标，STOP intermediate/final/unknown 标出横线交点。标记长度、垂直角度容差、两侧最小长度、停车位置和接近限速均可在 YAML 的 `stop_marker_*` 调整。若明确不使用站点标记，可关闭此功能，随后不再要求掩膜流。
+
+弯道连续性余量：近端缺线容差调整为图高40%；识别层逐行中心跳变允许65像素、连续漏检容差6行、中线形状跳变系数2.5。两侧实测线在缺口内相交时，接合转角上限统一为0.85 rad；缺口总长和两侧支撑长度限制仍保留。完全丢线不沿历史方向盲走，停止横线仍以画面中间为停车位置。以上是图像参数，需实车验证。

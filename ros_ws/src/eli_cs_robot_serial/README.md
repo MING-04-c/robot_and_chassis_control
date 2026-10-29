@@ -84,3 +84,9 @@ ros2 service call /tcp/send_file eli_cs_robot_serial/srv/SendFile \
 
 The receiver must define its own file framing protocol, such as a header with
 file size, because TCP and serial streams do not preserve message boundaries.
+
+## 工控机检测结果 TCP 回传
+
+`device/industrial_pc` 接收主机的 RGB-D 三维点结果，支持原结果 SHA256/HMAC
+封装、ACK、持久化去重和独立 DEMO 点话题；不直接启动运动。
+详见 [工控机通信协议与运行方法](device/industrial_pc/README.md)。

@@ -49,7 +49,7 @@ def generate_launch_description():
         DeclareLaunchArgument("frame_id", default_value="force_sensor"),
         DeclareLaunchArgument(
             "target_unit", default_value="",
-            description="Hardware unit after verification: N, kgf, keep; empty uses YAML.",
+            description="运行时硬件单位：N、kgf、keep；默认按上电 kg 对齐到 N，正常退出恢复 kg。",
         ),
         OpaqueFunction(function=launch_node),
     ])

@@ -1,9 +1,10 @@
-# 循迹累计有效 tracking 2 秒后停车；可修改 seconds 和 step_timeout_sec。
+# 独立循迹逐帧延伸可信段；视觉不足先零速等5秒恢复，未恢复才结束；单轮最多90秒。
 workflow:
   name: line_follow_only
   auto_start: false
   steps:
   - action: line_follow
-    seconds: 2.0
+    until_untrusted: true
+    boundary_wait_sec: 5.0
     progress_timeout_sec: 3.0
-    step_timeout_sec: 30.0
+    step_timeout_sec: 90.0

@@ -1,5 +1,14 @@
 # 树莓派本机任务控制与两路摄像头
 
+独立循迹入口 `line_follow_only.launch.py` 已改为 `until_untrusted: true`：
+逐帧跟随近端实测段，可信范围随新图像延伸；短缺口只在两端几何吻合时降速通过，
+前方累计缺口上限为图高30%，通过速度最多为正常30%；其他缺口截断。
+可信段变短减速，视觉不足时立即发零速，保留本轮最多5秒等待曝光和新帧恢复。
+恢复有效跟踪则继续；连续未恢复才结束本轮，结束后需再次 start。单轮总超时默认90秒。
+`line_follow_only.yaml` 的 `boundary_wait_sec` 控制该等待；通信和图像时效保护仍立即停车。
+联合入口仍使用有效循迹 2 秒的测试配置。
+窗口红叉显示当前连续实测段末端。图像比例阈值未换算为物理刹车距离，需要低速实测。
+
 机械臂、底盘、力传感器、HK 拍照和 USB 循迹在同一台树莓派运行。HK 照片通过网线传给外部主机做缺陷检测；树莓派不启动 YOLO。机械臂和底盘不再通过两机 TCP 控制桥协调。
 
 ## 两路摄像头与控制入口
@@ -32,7 +41,7 @@
   step_timeout_sec: 30.0
 ```
 
-`line_follow.seconds` 是累计收到有效 `tracking` 状态的时间，不是目标行驶距离。丢线、视觉过期或底盘未就绪时，循迹节点立即发零速度；连续没有 tracking 超过 `progress_timeout_sec` 则流程失败。默认速度为 0.05 m/s，可由启动参数 `line_follow_speed` 调整。
+`line_follow.seconds` 是累计收到有效 `tracking` 状态的时间，不是目标行驶距离。丢线、视觉过期或底盘未就绪时，循迹节点立即发零速度；连续没有 tracking 超过 `progress_timeout_sec` 则流程失败。默认速度为 0.075 m/s，可由启动参数 `line_follow_speed` 调整。
 
 `hk_capture` 使用 `robot_task_control/config/hk_capture.yaml`，默认每次触发只拍一张，曝光为 40000 μs，与现有 HK 参数一致。独立的数据集多曝光配置仍保留，但统一工作流不使用它。触发并设置曝光后必须收到新帧，不能用无新帧时的旧图假报成功。返回成功表示该次新照片已保存并发布到照片话题；不是外部主机保存确认。
 
@@ -63,7 +72,7 @@ SDK 从源码编译并安装到 `ros_ws/local/elite_sdk`；默认每次编译 2 
 ros2 launch robot_task_control robot_system.launch.py \
   robot_ip:=169.254.199.150 local_ip:=169.254.199.100 \
   sensor_host:=169.254.199.80 \
-  image_listen_ip:=169.254.199.100 image_receiver_ip:=169.254.199.250 \
+  image_listen_ip:=169.254.199.100 image_receiver_ip:=169.254.199.120 \
   line_camera_device:=/dev/video0
 ```
 
@@ -137,7 +146,7 @@ colcon test-result --verbose
 
 `arm_admittance_only.launch.py` 会自动等待机器人外控程序运行、轨迹/关节状态/速度缩放/TCP 位姿四个控制器激活，并收到零偏采集后的新鲜力数据，再捕获当前位置开启导纳，无需调用 start、enable 或 hold_current_pose 服务。采集零偏时工具应保持无外部接触。已有机械臂驱动在运行时，可传 `start_arm_driver:=false` 复用；需要手动开始时传 `auto_start:=false`。
 
-`arm_admittance_line_follow.launch.py` 同样默认自动开始并检查机械臂就绪：当前位置导纳保持 2 秒后，AGV 以默认 0.05 m/s 沿 USB 相机识别的蓝线累计有效循迹 2 秒，然后停车；机械臂导纳仍保持开启。无需海康相机或照片接收主机。启动这个联合入口前退出单独的机械臂驱动、导纳和底盘测试会话，避免重复运行节点；`auto_start:=false` 可恢复手动开始。
+`arm_admittance_line_follow.launch.py` 同样默认自动开始并检查机械臂就绪：当前位置导纳保持 2 秒后，AGV 以默认 0.075 m/s 沿 USB 相机识别的蓝线累计有效循迹 2 秒，然后停车；机械臂导纳仍保持开启。无需海康相机或照片接收主机。启动这个联合入口前退出单独的机械臂驱动、导纳和底盘测试会话，避免重复运行节点；`auto_start:=false` 可恢复手动开始。
 
 联合/机械臂整套启动现在分阶段加载：先启动驱动，确认外控运行且四个必要控制器连续正常 5 秒后，再启动 MoveIt、力传感器、导纳、USB 循迹相机和工作流。等待期间状态异常会重新计时；120 秒内无法稳定就取消控制部分启动。用 `arm_control_start_delay:=15.0` 可将稳定等待改为 15 秒，`0.0` 可关闭分阶段等待。此参数不改变导纳到位后保持 2 秒和 AGV 有效循迹 2 秒的任务配置。复用已启动的驱动/导纳时不再重复等待或加载这些节点。
 
@@ -181,7 +190,7 @@ USB 设备与循迹速度可继续通过 `line_camera_device`、`line_follow_spe
 
 ```bash
 ros2 launch robot_task_control line_follow_only.launch.py \
-  line_show_window:=true line_follow_speed:=0.05
+  line_show_window:=true line_follow_speed:=0.075
 ```
 
 `line_adaptive_exposure:=false` 可关闭 USB 曝光补偿；默认 true，需要 `v4l-utils`（已加入包依赖）。补偿只控制 `line_camera_device` 指定的 USB 设备，不调 HK 曝光。`line_image_forward_direction`、`line_vehicle_reference_y_ratio` 可覆盖安装方向与纵向参考；其他增益和横向参考可通过节点参数修改。
@@ -272,3 +281,12 @@ YAML 的 `real_target_frame: tool0` 表示本次按 tool0 检测；以后切换 
 检测节点的 `/detect_controller/status` 中，`motion_ready` 表示关节、原始力、零偏初始化后的滤波力均未超时，初始受力低于配置限制，导纳服务与 MoveIt 运动接口可用，且没有未结束运动或停止请求；`readiness_message` 给出等待原因。测试任务在该状态和外控状态连续就绪后才调用初始运动服务，避免服务刚出现、力零偏尚未完成时抢先请求导致失败。数据时效和力限制不放宽。
 
 检测初始点与检测点共用 tool0 方向配置（相对 base_link）：`initial_orientation_mode: current` 锁存初始移动前方向；`fixed` 使用 `initial_rpy_deg: [Rx, Ry, Rz]`，单位度，固定轴 RPY，旋转矩阵为 Rz(yaw)·Ry(pitch)·Rx(roll)。示例 `[0,0,0]` 仅为占位，未确认设备角度时保留 current。`orientation_tolerance_deg: 1.0` 限制目标到位和垂直接近/柔顺保持时的角度偏差；MoveIt 目标姿态容差可能因探头长度进一步收紧。初始与预接近之间的一般规划仍只保证目标姿态，不承诺整段轨迹姿态不变。旧自定义 YAML 的弧度 `orientation_tolerance` 继续兼容；显式度制参数优先。
+
+海康照片通信现由 `eli_cs_robot_serial/device/industrial_pc` 提供，旧入口兼容保留。
+工控机默认 IP 为 `169.254.199.120`，海康独立使用 TCP 9002；深度采集包使用 9030，
+深度检测点回传使用 9010。详见该目录 README。已在任务中启用海康传输时，不再重复
+启动 `industrial_pc.launch.py start_hk_transfer:=true`。
+
+## 循迹与四点机械臂正式测试
+
+`line_follow_arm_test.launch.py` 包含驱动与控制：先确认底盘停稳，将机械臂送到初始点（位置与角度都已到位则跳过），再沿线行走：途中停止横线居中后等待新的 `/line_follow/resume` 消息，最终 T 形横线居中停车后确认停稳，依次执行第二、第三、第四点。设备就绪后自动开始，无需调用 start 服务；点位和角度在 `config/line_follow_arm_test.yaml` 调整。使用 MoveIt 碰撞检查规划，保持现有其他任务的笛卡尔规划默认值。完整步骤见 [测试流程](../../docs/tasks/LINE_FOLLOW_ARM_TEST.md)。

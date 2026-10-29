@@ -8,6 +8,8 @@
     saturation_min: 70        # 灰色背景不应成为强蓝色种子
     value_min: 4              # 本机暗蓝胶带 V≈5..6；保留饱和度/蓝色优势约束
     illumination_support: true # 弱蓝色仅在连通区域含足够强蓝色像素时接纳
+    local_brightness_normalization: true # 局部明度归一化，原始色相/饱和度及蓝色优势仍必需
+    hough_join_support: true # 按实测点数量自适应投票阈值，用霍夫线段稳定两端拟合
     weak_saturation_min: 12
     weak_value_min: 8
     weak_seed_pixels: 20
@@ -24,22 +26,25 @@
     row_step: 6
     min_line_width: 4
     max_width_fraction: 0.45  # 过宽横截面标无效，不把急弯/交叉口当普通中线
-    max_center_jump: 50       # 相邻有效行中点最大跳变像素
+    max_center_jump: 65       # 相邻有效行中点最大跳变像素
     allow_reacquire: true     # 起点在线外时，局部寻找最近蓝像素
     search_radius: 80
     initial_search_radius: 640 # 默认覆盖整幅处理图，胶带不必在中间
     require_bottom_anchor: false # 局部可见即可测偏移；实车控制可额外要求底部连接
     bottom_anchor_tolerance_rows: 3 # 底部短暂阴影允许从紧邻的几行建立锚点
-    max_missing_rows: 4       # 连续缺失超过此行数后停止向上续接
+    max_missing_rows: 6       # 连续缺失超过此行数后停止向上续接
     min_valid_rows: 4
     min_line_aspect: 2.0      # 旋转包围框长度 / 内部厚度，支持斜向和横向胶带
     min_row_fill: 0.75        # 每行左右边界之间至少 75% 像素属于同一候选
     min_row_coverage: 0.65    # 候选上下范围内至少 65% 的采样行满足线宽和填充要求
-    max_shape_center_step: 2.0 # 中线跳变 / (平均局部线宽 + 行距) 的上限
+    max_shape_center_step: 2.5 # 中线跳变 / (平均局部线宽 + 行距) 的上限
     min_core_fraction: 0.45   # 有实心内部的像素比例，拒绝薄网状/毛刺噪声
     max_width_spread: 2.5     # 逐行宽度 90%/10% 分位数比，拒绝异常忽宽忽窄
     max_occlusion_gap: 72    # 硬上限；实际限制按局部线宽×1.5自适应，至少3个行距；0=关闭
     max_occlusion_offset: 12.0 # 遮挡两端方向/横向对齐容差像素，避免接错线
+    extended_join_gap_ratio: 0.30   # 长反光缺口：仅接两端相容或延长线在缺口内相交的候选
+    extended_join_support_ratio: 0.10 # 两端各需至少图高/图宽10%的实测支撑
+    extended_join_angle_rad: 0.85   # 延长线接合转角上限，约49度
     use_occlusion_edges: true # Canny 跨越胶带宽度的非蓝边缘，辅助报告“疑似遮挡”
     max_blue_fraction: 0.65   # ROI 大面积呈蓝色时标 BLUE_INTERFERENCE
     lookahead_ratio: 0.60     # 从 ROI 底部往上 60% 处取目标点

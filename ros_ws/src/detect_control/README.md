@@ -1,5 +1,21 @@
 # 多点漆膜厚度接触检测
 
+真机检测测试及本包 `detect.launch.py` 默认启动测厚仪串口节点，关闭周期轮询，
+在接触保持开始时发一次采集触发；已有驱动时传 `start_thickness_detector:=false`。
+`detactor_config_file` 可指定串口配置，默认设备 `/dev/ttyCH341USB0`。
+配置中的 `measurement_unit` 应按仪器设置填写 um/mm，未确认时保持 unknown。
+
+仪器 `/detactor/measurement` 发布最新单值 JSON，包括 value、unit、sequence 和 received_at_ros；
+即使数值相同，新有效回包也更新序号和时间。`/detactor/latest_measurement`（Trigger）读取缓存。
+任务只关联本次 HOLD 触发后收到的回包，发布 `/detect_controller/thickness_result`；
+保持结束将该点最后一次读数追加到 `~/.ros/detect_control/thickness_results.jsonl`，
+也可通过 `measurement_results_file` 配置路径。没有新读数时记录 available=false，
+不使用上一点读数。缺少仪器不阻塞现有运动测试，但不表示完成了真实厚度测量。
+串口时间只是回包接收时间；设备返回历史窗口时无法证明物理测量发生时间。
+
+工控机可通过现有 9010 签名通道查询最新仪器单值；详见
+`eli_cs_robot_serial/device/industrial_pc/README.md`。查询不会触发测量。
+
 `terminal_link_1`（Joint_1 子坐标系）是相机坐标，`terminal_link_2`（Joint_2 子坐标系）是探头检测点；机器人控制点仍为 `tool0`。相机相对坐标先转换到基座并保存，再执行整组检测。
 
 ## 执行流程

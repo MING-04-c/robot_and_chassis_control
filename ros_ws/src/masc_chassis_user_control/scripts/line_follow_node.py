@@ -2,6 +2,7 @@
 """Drive the chassis from ruier_camer_diver observations; stop on lost/stale input."""
 
 import json
+import math
 import os
 import time
 from dataclasses import replace
@@ -15,15 +16,17 @@ from masc_chassis_msgs.msg import ChassisStatus, CommStatus
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
-from std_msgs.msg import String
+from std_msgs.msg import String, Empty
 from std_srvs.srv import SetBool, Trigger
 
+from stop_marker import StopMarkerGate, detect_stop_markers
 from line_follow_control import ControlConfig, line_command, motion_preview, slew, smooth_yaw, tracking_geometry
 
 
 class LineFollowNode(Node):
     def __init__(self):
         super().__init__('line_follow_controller')
+        cv2.setNumThreads(1)  # 限制掩膜处理线程，避免和控制循环争抢所有 CPU。
         fixed = ParameterDescriptor(read_only=True)
         defaults = ControlConfig()
         values = {name: self.declare_parameter(name, value).value
@@ -36,6 +39,12 @@ class LineFollowNode(Node):
         self.bridge = CvBridge()
         self.window_name = 'MASC line following - body reference'
         self.geometry = None
+        self.marker_gate = StopMarkerGate()
+        self.marker_candidates = []
+        self.marker_time = None
+        self.marker_header = None
+        self.marker_stamp = None
+        self.control_curve_strength = 0.0
         self.exposure_status = None
         self.last_state = 0.0
         self.last_debug_time = 0.0
@@ -78,6 +87,8 @@ class LineFollowNode(Node):
         self.previous_v = self.previous_w = 0.0
         self.last_tick = time.monotonic()
         self.reason = None
+        self.input_reason = 'waiting'
+        self.last_blocked_reason = None
         self.cmd_pub = self.create_publisher(Twist, topics['cmd_vel_topic'], 10)
         self.state_pub = self.create_publisher(String, '/line_follow/status', 10)
         self.debug_pub = self.create_publisher(Image, '/line_follow/debug_image', qos_profile_sensor_data)
@@ -86,6 +97,10 @@ class LineFollowNode(Node):
         self.create_subscription(
             Image, debug_image_topic, self.on_debug_image,
             QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
+        marker_mask_topic = self.declare_parameter('stop_marker_mask_topic', '/camera/line/mask', fixed).value
+        self.create_subscription(Image, marker_mask_topic, self.on_marker_mask,
+                                 QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
+        self.create_subscription(Empty, '/line_follow/resume', self.on_resume_marker, 10)
         self.create_subscription(String, topics['line_status_topic'], self.on_status, 10)
         self.create_subscription(PolygonStamped, topics['centerline_topic'],
                                  self.on_path, qos_profile_sensor_data)
@@ -101,6 +116,33 @@ class LineFollowNode(Node):
             f'Line following ready: enabled={self.enabled}, '
             f'forward_speed={self.config.forward_speed:.3f} m/s; '
             f'{topics["line_status_topic"]} -> {topics["cmd_vel_topic"]}')
+
+    def on_marker_mask(self, message):
+        if not self.config.stop_marker_enabled:
+            return
+        stamp = (message.header.stamp.sec, message.header.stamp.nanosec)
+        if stamp == self.marker_stamp:
+            return
+        self.marker_stamp = stamp
+        try:
+            mask = self.bridge.imgmsg_to_cv2(message, desired_encoding='mono8')
+            if isinstance(self.status, dict) and (
+                    mask.shape != (self.status.get('image_height'), self.status.get('image_width'))):
+                self.marker_time = None
+                return
+            self.marker_candidates = detect_stop_markers(mask, self.path_points, self.config)
+            self.marker_gate.observe(self.marker_candidates, mask.shape[0], self.config)
+            self.marker_header = message.header
+            self.marker_time = time.monotonic()
+        except (CvBridgeError, ValueError, cv2.error):
+            self.marker_time = None
+
+    def on_resume_marker(self, _message):
+        if (self.enabled and self.config.stop_marker_enabled and self.blocked_reason(time.monotonic(), check_enabled=False) is None
+                and self.marker_gate.resume(self.config)):
+            self.get_logger().info('收到新的继续消息：离开途中停止点，继续循迹')
+        else:
+            self.get_logger().info('忽略继续消息：尚未停在途中站点，或当前输入/底盘不可用')
 
     def on_exposure_status(self, message):
         try:
@@ -122,7 +164,13 @@ class LineFollowNode(Node):
             candidate.validate()
         except (ValueError, TypeError) as error:
             return SetParametersResult(successful=False, reason=str(error))
+        marker_was_enabled = self.config.stop_marker_enabled
         self.config = candidate
+        if candidate.stop_marker_enabled and not marker_was_enabled:
+            self.marker_gate.reset()
+            self.marker_time = self.marker_stamp = None
+        if enabled and not self.enabled:
+            self.marker_gate.reset()
         if enabled != self.enabled or updates.keys() & {
                 "image_forward_direction", "vehicle_reference_x_ratio", "vehicle_reference_y_ratio"}:
             self.good_frames = 0
@@ -147,10 +195,7 @@ class LineFollowNode(Node):
                 self.path_points, observation.get('image_width'),
                 observation.get('image_height'), self.config)
             if reason is None:
-                observation.update({key: geometry[key] for key in (
-                    'error_normalized', 'heading_error_rad', 'target_fallback')})
-                observation['curve_geometry_valid'] = True
-                observation['target_estimated'] = False
+                observation = self.local_observation(observation, geometry)
                 _, _, reason = line_command(observation, self.config)
                 if reason == 'tracking' and self.ready_frames < self.reacquire_frames:
                     reason = 'reacquiring'
@@ -158,18 +203,42 @@ class LineFollowNode(Node):
         response.message = 'chassis and USB tracking inputs ready' if response.success else str(reason)
         return response
 
+    @staticmethod
+    def local_observation(status, geometry):
+        """按近端实测段及已通过两端几何验证的续接段判断可行性。"""
+        observation = dict(status)
+        observation.update({key: geometry[key] for key in (
+            'error_normalized', 'heading_error_rad', 'target_fallback', 'trusted_speed_factor',
+            'path_heading_rad', 'curve_strength')})
+        fraction = observation.get('valid_row_fraction')
+        if (not isinstance(fraction, bool) and isinstance(fraction, (int, float))
+                and math.isfinite(fraction) and 0 <= fraction <= 1):
+            observation['valid_row_fraction'] = min(fraction, geometry['trusted_span_ratio'])
+        observation['curve_geometry_valid'] = True
+        observation['target_estimated'] = False
+        observation['gap_connection_confirmed'] = bool(geometry['bridged_gaps'])
+        if observation['gap_connection_confirmed']:
+            # 上游 Canny 的疑似遮挡不能对已经验证的同一缺口重复降速。
+            observation['occlusion_suspected'] = False
+        return observation
+
     def on_status(self, message):
         try:
             status = json.loads(message.data)
             candidate = dict(status) if isinstance(status, dict) else status
+            geometry_reason = None
             if isinstance(candidate, dict):
-                _, geometry_reason = tracking_geometry(
+                geometry, geometry_reason = tracking_geometry(
                     self.path_points, candidate.get('image_width'),
                     candidate.get('image_height'), self.config)
                 candidate['curve_geometry_valid'] = (
                     geometry_reason is None and self.path_time is not None
                     and time.monotonic() - self.path_time <= self.input_timeout)
+                if candidate['curve_geometry_valid']:
+                    candidate = self.local_observation(candidate, geometry)
             _, _, reason = line_command(candidate, self.config)
+            if geometry_reason is not None:
+                reason = geometry_reason
         except (ValueError, TypeError):
             status, reason = None, 'invalid_json'
         self.status = status
@@ -233,6 +302,13 @@ class LineFollowNode(Node):
         for receipt in (self.status_time, self.path_time):
             if receipt is None or now - receipt > self.input_timeout:
                 return 'camera_timeout'
+        if self.config.stop_marker_enabled:
+            if self.marker_time is None or now-self.marker_time > self.input_timeout or self.marker_header is None:
+                return 'stop_marker_mask_timeout'
+            stamp = self.marker_header.stamp
+            age = (self.get_clock().now().nanoseconds-stamp.sec*10**9-stamp.nanosec)/1e9
+            if not -0.1 <= age <= self.input_timeout:
+                return 'stop_marker_mask_stale'
         if not self.path_valid or self.path_header is None:
             return 'empty_centerline'
         if self.path_header.frame_id == 'synthetic_demo' and not self.dry_run:
@@ -259,6 +335,8 @@ class LineFollowNode(Node):
             if width <= 0 or height <= 0:
                 return
             text = f'CONTROL: {self.reason or "waiting"} / forward={self.config.image_forward_direction}'
+            if self.geometry and self.geometry['curve_strength'] > 0:
+                text += f' / CURVE={self.control_curve_strength:.2f}'
             if self.exposure_status and self.exposure_status.get('ready'):
                 mode = 'adaptive' if self.exposure_status.get('enabled') else 'fixed'
                 text += f' / EXP={self.exposure_status.get("exposure")} {mode}'
@@ -276,6 +354,16 @@ class LineFollowNode(Node):
                 cv2.line(image, ground, (width - 1, ground[1]), (180, 180, 180), 1)
                 cv2.putText(image, 'GROUND CHECK START', (5, ground[1] - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1, cv2.LINE_AA)
+                if self.config.stop_marker_enabled:
+                    stop_y = int(self.config.stop_marker_target_ratio*height)+64
+                    cv2.line(image, (0, stop_y), (width-1, stop_y), (255, 255, 0), 1)
+                    cv2.putText(image, 'STOP TARGET', (5, stop_y-5), cv2.FONT_HERSHEY_SIMPLEX,
+                                .35, (255, 255, 0), 1, cv2.LINE_AA)
+                    for marker in self.marker_candidates:
+                        center = pixel(marker['x'], marker['y'])
+                        cv2.circle(image, center, 9, (0, 0, 255), 2)
+                        cv2.putText(image, 'STOP '+marker['kind'], (center[0]+10, center[1]),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 0, 255), 1, cv2.LINE_AA)
                 target = pixel(geometry['target_x'], geometry['target_y'])
                 cv2.line(image, (reference[0], 64), (reference[0], height + 63),
                          (255, 0, 255), 1)
@@ -283,6 +371,15 @@ class LineFollowNode(Node):
                                cv2.MARKER_CROSS, 20, 2)
                 cv2.circle(image, near, 8, (255, 255, 0), 2)
                 cv2.circle(image, target, 10, (0, 140, 255), 2)
+                boundary = pixel(geometry['trusted_end_x'], geometry['trusted_end_y'])
+                cv2.drawMarker(image, boundary, (0, 0, 255), cv2.MARKER_TILTED_CROSS, 18, 2)
+                cv2.putText(image, 'MEASURED SEGMENT END', (max(0, boundary[0] - 100), boundary[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                for gap in geometry['bridged_gaps']:
+                    start, end = pixel(*gap['from']), pixel(*gap['to'])
+                    cv2.line(image, start, end, (0, 165, 255), 3)
+                    cv2.putText(image, 'GAP: JOINED', start,
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1, cv2.LINE_AA)
                 cv2.arrowedLine(image, reference, target, (0, 140, 255), 2)
                 cv2.line(image, (reference[0], near[1]), near, (255, 255, 0), 2)
                 cv2.putText(image, 'GOAL (not wheel angle)', (target[0] + 12, target[1]),
@@ -308,6 +405,10 @@ class LineFollowNode(Node):
                 detail = 'CONTROL waiting for a fresh near line; green point is the detector target'
             cv2.putText(image, detail, (10, 47), cv2.FONT_HERSHEY_SIMPLEX,
                         0.4, (255, 255, 255), 1, cv2.LINE_AA)
+            diagnosis = (f'INPUT: {self.input_reason} / LAST BLOCK: {self.last_blocked_reason or "-"}'
+                         f' / v={self.previous_v:+.3f} m/s')
+            cv2.putText(image, diagnosis, (10, 62), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4, (0, 220, 255), 1, cv2.LINE_AA)
             output = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
             output.header = message.header
             self.debug_pub.publish(output)
@@ -336,17 +437,26 @@ class LineFollowNode(Node):
                for t in (self.status_time, self.path_time)):
             self.geometry = None
             geometry_reason = 'camera_timeout'
-        reason = self.blocked_reason(now)
+        # 独立计算输入是否可走，禁用后仍显示真实输入状态，便于区分识别与任务使能问题。
+        input_reason = self.blocked_reason(now, check_enabled=False)
         v = w = 0.0
-        if reason is None:
+        if input_reason is None:
             if geometry_reason is not None:
-                reason = geometry_reason
+                input_reason = geometry_reason
             else:
-                observation.update({key: self.geometry[key] for key in (
-                    'error_normalized', 'heading_error_rad', 'target_fallback')})
-                observation['curve_geometry_valid'] = True
-                observation['target_estimated'] = False
-                v, w, reason = line_command(observation, self.config)
+                observation = self.local_observation(observation, self.geometry)
+                tau = self.config.curve_entry_time_sec
+                alpha = -math.expm1(-dt/tau) if tau > 0 else 1.0
+                self.control_curve_strength += alpha * (
+                    self.geometry['curve_strength']-self.control_curve_strength)
+                observation['curve_strength'] = self.control_curve_strength
+                self.geometry['control_curve_strength'] = self.control_curve_strength
+                v, w, input_reason = line_command(observation, self.config)
+        self.input_reason = input_reason
+        reason = input_reason if self.enabled else 'disabled'
+        if self.enabled:
+            if input_reason != 'tracking':
+                self.last_blocked_reason = input_reason
             if reason == 'tracking' and self.good_frames < self.reacquire_frames:
                 v = w = 0.0
                 reason = 'reacquiring'
@@ -354,9 +464,17 @@ class LineFollowNode(Node):
             self.good_frames = 0
         if reason == 'tracking':
             v = slew(self.previous_v, v, self.config.linear_acceleration, dt)
-            w = smooth_yaw(self.previous_w, w, self.config, dt)
+            w = smooth_yaw(self.previous_w, w, self.config, dt, self.control_curve_strength)
+            if self.config.stop_marker_enabled:
+                v, marker_state = self.marker_gate.limit(v, self.config)
+                # 横线接近限速和停车必须盖过平滑器，不能为了缓降而滑过目标。
+                if marker_state != 'searching':
+                    reason = 'stop_marker_'+marker_state.removeprefix('stopped_')
+                    if v == 0:
+                        w = 0.0
         else:
             v = w = 0.0
+            self.control_curve_strength = 0.0
         self.previous_v, self.previous_w = v, w
         command = Twist()
         command.linear.x, command.angular.z = v, w
@@ -368,8 +486,10 @@ class LineFollowNode(Node):
             self.last_state = now
             self.state_pub.publish(String(data=json.dumps({
                 'state': reason, 'enabled': self.enabled,
+                'input_state': self.input_reason, 'last_blocked_reason': self.last_blocked_reason,
                 'image_forward_direction': self.config.image_forward_direction,
                 'geometry': self.geometry,
+                'stop_marker': self.marker_gate.snapshot(self.config),
                 'forward_speed_mps': self.config.forward_speed,
                 'command_linear_x_mps': v, 'command_angular_z_radps': w,
             }, separators=(',', ':'))))

@@ -11,6 +11,7 @@ import rclpy
 import yaml
 from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import Pose, PoseArray, WrenchStamped
+from nav_msgs.msg import Odometry
 from masc_chassis_msgs.msg import TaskStatus
 from masc_chassis_msgs.srv import TaskControl
 from rclpy.executors import ExternalShutdownException
@@ -33,6 +34,7 @@ SUPPORTED_ACTIONS = set(CONTROL_COMMANDS) | {
     "arm_move",
     "hk_capture",
     "line_follow",
+    "wait_chassis_stopped",
 }
 
 
@@ -127,6 +129,12 @@ class WorkflowController(Node):
         self.capture_client = self.create_client(Trigger, "/dataset_capture/capture")
         self.follow_status = None
         self.follow_status_time = None
+        self.wheel_odom = None
+        self.wheel_odom_received = None
+        self.stationary_since = None
+        odom_topic = str(self.declare_parameter("chassis_odom_topic", "/wheel_odom").value)
+        if any(step['action'] == 'wait_chassis_stopped' for step in self.steps):
+            self.create_subscription(Odometry, odom_topic, self.on_wheel_odom, 10)
         self.create_subscription(
             String, "/line_follow/status", self.on_follow_status, 10
         )
@@ -172,6 +180,15 @@ class WorkflowController(Node):
             )
         self.check_arm_devices = any(
             step["action"] in ("arm_move", "arm_poses") for step in self.steps
+        )
+        self.check_admittance_devices = any(
+            step["action"] == "arm_move" and step["control_mode"] == "admittance"
+            for step in self.steps
+        )
+        self.check_moveit_devices = any(
+            step["action"] == "arm_poses"
+            or (step["action"] == "arm_move" and step["control_mode"] == "moveit")
+            for step in self.steps
         )
         self.check_line_devices = any(
             step["action"] == "line_follow" for step in self.steps
@@ -239,18 +256,34 @@ class WorkflowController(Node):
             if action == "delay" and (not math.isfinite(seconds) or seconds < 0.0):
                 raise ValueError(f"workflow step {index} has invalid seconds")
             if action == "line_follow":
+                until_untrusted = step.get("until_untrusted", False)
+                if not isinstance(until_untrusted, bool):
+                    raise ValueError(f"workflow step {index} until_untrusted must be boolean")
+                if not isinstance(step.get("require_final_marker", False), bool):
+                    raise ValueError(f"workflow step {index} require_final_marker must be boolean")
+                if step.get("require_final_marker", False) and not until_untrusted:
+                    raise ValueError(f"workflow step {index} final marker mode requires until_untrusted")
+                boundary_wait = float(step.get("boundary_wait_sec", 0.0))
+                if not math.isfinite(boundary_wait) or not 0 <= boundary_wait <= 30:
+                    raise ValueError(f"workflow step {index} boundary_wait_sec must be 0..30")
                 progress_timeout = float(step.get("progress_timeout_sec", 3.0))
                 if not math.isfinite(progress_timeout) or progress_timeout <= 0.0:
                     raise ValueError(
                         f"workflow step {index} has invalid progress_timeout_sec"
                     )
                 duration = float(step.get("seconds", -1.0))
-                if not math.isfinite(duration) or duration <= 0.0:
+                if not until_untrusted and (not math.isfinite(duration) or duration <= 0.0):
                     raise ValueError(
                         f"workflow step {index} line_follow.seconds must be positive"
                     )
             if action == "arm_poses":
                 WorkflowController.validate_pose_values(step.get("poses"), index)
+            if action == "wait_chassis_stopped":
+                for name, default in (("stable_seconds", 1.0), ("linear_tolerance", 0.005),
+                                      ("angular_tolerance", 0.02), ("data_timeout_sec", 0.5)):
+                    value = float(step.get(name, default))
+                    if not math.isfinite(value) or value <= 0:
+                        raise ValueError(f"workflow step {index} invalid {name}")
             if action == "arm_move":
                 WorkflowController.validate_arm_move(step, index)
         return workflow
@@ -304,6 +337,11 @@ class WorkflowController(Node):
 
     @staticmethod
     def validate_arm_move(step, index):
+        if not isinstance(step.get('skip_if_at_target', False), bool):
+            raise ValueError(f'workflow step {index} skip_if_at_target must be boolean')
+        degrees = float(step.get('arrival_orientation_tolerance_deg', 1.0))
+        if not math.isfinite(degrees) or not 0 < degrees <= 180:
+            raise ValueError(f'workflow step {index} invalid arrival_orientation_tolerance_deg')
         if step.get("control_mode") not in ("moveit", "admittance"):
             raise ValueError(
                 f"workflow step {index} control_mode must be moveit or admittance"
@@ -491,6 +529,7 @@ class WorkflowController(Node):
             self.follow_tracking_seconds = 0.0
             self.follow_last_tick = monotonic()
             self.follow_last_tracking = monotonic()
+            self.follow_boundary_since = None
             if not self.stop_pid_before_follow:
                 self.phase = "follow_select"
                 return
@@ -525,17 +564,52 @@ class WorkflowController(Node):
                 self.follow_status_time is not None
                 and now - self.follow_status_time <= 1.0
             )
-            if fresh and self.follow_status == "tracking":
+            if fresh and self.follow_status == "stop_marker_intermediate":
+                self.follow_last_tracking = now
+                self.follow_boundary_since = None
+                return  # 等待 /line_follow/resume，新消息到达前既不完成也不累计行走时间。
+            if fresh and self.follow_status in ("tracking", "stop_marker_approaching"):
                 self.follow_tracking_seconds += dt
                 self.follow_last_tracking = now
-            if self.follow_tracking_seconds >= float(step["seconds"]):
+                if self.follow_boundary_since is not None:
+                    self.get_logger().info("视觉恢复有效，继续本轮循迹")
+                self.follow_boundary_since = None
+            until_untrusted = step.get("until_untrusted", False)
+            boundary = (until_untrusted and self.follow_tracking_seconds > 0.0 and fresh
+                        and self.follow_status in {
+                            "line_lost", "insufficient_rows", "no_forward_line",
+                            "insufficient_forward_span", "near_line_missing", "empty_centerline",
+                            "heading_out_of_range", "horizontal_or_unknown_line",
+                        })
+            if boundary and self.follow_boundary_since is None:
+                self.follow_boundary_since = now
+                self.get_logger().info(
+                    f"视觉暂不可行，底盘已停车；等待最多 {step.get('boundary_wait_sec', 0.0)} 秒恢复："
+                    f"{self.follow_status}")
+            if not boundary and self.follow_status not in ("tracking", "reacquiring"):
+                self.follow_boundary_since = None
+            waiting_at_boundary = (self.follow_boundary_since is not None and fresh
+                                   and (boundary or self.follow_status == "reacquiring"))
+            boundary_confirmed = (waiting_at_boundary and now - self.follow_boundary_since >=
+                                  float(step.get("boundary_wait_sec", 0.0)))
+            timed_finish = (not until_untrusted and
+                            self.follow_tracking_seconds >= float(step["seconds"]))
+            final_marker = fresh and self.follow_status == "stop_marker_final"
+            if boundary_confirmed and step.get("require_final_marker", False) and not final_marker:
+                self.fail_workflow("最终停止横线尚未确认，主线持续不可用；不会执行后续机械臂点位")
+                return
+            if boundary_confirmed or timed_finish or final_marker:
+                if final_marker:
+                    self.get_logger().info("最终停止横线已居中停车，结束循迹并等待底盘停稳")
+                if boundary_confirmed:
+                    self.get_logger().info(f"可信实测段不足，结束本次循迹：{self.follow_status}")
                 self.phase = "follow_disable_pending"
                 self.request_bool(
                     self.follow_enable_client,
                     False,
                     lambda result: self.checked_bool(result, "follow_restore_pid"),
                 )
-            elif now - self.follow_last_tracking > float(
+            elif not waiting_at_boundary and now - self.follow_last_tracking > float(
                 step.get("progress_timeout_sec", 3.0)
             ):
                 self.fail_workflow(f"line following unavailable: {self.follow_status}")
@@ -615,6 +689,12 @@ class WorkflowController(Node):
         action = step["action"]
         now_ns = self.get_clock().now().nanoseconds
 
+        if (action == "line_follow" and self.phase == "follow_tracking"
+                and self.follow_status == "stop_marker_intermediate"
+                and self.follow_status_time is not None
+                and monotonic()-self.follow_status_time <= 1.0):
+            # 只暂停人工站点等待的时钟；状态失联后仍恢复超时保护。
+            self.step_started += max(0.0, monotonic()-self.follow_last_tick)
         if monotonic() - self.step_started > float(
             step.get("step_timeout_sec", self.step_timeout)
         ):
@@ -638,6 +718,8 @@ class WorkflowController(Node):
             return
         if action == "hk_capture":
             self.advance_hk_capture()
+        elif action == "wait_chassis_stopped":
+            self.advance_chassis_stopped(step, now_ns)
         elif action == "line_follow":
             self.advance_line_follow(step)
         elif action in CONTROL_COMMANDS:
@@ -671,6 +753,48 @@ class WorkflowController(Node):
         elif action == "arm_move":
             self.advance_arm_move(step, now_ns)
 
+    def on_wheel_odom(self, message):
+        self.wheel_odom = message
+        self.wheel_odom_received = monotonic()
+        step = self.current_step()
+        if step is not None and step['action'] == 'wait_chassis_stopped':
+            twist = message.twist.twist
+            values = [twist.linear.x, twist.linear.y, twist.linear.z,
+                      twist.angular.x, twist.angular.y, twist.angular.z]
+            if (not all(math.isfinite(v) for v in values) or
+                    math.sqrt(sum(v*v for v in values[:3])) > step.get('linear_tolerance', 0.005) or
+                    math.sqrt(sum(v*v for v in values[3:])) > step.get('angular_tolerance', 0.02)):
+                self.stationary_since = None
+
+    def advance_chassis_stopped(self, step, now_ns):
+        """只以新鲜轮速反馈确认停车；超时由工作流统一中止，不能用固定延时冒充停稳。"""
+        now = monotonic()
+        if self.phase == 'ready':
+            self.stationary_since = None
+            self.phase = 'waiting_stationary'
+            self.get_logger().info('等待底盘轮速反馈连续停稳后开始机械臂任务')
+        timeout = float(step.get('data_timeout_sec', 0.5))
+        if (self.wheel_odom is None or self.wheel_odom_received is None or
+                self.wheel_odom_received < self.step_started or now - self.wheel_odom_received > timeout):
+            self.stationary_since = None
+            return
+        stamp = self.wheel_odom.header.stamp
+        age = (now_ns - stamp.sec * 10**9 - stamp.nanosec) / 1e9
+        twist = self.wheel_odom.twist.twist
+        values = [twist.linear.x, twist.linear.y, twist.linear.z,
+                  twist.angular.x, twist.angular.y, twist.angular.z]
+        if (stamp.sec == 0 and stamp.nanosec == 0 or not -0.1 <= age <= timeout or
+                not all(math.isfinite(v) for v in values) or
+                math.sqrt(sum(v*v for v in values[:3])) > float(step.get('linear_tolerance', 0.005)) or
+                math.sqrt(sum(v*v for v in values[3:])) > float(step.get('angular_tolerance', 0.02))):
+            self.stationary_since = None
+            return
+        if self.stationary_since is None:
+            self.stationary_since = now
+        if now - self.stationary_since >= float(step.get('stable_seconds', 1.0)):
+            self.get_logger().info('底盘轮速反馈已连续停稳，继续机械臂任务')
+            self.complete_step()
+
     def reset_device_checks(self):
         self.devices_checked = not self.check_devices_on_startup
         self.devices_check_started = monotonic()
@@ -702,17 +826,24 @@ class WorkflowController(Node):
         if self.check_arm_devices:
             if not self.arm_ready():
                 missing.append("robot external control/controllers")
-            if (
-                not self.admittance_enable_client.service_is_ready()
-                or self.compliant_target_publisher.get_subscription_count() == 0
+            if not self.admittance_enable_client.service_is_ready():
+                missing.append("arm control mode service")
+            # 只有实际包含导纳动作的流程依赖零偏完成后的力反馈。
+            # 普通 MoveIt 点位规划仍保留外控、控制器、TF 和执行接口检查。
+            if self.check_admittance_devices:
+                if self.compliant_target_publisher.get_subscription_count() == 0:
+                    missing.append("admittance target subscriber")
+                now_ns = self.get_clock().now().nanoseconds
+                if (
+                    self.last_compliant_wrench_ns is None
+                    or now_ns - self.last_compliant_wrench_ns > 500_000_000
+                ):
+                    missing.append("force bias/fresh wrench data")
+            if self.check_moveit_devices and (
+                not self.execute_client.service_is_ready()
+                or self.target_publisher.get_subscription_count() == 0
             ):
-                missing.append("admittance node")
-            now_ns = self.get_clock().now().nanoseconds
-            if (
-                self.last_compliant_wrench_ns is None
-                or now_ns - self.last_compliant_wrench_ns > 500_000_000
-            ):
-                missing.append("force bias/fresh wrench data")
+                missing.append("MoveIt target subscriber/execution service")
             try:
                 self.tf_buffer.lookup_transform("base_link", "tool0", Time())
             except TransformException:
@@ -1002,6 +1133,17 @@ class WorkflowController(Node):
             if target is None:
                 return
             self.pending_arm_target = target
+            self.pending_arm_skip = False
+            if mode == "moveit" and step.get("skip_if_at_target", False):
+                try:
+                    actual = self.tf_buffer.lookup_transform(
+                        target.header.frame_id,
+                        step.get("end_effector_frame", "tool0"),
+                        Time(),
+                    ).transform
+                except TransformException:
+                    return
+                self.pending_arm_skip = self.arm_target_reached(actual, target.poses[0], step)
             self.phase = "arm_mode_pending"
             request = SetBool.Request()
             request.data = mode == "admittance"
@@ -1018,6 +1160,25 @@ class WorkflowController(Node):
             self.get_logger().info("Arm arrival delay finished; continuing workflow")
             self.complete_step()
 
+    @staticmethod
+    def arm_target_reached(actual, goal, step):
+        """比较同一坐标系中的实际 TCP 与目标，位置和方向必须同时满足误差要求。"""
+        position = (actual.translation.x, actual.translation.y, actual.translation.z)
+        target = (goal.position.x, goal.position.y, goal.position.z)
+        distance = math.sqrt(sum((a - b) ** 2 for a, b in zip(position, target)))
+        q1 = (actual.rotation.x, actual.rotation.y, actual.rotation.z, actual.rotation.w)
+        q2 = (goal.orientation.x, goal.orientation.y, goal.orientation.z, goal.orientation.w)
+        norm = math.sqrt(sum(x * x for x in q1) * sum(x * x for x in q2))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            return False
+        # q 和 -q 表示同一方向；使用最短旋转角，避免欧拉角跨越 ±180° 的歧义。
+        cosine = abs(sum(a * b for a, b in zip(q1, q2))) / norm
+        angle = 2.0 * math.acos(min(1.0, cosine))
+        return (
+            distance <= float(step.get("arrival_tolerance", 0.01))
+            and angle <= math.radians(float(step.get("arrival_orientation_tolerance_deg", 1.0)))
+        )
+
     def on_arm_mode_response(self, future):
         try:
             response = future.result()
@@ -1029,6 +1190,10 @@ class WorkflowController(Node):
             return
         mode = self.current_step()["control_mode"]
         self.arm_control_mode = mode
+        if mode == 'moveit' and self.pending_arm_skip:
+            self.get_logger().info('当前位置及方向已达到初始目标，跳过重复运动')
+            self.finish_arm_arrival(self.get_clock().now().nanoseconds)
+            return
         if mode == "admittance":
             self.compliant_target_publisher.publish(self.pending_arm_target)
             self.get_logger().info(

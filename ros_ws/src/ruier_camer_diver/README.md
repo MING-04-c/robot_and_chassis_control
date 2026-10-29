@@ -269,6 +269,13 @@ ROI 蓝色面积过大时显示 `BLUE_INTERFERENCE`，但局部蓝色杂物不�
 多个断开的线段优先选一个候选；仅当短间隔两端线宽相近、
 局部方向及横向位置匹配时，保留两段真实蓝色证据。扫描跨越短缺口的容忍范围
 取 `max(max_missing_rows, ceil(max_occlusion_gap/row_step))`。
+此外，部署 YAML 开启 `extended_join_gap_ratio: 0.30`：两端均为完整合格候选，
+各有至少图像扫描轴10%的实测跨度、宽度比不超过1.8时，允许较长反光缺口续接。
+两端可近似同向对齐，或延长切线在缺口内部相交；交点必须在图像内，
+转角最多 `extended_join_angle_rad: 0.60`（约34度）。端点横向差还须满足现有搜索/跳变限制。
+通过后保留两端真实像素，并让扫描跨过该已批准间隔；中间不填蓝色掩膜、不当作实测行。
+该长缺口候选续接独立于下文短遮挡插值。`extended_join_gap_ratio: 0` 可关闭；
+直接使用 C++ LineConfig 而不加载部署 YAML 时，默认关闭。
 短碎片如果仅因细长度不足而被拒绝，可在完整合格胶带的端点方向、位置和厚度支持下接纳，
 标记 `context_supported=true`；短片实心比例允许降至常规阈值的 80%，补偿两端边界占比。
 单独的紧凑色块仍不会作为起始胶带。
@@ -277,6 +284,15 @@ JSON `candidates` 输出每个候选的 `rejection`、`aspect`、`core_fraction`
 `accepted` 表示通过单体或上下文几何检查，不代表该候选被选为路线。
 
 ### 短遮挡与观测/估计区别
+
+参照亮度渐变断线 PDF 的处理已接入部署 YAML：
+`local_brightness_normalization: true` 用局部明度背景估计补偿暗处，增益最多2倍；
+原始蓝色证据、饱和度和信号下限仍必需。`hough_join_support: true` 在合格候选的
+实测中点上执行 HoughLinesP，投票阈值随实测点数变化；多数点支持同一直线时稳健拟合方向，
+否则沿用局部端点拟合。灰度背景不参与蓝线方向投票。
+`line/status` 的 `hough_supported_candidates` 可检查本帧有多少候选采用该辅助。
+这两项在直接构造 LineConfig 时默认关闭，在部署 YAML 中开启。
+具体流程见工作区 `docs/chassis/LINE_FOLLOW_REFERENCE_20261029.md`。
 
 `max_occlusion_gap=72`（处理图像像素）是短缺口插值的硬上限；`0` 关闭。
 实际允许长度为 `min(max_occlusion_gap, max(3*row_step, 1.5*局部截面宽度))`，

@@ -37,6 +37,8 @@ detactor_node:
     frame_end: <:>
     # 当前滚动窗口取整帧最后 10 个数。
     latest_window_size: 10
+    # 设备回包未携带单位，确认仪器设置后填写 um 或 mm；不进行隐式换算。
+    measurement_unit: unknown
 
     # 自动采集：true 且 request_period 大于 0 时周期发送采集命令。
     auto_request: true

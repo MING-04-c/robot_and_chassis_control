@@ -6,6 +6,8 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
+ament_get_python_install_dir(PYTHON_INSTALL_DIR)
 find_package(rosidl_default_generators REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -79,6 +81,37 @@ install(FILES
 )
 install(PROGRAMS device/sensor/src/sensor_plot.py
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# 工控机结果通信及不依赖 ROS 的主机端工具。
+install(PROGRAMS
+  device/industrial_pc/src/industrial_pc_node.py
+  device/industrial_pc/src/industrial_pc_client.py
+  device/industrial_pc/src/industrial_pc_hk_transfer.py
+  device/industrial_pc/src/industrial_pc_hk_receiver.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+# 旧 robot_task_control 入口导入此模块，避免反向依赖任务包。
+install(FILES device/industrial_pc/src/industrial_pc_hk_transfer.py
+  DESTINATION ${PYTHON_INSTALL_DIR}
+)
+install(FILES device/industrial_pc/src/industrial_pc_protocol.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+install(DIRECTORY device/industrial_pc/config/
+  DESTINATION share/${PROJECT_NAME}/device/industrial_pc/config
+)
+install(FILES device/industrial_pc/launch/industrial_pc.launch.py
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+install(FILES device/industrial_pc/README.md
+  DESTINATION share/${PROJECT_NAME}/device/industrial_pc
+)
+install(FILES
+  device/industrial_pc/src/industrial_pc_client.py
+  device/industrial_pc/src/industrial_pc_protocol.py
+  device/industrial_pc/src/industrial_pc_hk_receiver.py
+  DESTINATION share/${PROJECT_NAME}/device/industrial_pc/host_tools
 )
 
 ament_export_dependencies(rosidl_default_runtime)

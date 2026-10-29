@@ -64,6 +64,7 @@ class DetectController(Node):
             "target_topic": "/geminipro_calibration/target_base",
             "targets_topic": "/geminipro_calibration/targets_base",
             "targets_file": "~/.ros/detect_control/targets.yaml",
+            "measurement_results_file": "~/.ros/detect_control/thickness_results.jsonl",
             "max_targets": 100,
             "home_joint_tolerance": 0.01,
             "admittance_namespace": "/admittance_controller",
@@ -168,6 +169,10 @@ class DetectController(Node):
         self.window_pub = self.create_publisher(Bool, "~/measurement_active", 10)
         self.contact_pub = self.create_publisher(PoseStamped, "~/contact_pose", 10)
         self.measure_pub = self.create_publisher(Empty, "/detactor/acquire_trigger", 10)
+        self.thickness_result = None
+        self.measurement_started_ns = None
+        self.thickness_pub = self.create_publisher(String, "~/thickness_result", 10)
+        self.create_subscription(String, "/detactor/measurement", self.on_thickness, 10)
         self.enable = self.create_client(SetBool, namespace + "/enable")
         self.ik = self.create_client(GetPositionIK, "/compute_ik")
         self.cartesian = self.create_client(GetCartesianPath, "/compute_cartesian_path")
@@ -214,10 +219,48 @@ class DetectController(Node):
         return self.phase not in ("IDLE", "DONE", "FAULT")
 
     def state(self, phase, detail=""):
+        if self.phase == "HOLD" and phase != "HOLD":
+            result = {"schema": "paint_thickness_task_result_v1",
+                      "available": self.thickness_result is not None,
+                      "point_index": self.point_index + 1, "measurement": self.thickness_result,
+                      "next_phase": phase}
+            if self.thickness_result is None:
+                result["reason"] = "接触保持期间未收到有效测厚回包"
+                self.get_logger().warning("本检测点未获得厚度读数；不会复用上一点读数")
+            self.thickness_pub.publish(String(data=json.dumps(result, ensure_ascii=False)))
+            try:
+                path = Path(self.cfg["measurement_results_file"]).expanduser()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(result, ensure_ascii=False, allow_nan=False) + "\n")
+            except OSError as error:
+                self.get_logger().error(f"厚度结果保存失败：{error}")
         self.phase, self.detail, self.since = phase, detail, monotonic()
         self.get_logger().info(f"{phase}: {detail}")
         self.publish_status()
         self.window_pub.publish(Bool(data=phase == "HOLD"))
+
+    def on_thickness(self, message):
+        """只将本次接触触发后收到的有效单值关联到当前检测点。"""
+        if self.phase != "HOLD" or self.measurement_started_ns is None:
+            return
+        try:
+            reading = json.loads(message.data)
+            value = reading["value"]
+            stamp = reading["received_at_ros"]
+            received_ns = int(stamp["sec"]) * 10**9 + int(stamp["nanosec"])
+            if (reading.get("schema") != "paint_thickness_measurement_v1" or
+                    isinstance(value, bool) or not isinstance(value, (int, float)) or
+                    not math.isfinite(value) or received_ns < self.measurement_started_ns or
+                    reading.get("unit") not in ("unknown", "um", "mm")):
+                return
+        except (ValueError, KeyError, TypeError):
+            return
+        self.thickness_result = reading
+        result = {"schema": "paint_thickness_task_result_v1", "available": True,
+                  "point_index": self.point_index + 1, "measurement": reading}
+        self.thickness_pub.publish(String(data=json.dumps(result, ensure_ascii=False)))
+        self.get_logger().info(f'检测点 {self.point_index + 1} 厚度：{value} {reading["unit"]}')
 
     def motion_readiness(self):
         """返回初始运动能否开始及等待原因；只读取状态，不触发运动。"""
@@ -248,6 +291,7 @@ class DetectController(Node):
                 "batch_points": len(self.batch),
                 "current_point": self.point_index + 1 if self.batch else 0,
                 "completed_points": self.completed_points,
+                "thickness_measurement": self.thickness_result,
                 "home_recorded": self.recorded_home is not None,
                 "initial_position_ready": self.initial_position_ready,
                 "initial_tool_orientation_xyzw": self.initial_orientation_xyzw,
@@ -867,6 +911,8 @@ class DetectController(Node):
 
     def begin_hold(self):
         self.contact = self.current_tool()
+        self.thickness_result = None
+        self.measurement_started_ns = self.get_clock().now().nanoseconds
         self.state("HOLD", f'停止位置推进，保持 {self.cfg["hold_seconds"]} 秒')
         message = PoseStamped()
         message.header.frame_id = self.cfg["base_frame"]

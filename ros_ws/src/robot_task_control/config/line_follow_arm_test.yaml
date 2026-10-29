@@ -1,0 +1,80 @@
+# 坐标系 base_link，末端 tool0；XYZ 单位 m，角度为固定轴 RPY 度，R=Rz*Ry*Rx。
+# 本文件定义单轮测试，不循环、不自动回原位。修改后重建包或用 workflow_file 指定外部文件。
+workflow:
+  name: line_follow_then_four_arm_points
+  auto_start: true
+  steps:
+    - action: wait_chassis_stopped
+      stable_seconds: 1.0
+      linear_tolerance: 0.005         # m/s
+      angular_tolerance: 0.02         # rad/s
+      data_timeout_sec: 0.5
+      step_timeout_sec: 10.0         # 初始准备前也确认底盘停稳
+
+    - action: arm_move
+      control_mode: moveit
+      frame_id: base_link
+      end_effector_frame: tool0
+      max_position_distance: 1.0     # 首点相对实际启动 TCP 的最大位移，按现场核对
+      arrival_tolerance: 0.005
+      skip_if_at_target: true         # 位置、角度都已到位时不重复规划初始运动
+      arrival_orientation_tolerance_deg: 1.0
+      after_arrival_delay_sec: 1.0
+      step_timeout_sec: 120.0
+      target_pose:
+        position_mode: absolute
+        position: [-0.05, 0.2, 0.475]
+        orientation: [0.0, 0.0, 90.0]
+
+    - action: line_follow
+      until_untrusted: true          # 不按固定时间结束
+      require_final_marker: true     # 最终 T 形停止横线居中后才进入机械臂后续点位
+      boundary_wait_sec: 5.0          # 主线丢失等待恢复，未见最终横线不能当成正常结束
+      progress_timeout_sec: 5.0
+      step_timeout_sec: 90.0          # 行走总超时中止；途中站等待开始消息时暂停计时
+
+    - action: wait_chassis_stopped
+      stable_seconds: 1.0
+      linear_tolerance: 0.005
+      angular_tolerance: 0.02
+      data_timeout_sec: 0.5
+      step_timeout_sec: 10.0         # 循迹停车后再开始第二、第三点
+
+    - action: arm_move
+      control_mode: moveit
+      frame_id: base_link
+      end_effector_frame: tool0
+      max_position_distance: 0.6
+      arrival_tolerance: 0.005
+      after_arrival_delay_sec: 1.0
+      step_timeout_sec: 120.0
+      target_pose:
+        position_mode: absolute
+        position: [-0.13, 0.35, 0.8]
+        orientation: [0.0, 0.0, 90.0]
+
+    - action: arm_move
+      control_mode: moveit
+      frame_id: base_link
+      end_effector_frame: tool0
+      max_position_distance: 0.6
+      arrival_tolerance: 0.005
+      after_arrival_delay_sec: 1.0
+      step_timeout_sec: 120.0
+      target_pose:
+        position_mode: absolute
+        position: [0.3, 0.165, 0.8]
+        orientation: [0.0, 0.0, 0.0]
+
+    - action: arm_move
+      control_mode: moveit
+      frame_id: base_link
+      end_effector_frame: tool0
+      max_position_distance: 0.6
+      arrival_tolerance: 0.005
+      after_arrival_delay_sec: 1.0
+      step_timeout_sec: 120.0
+      target_pose:
+        position_mode: absolute
+        position: [0.3, 0.2, 0.6]
+        orientation: [-160.0, 0.0, -77.0]

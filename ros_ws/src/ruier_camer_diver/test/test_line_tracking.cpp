@@ -14,6 +14,28 @@ cv::Mat stripe(cv::Scalar floor = {240, 240, 240}, int x = 320)
 }
 }  // namespace
 
+TEST(BlueLineTracking, TerminalCrossbarDoesNotHideLongSlantedMainLine)
+{
+  camer_diver::LineConfig config;
+  config.max_center_jump = 65;
+  config.search_radius = 80;
+  for (const int end_x : {240, 290, 350, 420}) {
+  SCOPED_TRACE(end_x);
+  cv::Mat image(480, 640, CV_8UC3, cv::Scalar(235, 235, 235));
+  const cv::Scalar blue(220, 80, 20);
+  // 末端横线倾斜且延伸至图像底边，会把首次扫描种子拉离主线。
+  cv::line(image, {150, 440}, {350, 0}, blue, 24);
+  cv::line(image, {100, 425}, {end_x, 479}, blue, 22);
+  const auto result = camer_diver::track_blue_line(image, config);
+  EXPECT_FALSE(result.lost);
+  int main_rows = 0;
+  for (const auto & row : result.rows) {
+    if (row.valid && row.y < 200) {++main_rows;}
+  }
+  EXPECT_GT(main_rows, 20);
+  }
+}
+
 TEST(BlueLineTracking, WhiteGrayAndWarmFloors)
 {
   camer_diver::LineConfig config;
@@ -623,6 +645,40 @@ TEST(BlueLineTracking, JoinFailuresAndFinalRetentionAreExplicit)
   EXPECT_EQ(result.inferred_rows, 0);
 }
 
+TEST(BlueLineTracking, ExtendedReflectionJoinRetainsBothMeasuredSegments)
+{
+  camer_diver::LineConfig config;
+  config.extended_join_gap_ratio = 0.30;
+  config.hough_join_support = true;
+  cv::Mat image(480, 640, CV_8UC3, cv::Scalar(235, 235, 235));
+  cv::line(image, {286, 80}, {320, 200}, cv::Scalar(220, 80, 20), 21);
+  cv::line(image, {320, 300}, {281, 440}, cv::Scalar(220, 80, 20), 21);
+  const auto joined = camer_diver::track_blue_line(image, config);
+  ASSERT_FALSE(joined.lost);
+  EXPECT_GE(joined.hough_supported_candidates, 2);
+  int retained = 0;
+  for (const auto & candidate : joined.candidates) {retained += candidate.retained;}
+  EXPECT_EQ(retained, 2);
+  EXPECT_NE(joined.mask.at<uint8_t>(170, 311), 0);
+  EXPECT_NE(joined.mask.at<uint8_t>(350, 306), 0);
+  EXPECT_EQ(joined.mask.at<uint8_t>(250, 334), 0);  // 相交处未观测，不能画进真实蓝色掩膜。
+  bool upper = false, lower = false;
+  for (const auto & row : joined.rows) {
+    upper = upper || (row.valid && row.y < 180);
+    lower = lower || (row.valid && row.y > 330);
+  }
+  EXPECT_TRUE(upper);
+  EXPECT_TRUE(lower);  // 扫描不能在已批准的长缺口处提前结束。
+
+  cv::Mat outside(480, 640, CV_8UC3, cv::Scalar(235, 235, 235));
+  cv::line(outside, {286, 80}, {320, 200}, cv::Scalar(220, 80, 20), 21);
+  cv::line(outside, {390, 300}, {351, 440}, cv::Scalar(220, 80, 20), 21);
+  const auto rejected = camer_diver::track_blue_line(outside, config);
+  retained = 0;
+  for (const auto & candidate : rejected.candidates) {retained += candidate.retained;}
+  EXPECT_EQ(retained, 1);  // 仅在缺口以外相交，不续接。
+}
+
 TEST(BlueLineTracking, FewSectionFragmentNeedsQualifiedAlignedContext)
 {
   camer_diver::LineConfig config;
@@ -652,4 +708,63 @@ TEST(BlueLineTracking, DarkBlueValueFloorKeepsGrayRejected)
   EXPECT_GT(dark_blue.valid_rows, 40);
   cv::rectangle(image, {305, 0, 31, 480}, cv::Scalar(5, 5, 5), cv::FILLED);
   EXPECT_TRUE(camer_diver::track_blue_line(image, config).lost);
+}
+
+TEST(BlueLineTracking, PdfInspiredNormalizationAndHoughHandleNoisyGradientReflection)
+{
+  camer_diver::LineConfig config;
+  config.local_brightness_normalization = true;
+  config.hough_join_support = true;
+  config.extended_join_gap_ratio = 0.30;
+  cv::Mat image(480, 640, CV_8UC3);
+  cv::RNG random(42);
+  for (int y = 0; y < image.rows; ++y) {
+    for (int x = 0; x < image.cols; ++x) {
+      const double background = 24 + y * 0.45;
+      image.at<cv::Vec3b>(y, x) = cv::Vec3b(
+        cv::saturate_cast<uint8_t>(background + random.gaussian(2)),
+        cv::saturate_cast<uint8_t>(background + random.gaussian(2)),
+        cv::saturate_cast<uint8_t>(background + random.gaussian(2)));
+    }
+  }
+  cv::rectangle(image, {310, 90, 21, 120}, cv::Scalar(12, 5, 2), cv::FILLED);
+  cv::rectangle(image, {310, 320, 21, 130}, cv::Scalar(180, 65, 15), cv::FILLED);
+  cv::line(image, {70, 70}, {220, 430}, cv::Scalar(35, 35, 35), 20);  // 灰色边缘不参与蓝线投票。
+  cv::rectangle(image, {510, 200, 18, 18}, cv::Scalar(180, 65, 15), cv::FILLED);
+  const auto result = camer_diver::track_blue_line(image, config);
+  ASSERT_FALSE(result.lost);
+  EXPECT_GE(result.hough_supported_candidates, 2);
+  EXPECT_NE(result.mask.at<uint8_t>(150, 320), 0);
+  EXPECT_NE(result.mask.at<uint8_t>(380, 320), 0);
+  EXPECT_EQ(result.mask.at<uint8_t>(260, 320), 0);  // 反光空白不变成实测蓝色。
+  EXPECT_EQ(result.mask.at<uint8_t>(205, 515), 0);
+  int retained = 0;
+  for (const auto & candidate : result.candidates) {retained += candidate.retained;}
+  EXPECT_EQ(retained, 2);
+  config.local_brightness_normalization = false;
+  EXPECT_EQ(camer_diver::track_blue_line(image, config).mask.at<uint8_t>(150, 320), 0);
+  cv::rectangle(image, {310, 90, 21, 120}, cv::Scalar(12, 12, 12), cv::FILLED);
+  config.local_brightness_normalization = true;
+  EXPECT_EQ(camer_diver::track_blue_line(image, config).mask.at<uint8_t>(150, 320), 0);
+}
+
+TEST(BlueLineTracking, HoughPreprocessingKeepsDifferentTapeDirectionsAndRejectsGray)
+{
+  camer_diver::LineConfig config;
+  config.local_brightness_normalization = true;
+  config.hough_join_support = true;
+  for (const auto & endpoints : std::vector<cv::Vec4i>{{320, 50, 320, 430},
+    {100, 80, 500, 400}, {100, 300, 500, 300}})
+  {
+    cv::Mat image(480, 640, CV_8UC3, cv::Scalar(150, 150, 150));
+    cv::line(image, {endpoints[0], endpoints[1]}, {endpoints[2], endpoints[3]},
+      cv::Scalar(220, 80, 20), 23);
+    const auto result = camer_diver::track_blue_line(image, config);
+    EXPECT_FALSE(result.lost);
+    EXPECT_GT(result.hough_supported_candidates, 0);
+    cv::Mat gray;
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(gray, gray, cv::COLOR_GRAY2BGR);
+    EXPECT_TRUE(camer_diver::track_blue_line(gray, config).lost);
+  }
 }

@@ -1,7 +1,7 @@
 """USB 蓝线循迹：相机 + 识别 + 底盘 + 循迹控制，不启动距离任务 PID。
 
 启动循迹并显示实时画面：
-    ros2 launch masc_chassis_user_control line_follow.launch.py show_window:=true forward_speed:=0.05
+    ros2 launch masc_chassis_user_control line_follow.launch.py show_window:=true forward_speed:=0.075
 画面开关：show_window:=true 显示；show_window:=false 关闭（默认）。
 该开关只控制可视化窗口；相机识别和底盘循迹继续运行。
 行进方向：image_forward_direction:=down（轮子/车身在画面上方，前方朝下）。
@@ -28,7 +28,7 @@ def generate_launch_description():
     camera_share = get_package_share_directory('ruier_camer_diver')
     driver_share = get_package_share_directory('masc_chassis_ros_driver')
     return LaunchDescription([
-        DeclareLaunchArgument('forward_speed', default_value='0.05', description='前进速度，m/s'),
+        DeclareLaunchArgument('forward_speed', default_value='0.075', description='前进速度，m/s'),
         DeclareLaunchArgument(
             'image_forward_direction', default_value='down',
             description='前方方向：down 向下（当前车身在上方），up 向上',

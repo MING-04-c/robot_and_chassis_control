@@ -422,6 +422,55 @@ class LocalControlTest(unittest.TestCase):
         self.wait_for(lambda: self.controller.failed, 3)
         self.assertEqual(len(captures), 1)
 
+    def test_marker_station_wait_pauses_timeout_and_requires_final_marker(self):
+        mux = VelocityMux()
+        self.executor.add_node(mux)
+        self.addCleanup(mux.destroy_node)
+        self.controller.use_velocity_mux = True
+        self.controller.stop_pid_before_follow = False
+        flags = {'following': False, 'state': 'tracking'}
+        publisher = self.node.create_publisher(String, '/line_follow/status', 10)
+        commands = self.node.create_publisher(Twist, '/robot_control/line_follow/cmd_vel', 10)
+        def enable(request, response):
+            flags['following'] = request.data
+            response.success = True
+            return response
+        def feedback():
+            state = flags['state'] if flags['following'] else 'disabled'
+            publisher.publish(String(data=json.dumps({'state': state})))
+            cmd = Twist()
+            cmd.linear.x = .01 if state in ('tracking', 'stop_marker_approaching') else 0.
+            commands.publish(cmd)
+        self.node.create_service(SetBool, '/line_follow_controller/enable', enable)
+        self.node.create_timer(.02, feedback)
+        step = {'action': 'line_follow', 'until_untrusted': True, 'require_final_marker': True,
+                'boundary_wait_sec': .1, 'progress_timeout_sec': .4, 'step_timeout_sec': 2.0}
+        self.controller.steps = [step]
+        self.controller.on_start_request(Trigger.Request(), Trigger.Response())
+        self.wait_for(lambda: flags['following'], 1.5)
+        self.pump(.2)
+        flags['state'] = 'stop_marker_intermediate'
+        self.pump(2.3)  # 超过总超时和进度超时，人工站点等待仍不能结束或失败。
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.controller.failed)
+        self.assertEqual(self.controller.step_index, 0)
+        flags['state'] = 'stop_marker_approaching'
+        self.pump(.2)
+        flags['state'] = 'stop_marker_final'
+        self.wait_for(lambda: not self.controller.active, 1)
+        self.assertFalse(self.controller.failed)
+        self.assertFalse(flags['following'])
+        # 未看到 T 形终点时，普通丢线不能误当成完成再启动机械臂。
+        self.controller.steps = [step, {'action': 'arm_poses', 'poses': [[.1, .2, .3, 0., 0., 0.]]}]
+        self.controller.step_index = 0
+        flags['state'] = 'tracking'
+        self.controller.on_start_request(Trigger.Request(), Trigger.Response())
+        self.wait_for(lambda: flags['following'], 1.5)
+        self.pump(.2)
+        flags['state'] = 'insufficient_forward_span'
+        self.wait_for(lambda: self.controller.failed, 1)
+        self.assertEqual(self.controller.step_index, 0)
+
     def test_minimal_profiles_without_distance_pid(self):
         # Exercise the actual three YAML files with no PID service available.
         self.pid.terminate()
@@ -431,6 +480,9 @@ class LocalControlTest(unittest.TestCase):
         self.addCleanup(mux.destroy_node)
         following = [False]
         arm_enabled = [False]
+        following_at = [None]
+        until_boundary = [False]
+        saw_boundary_recovery = [False]
         arm_enabled_at = [None]
         arm_expected = [False]
         arm_targets = []
@@ -453,12 +505,18 @@ class LocalControlTest(unittest.TestCase):
             broadcaster.sendTransform(transform)
             wrench_pub.publish(WrenchStamped(header=transform.header))
             command = Twist()
-            command.linear.x = 0.01 if following[0] else 0.0
+            elapsed = time.monotonic() - following_at[0] if following_at[0] is not None else 0.0
+            boundary = (until_boundary[0] and following[0] and
+                        (0.5 < elapsed < 1.5 or elapsed >= 2.0))
+            if until_boundary[0] and following[0] and 1.5 <= elapsed < 2.0:
+                saw_boundary_recovery[0] = True
+            command.linear.x = 0.01 if following[0] and not boundary else 0.0
             follow_pub.publish(command)
             status_pub.publish(
                 String(
                     data=json.dumps(
-                        {"state": "tracking" if following[0] else "disabled"}
+                        {"state": "insufficient_forward_span" if boundary else
+                         "tracking" if following[0] else "disabled"}
                     )
                 )
             )
@@ -471,6 +529,7 @@ class LocalControlTest(unittest.TestCase):
                 self.assertIsNotNone(arm_enabled_at[0])
                 self.assertGreaterEqual(time.monotonic() - arm_enabled_at[0], 1.9)
             following[0] = request.data
+            following_at[0] = time.monotonic() if request.data else None
             response.success = True
             return response
 
@@ -501,6 +560,7 @@ class LocalControlTest(unittest.TestCase):
                     Path(__file__).parents[1] / "config" / f"{name}.yaml"
                 )
                 self.controller.steps = config["steps"]
+                until_boundary[0] = name == "line_follow_only"
                 self.controller.step_index = 0
                 self.controller.use_velocity_mux = with_follow
                 # Arm-only must complete even without using mux services.
@@ -510,6 +570,8 @@ class LocalControlTest(unittest.TestCase):
                 self.wait_for(lambda: not self.controller.active, 10)
                 self.assertFalse(self.controller.failed)
                 self.assertFalse(following[0])
+                if name == "line_follow_only":
+                    self.assertTrue(saw_boundary_recovery[0], "短暂失线不能直接结束，恢复后应继续本轮")
                 self.assertEqual(len(arm_targets) - before_targets, int(with_arm))
                 if with_arm:
                     target = arm_targets[-1].poses[0].position

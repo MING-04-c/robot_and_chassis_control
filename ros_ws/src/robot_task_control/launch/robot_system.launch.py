@@ -78,6 +78,7 @@ def generate_launch_description():
             "launch_target_publisher": "false",
             # 导纳步骤使用 IK；MoveIt 步骤由独立执行器处理。
             "launch_executor": LaunchConfiguration("launch_arm_executor"),
+            "use_cartesian_path": LaunchConfiguration("arm_use_cartesian_path"),
             "cs_type": LaunchConfiguration("cs_type"),
             "admittance_enabled_on_startup": "false",
             "auto_start_admittance": "false",
@@ -197,6 +198,7 @@ def generate_launch_description():
                 "debug_image_topic": "/line_camera/line/debug_image",
                 "line_status_topic": "/line_camera/line/status",
                 "centerline_topic": "/line_camera/line/centerline",
+                "stop_marker_mask_topic": "/line_camera/line/mask",
                 "cmd_vel_topic": "/robot_control/line_follow/cmd_vel",
                 "forward_speed": ParameterValue(
                     LaunchConfiguration("line_follow_speed"), value_type=float
@@ -310,8 +312,8 @@ def generate_launch_description():
             DeclareLaunchArgument("start_hk_camera", default_value="true"),
             DeclareLaunchArgument("start_line_camera", default_value="true"),
             DeclareLaunchArgument("start_image_transfer", default_value="true"),
-            DeclareLaunchArgument("image_listen_ip", default_value="169.254.199.100"),
-            DeclareLaunchArgument("image_receiver_ip", default_value="169.254.199.250"),
+            DeclareLaunchArgument("image_listen_ip", default_value="0.0.0.0"),
+            DeclareLaunchArgument("image_receiver_ip", default_value="169.254.199.120"),
             DeclareLaunchArgument("image_port", default_value="9002"),
             DeclareLaunchArgument("image_delivery_mode", default_value="photos"),
             DeclareLaunchArgument("image_format", default_value="jpeg"),
@@ -322,7 +324,7 @@ def generate_launch_description():
             DeclareLaunchArgument("image_max_fps", default_value="10.0"),
             DeclareLaunchArgument("hk_output_dir", default_value="~/robot_data/hk"),
             DeclareLaunchArgument("line_camera_device", default_value="/dev/video0"),
-            DeclareLaunchArgument("line_follow_speed", default_value="0.05"),
+            DeclareLaunchArgument("line_follow_speed", default_value="0.075"),
             DeclareLaunchArgument("line_show_window", default_value="false"),
             DeclareLaunchArgument("line_adaptive_exposure", default_value="true"),
             DeclareLaunchArgument("line_image_forward_direction", default_value="down"),
@@ -337,6 +339,7 @@ def generate_launch_description():
             DeclareLaunchArgument("use_velocity_mux", default_value="true"),
             DeclareLaunchArgument("chassis_pid_enabled", default_value="true"),
             DeclareLaunchArgument("launch_arm_executor", default_value="true"),
+            DeclareLaunchArgument("arm_use_cartesian_path", default_value="true"),
             DeclareLaunchArgument("start_arm_driver", default_value="true"),
             DeclareLaunchArgument("cs_type", default_value="ls65"),
             DeclareLaunchArgument("robot_ip", default_value="169.254.199.150"),

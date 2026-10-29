@@ -40,6 +40,9 @@ void LineConfig::validate() const
     !std::isfinite(max_width_spread) || max_width_spread < 1 || max_width_spread > 20 ||
     max_occlusion_gap < 0 || max_occlusion_gap > 120 ||
     !std::isfinite(max_occlusion_offset) || max_occlusion_offset < 0 || max_occlusion_offset > 100 ||
+    !std::isfinite(extended_join_gap_ratio) || extended_join_gap_ratio < 0 || extended_join_gap_ratio > 0.5 ||
+    !std::isfinite(extended_join_support_ratio) || extended_join_support_ratio <= 0 || extended_join_support_ratio > 1 ||
+    !std::isfinite(extended_join_angle_rad) || extended_join_angle_rad <= 0 || extended_join_angle_rad > 1.2 ||
     !std::isfinite(canny_sigma) || canny_sigma <= 0 || canny_sigma >= 1 ||
     !std::isfinite(lookahead_ratio) || lookahead_ratio < 0 || lookahead_ratio > 1)
   {
@@ -92,6 +95,7 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
   LineResult result;
   struct Corridor {cv::Vec3d lower, upper; double width; bool horizontal;};
   std::vector<Corridor> corridors;
+  int retained_gap_rows = 0;
   const int width = std::min(bgr.cols, config.processing_width);
   const int height = std::max(8, static_cast<int>(std::round(bgr.rows * double(width) / bgr.cols)));
   cv::resize(bgr, result.image, {width, height}, 0, 0, cv::INTER_AREA);
@@ -104,7 +108,21 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
     filtered = result.image;
   }
   cv::cvtColor(filtered, hsv, cv::COLOR_BGR2HSV);
-  cv::inRange(hsv, cv::Scalar(config.hue_low, config.saturation_min, config.value_min),
+  cv::Mat local_background;
+  if (config.local_brightness_normalization) {
+    cv::Mat value;
+    cv::extractChannel(hsv, value, 2);
+    value.convertTo(value, CV_32F);
+    const int kernel = std::max(3, static_cast<int>(width * 0.10) | 1);
+    cv::blur(value, local_background, {kernel, kernel});
+  }
+  const auto visible_value = [&local_background](int y, int x, double raw) {
+      // 局部亮度归一化只影响明度门槛，保留原始色相/饱和度和蓝色优势条件。
+      const double gain = local_background.empty() ? 1.0 : std::clamp(
+        128.0 / std::max(16.0, double(local_background.at<float>(y, x))), 1.0, 2.0);
+      return raw * gain;
+    };
+  cv::inRange(hsv, cv::Scalar(config.hue_low, config.saturation_min, 0),
     cv::Scalar(config.hue_high, 255, 255), result.strong_mask);
   // Hue alone is unstable on grey pixels; all strong seeds also need RGB blue dominance.
   for (int y = 0; y < height; ++y) {
@@ -112,7 +130,8 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
     auto * strong = result.strong_mask.ptr<uint8_t>(y);
     for (int x = 0; x < width; ++x) {
       const double b = colors[x][0], g = colors[x][1], r = colors[x][2];
-      if (b <= g || b <= r || (2 * b - g - r) / (b + g + r + 1) <
+      if (b < std::min(config.value_min, config.weak_value_min) ||
+        visible_value(y, x, b) < config.value_min || b <= g || b <= r || (2 * b - g - r) / (b + g + r + 1) <
         config.strong_blue_excess_min) {strong[x] = 0;}
     }
   }
@@ -129,7 +148,7 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
   result.mask = result.strong_mask.clone();
   result.weak_mask = cv::Mat::zeros(height, width, CV_8UC1);
   if (config.illumination_support) {
-    cv::inRange(hsv, cv::Scalar(config.hue_low, config.weak_saturation_min, config.weak_value_min),
+    cv::inRange(hsv, cv::Scalar(config.hue_low, config.weak_saturation_min, 0),
       cv::Scalar(config.hue_high, 255, 255), result.weak_mask);
     // Relative blue dominance tolerates intensity scaling and mildly washed-out blue.
     // Do not accept all bright low-saturation pixels: white floor has no blue evidence.
@@ -138,7 +157,9 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
       auto * weak = result.weak_mask.ptr<uint8_t>(y);
       for (int x = 0; x < width; ++x) {
         const double b = colors[x][0], g = colors[x][1], r = colors[x][2];
-        if (b <= g || b <= r || (2 * b - g - r) / (b + g + r + 1) < config.blue_excess_min) {
+        if (b < std::min(config.value_min, config.weak_value_min) ||
+          visible_value(y, x, b) < config.weak_value_min || b <= g || b <= r ||
+          (2 * b - g - r) / (b + g + r + 1) < config.blue_excess_min) {
           weak[x] = 0;
         }
       }
@@ -383,9 +404,59 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
       result.horizontal = horizontal[selected];
       std::vector<uint8_t> keep(count, 0);
       keep[selected] = 1;
+      std::vector<cv::Vec2d> hough_fits(count);
+      std::vector<uint8_t> hough_valid(count, 0);
+      if (config.hough_join_support) {
+        for (int id = 1; id < count; ++id) {
+          if (!qualified[id]) {continue;}
+          // 霍夫检测只使用已通过蓝色/形状筛选的实测中点，灰色背景边缘没有投票资格。
+          cv::Mat centres = cv::Mat::zeros(height, width, CV_8UC1);
+          for (const auto & p : profiles[id]) {
+            const int x = cvRound(horizontal[id] ? p[0] : p[1]);
+            const int y = cvRound(horizontal[id] ? p[1] : p[0]);
+            centres.at<uint8_t>(y, x) = 255;
+          }
+          // 方向性连接只用于霍夫提案图；相邻实测采样之间连线，不更改真实掩膜或中线话题。
+          for (size_t k = 1; k < profiles[id].size(); ++k) {
+            const auto & a = profiles[id][k - 1];
+            const auto & b = profiles[id][k];
+            if (std::abs(a[0] - b[0]) > 2 * config.row_step ||
+              std::abs(a[1] - b[1]) > config.max_center_jump) {continue;}
+            const cv::Point start(cvRound(horizontal[id] ? a[0] : a[1]),
+              cvRound(horizontal[id] ? a[1] : a[0]));
+            const cv::Point end(cvRound(horizontal[id] ? b[0] : b[1]),
+              cvRound(horizontal[id] ? b[1] : b[0]));
+            cv::line(centres, start, end, cv::Scalar(255), 1);
+          }
+          std::vector<cv::Vec4i> lines;
+          const int votes = std::clamp(static_cast<int>(profiles[id].size() * 0.25), 4, 40);
+          cv::HoughLinesP(centres, lines, 1, CV_PI / 180, votes,
+            0.08 * (horizontal[id] ? width : height), 2 * config.row_step);
+          std::vector<cv::Vec3d> best;
+          const double tolerance = std::max(2.0, medians[id] * 0.15);
+          for (const auto & line : lines) {
+            const double da = horizontal[id] ? line[2] - line[0] : line[3] - line[1];
+            const double dc = horizontal[id] ? line[3] - line[1] : line[2] - line[0];
+            if (std::abs(da) < config.row_step) {continue;}
+            const double slope = dc / da;
+            const double intercept = (horizontal[id] ? line[1] : line[0]) -
+              slope * (horizontal[id] ? line[0] : line[1]);
+            std::vector<cv::Vec3d> inliers;
+            for (const auto & p : profiles[id]) {
+              if (std::abs(p[1] - intercept - slope * p[0]) <= tolerance) {inliers.push_back(p);}
+            }
+            if (inliers.size() > best.size()) {best = std::move(inliers);}
+          }
+          if (best.size() >= 6 && best.size() >= profiles[id].size() * 0.75) {
+            hough_fits[id] = robust_line(best);
+            hough_valid[id] = 1;
+            ++result.hough_supported_candidates;
+          }
+        }
+      }
       // Join only short axis-separated candidates with compatible widths and
       // matching endpoint tangents. This retains evidence, never paints over an object.
-      const auto endpoint = [&profiles, &medians](int id, bool top) {
+      const auto endpoint = [&profiles, &medians, &hough_fits, &hough_valid](int id, bool top) {
           std::vector<cv::Vec3d> points;
           for (const auto & p : profiles[id]) {
             if (p[2] >= medians[id] * 0.9) {points.push_back(p);}
@@ -397,12 +468,23 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
           for (size_t k = 0; k < n; ++k) {
             intact.push_back(points[top ? points.size() - 1 - guard - k : guard + k]);
           }
-          const auto fit = robust_line(intact);
+          auto fit = robust_line(intact);
+          if (hough_valid[id]) {
+            const auto & proposal = hough_fits[id];
+            size_t supported = 0;
+            for (const auto & p : intact) {
+              supported += std::abs(p[1] - proposal[0] - proposal[1] * p[0]) <=
+                std::max(2.0, medians[id] * 0.20);
+            }
+            // 整段以直线为主但末端正在转弯时，不能用全局方向压掉真实的局部弯曲。
+            if (supported >= intact.size() * 0.75 &&
+              std::abs(std::atan(fit[1]) - std::atan(proposal[1])) <= 0.20) {fit = proposal;}
+          }
           const auto & p = top ? points.back() : points.front();
           return cv::Vec3d(p[0], fit[0] + fit[1] * p[0], fit[1]);
         };
       bool changed = true;
-      while (changed && config.max_occlusion_gap > 0) {
+      while (changed && (config.max_occlusion_gap > 0 || config.extended_join_gap_ratio > 0)) {
         changed = false;
         for (int id = 1; id < count; ++id) {
           if ((!qualified[id] && !joinable[id]) || keep[id]) {continue;}
@@ -426,13 +508,35 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
             const double limit = gap_limit(config, std::min(medians[id], medians[anchor]));
             const double alignment = std::max(std::abs(a[1] - a[2] * gap - b[1]),
               std::abs(b[1] + b[2] * gap - a[1]));
+            const double axis_size = horizontal[id] ? width - 1 : height - 1;
+            const double cross_size = horizontal[id] ? height - 1 : width - 1;
+            const double support = config.extended_join_support_ratio * axis_size;
+            const double lower_span = profiles[lower].front()[0] - profiles[lower].back()[0];
+            const double upper_span = profiles[upper].front()[0] - profiles[upper].back()[0];
+            const double turn = std::abs(std::atan(a[2]) - std::atan(b[2]));
+            bool intersection_inside = false;
+            if (std::abs(a[2] - b[2]) > 1e-6) {
+              const double axis = (b[1] - b[2] * b[0] - a[1] + a[2] * a[0]) / (a[2] - b[2]);
+              const double cross = a[1] + a[2] * (axis - a[0]);
+              intersection_inside = axis >= b[0] && axis <= a[0] && cross >= 0 && cross <= cross_size;
+            }
+            // 只接同一扫描轴、长实测段之间的空白；交点必须落在缺口内，不能远处相交就放行。
+            const bool extended = config.extended_join_gap_ratio > 0 && qualified[id] &&
+              qualified[anchor] && lower_span >= support && upper_span >= support && gap > 0 &&
+              gap <= config.extended_join_gap_ratio * axis_size && width_ratio <= 1.8 &&
+              turn <= config.extended_join_angle_rad &&
+              std::abs(a[1] - b[1]) <= std::min(config.search_radius, config.max_center_jump) &&
+              ((turn <= 0.25 && alignment <= std::max(config.max_occlusion_offset, 0.04 * cross_size)) ||
+              intersection_inside);
             std::string rejection;
             if (gap <= 0) {rejection = "overlapping_axis_ranges";}
             else if (width_ratio > 1.8) {rejection = "width_mismatch";}
             else if (alignment > config.max_occlusion_offset) {rejection = "tangent_mismatch";}
             else if (gap - config.row_step > limit) {rejection = "gap_too_long";}
+            if (extended) {rejection.clear();}
             if (result.joins.size() < 64) {
-              result.joins.push_back({id, anchor, gap - config.row_step, limit,
+              result.joins.push_back({id, anchor, gap - config.row_step,
+                extended ? config.extended_join_gap_ratio * axis_size : limit,
                 width_ratio, alignment, rejection});
             }
             // Edge evidence is independent of permission to interpolate the gap.
@@ -442,6 +546,10 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
                 bool(horizontal[id])});
             }
             if (rejection.empty()) {
+              if (extended) {
+                retained_gap_rows = std::max(retained_gap_rows,
+                  static_cast<int>(std::ceil(gap / config.row_step)) + 1);
+              }
               keep[id] = 1; changed = true; break;
             }
           }
@@ -519,8 +627,8 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
       ++result.rejected_rows;
       // Keep the last valid seed. Never steer using an edge fallback midpoint.
       // Empty rows before the first acquisition are not a tracking gap.
-      const int gap_limit = std::max(config.max_missing_rows,
-        (config.max_occlusion_gap + config.row_step - 1) / config.row_step);
+      const int gap_limit = std::max({config.max_missing_rows, retained_gap_rows,
+        (config.max_occlusion_gap + config.row_step - 1) / config.row_step});
       if (have_valid_seed && ++missing > gap_limit) {stopped = true;}
     }
     result.rows.push_back(row);

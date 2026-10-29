@@ -11,6 +11,8 @@ struct LineConfig
   int processing_width = 640;
   int hue_low = 100, hue_high = 130, saturation_min = 70, value_min = 18;
   bool illumination_support = true;
+  bool local_brightness_normalization = false;
+  bool hough_join_support = false;
   int weak_saturation_min = 12, weak_value_min = 8, weak_seed_pixels = 20;
   double blue_excess_min = 0.025;
   double strong_blue_excess_min = 0.12;
@@ -29,6 +31,10 @@ struct LineConfig
   double min_core_fraction = 0.45, max_width_spread = 2.5;
   int max_occlusion_gap = 72;
   double max_occlusion_offset = 12.0;
+  // 长反光缺口续接仅保留两端真实像素，不把中间补成观测。
+  double extended_join_gap_ratio = 0.0;
+  double extended_join_support_ratio = 0.10;
+  double extended_join_angle_rad = 0.60;
   bool use_occlusion_edges = true;
   bool allow_reacquire = true, show_canny = false;
   int canny_low = 50, canny_high = 150;
@@ -79,6 +85,7 @@ struct LineResult
   bool horizontal = false, occlusion_suspected = false;
   int occlusion_edge_pixels = 0;
   int selected_candidate = 0;
+  int hough_supported_candidates = 0;
   int valid_rows = 0, rejected_rows = 0, roi_top = 0, roi_bottom = 0, target_y = 0;
   double target_x = 0, error_pixels = 0, error_normalized = 0, confidence = 0;
   double blue_fraction = 0;

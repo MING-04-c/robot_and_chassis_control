@@ -61,9 +61,14 @@ public:
     stop_exit_delay_ms_ = declare_parameter<int>("stop_exit_delay_ms", 1000);
     auto_start_ = declare_parameter<bool>("auto_start", true);
     zero_before_request_ = declare_parameter<bool>("zero_before_request", true);
-    unit_ = declare_parameter<std::string>("unit", "N");
+    unit_ = declare_parameter<std::string>("unit", "kg");
+    if (unit_ == "kgf") unit_ = "kg";
     baud_code_ = declare_parameter<int>("baud_code", 0);
-    auto_calibrate_unit_ = declare_parameter<bool>("auto_calibrate_unit", true);
+    auto_calibrate_unit_ = declare_parameter<bool>("auto_calibrate_unit", false);
+    switch_unit_on_startup_ = declare_parameter<bool>("switch_unit_on_startup", true);
+    restore_kg_on_shutdown_ = declare_parameter<bool>("restore_kg_on_shutdown", true);
+    // 旧比较实验仅显式开启时保留；正常使用按厂家上电默认 kg 档管理。
+    if (auto_calibrate_unit_) switch_unit_on_startup_ = false;
     calibration_zero_each_group_ = declare_parameter<bool>("unit_calibration_zero_each_group", true);
     target_unit_ = declare_parameter<std::string>("target_unit", "N");
     if (target_unit_ == "kgf") target_unit_ = "kg";
@@ -87,7 +92,7 @@ public:
     if (!auto_calibrate_unit_ && unit_ != "N" && unit_ != "kg") {
       throw std::runtime_error("Manual unit must be N or kg");
     }
-    unit_ready_ = !auto_calibrate_unit_;
+    unit_ready_ = !auto_calibrate_unit_ && !switch_unit_on_startup_;
     unit_scale_ = unit_ == "kg" ? sensor_units::kGravity : 1.0;
 
     if (transport_ != "usb" && transport_ != "tcp") {
@@ -137,8 +142,9 @@ public:
       "/sensor/set_baud", std::bind(&SensorNode::baud_callback, this,
       std::placeholders::_1, std::placeholders::_2));
 
-    unit_status(auto_calibrate_unit_ ? "WAIT_CONNECTION" : "MANUAL",
-      auto_calibrate_unit_ ? "等待连接后自动识别单位" : "使用人工声明单位，未自动验证");
+    unit_status((auto_calibrate_unit_ || switch_unit_on_startup_) ? "WAIT_CONNECTION" : "MANUAL",
+      switch_unit_on_startup_ ? "按厂家上电默认单位 " + unit_ + "，连接后对齐目标单位，不做采样比较" :
+      (auto_calibrate_unit_ ? "等待连接后自动识别单位" : "使用人工声明单位，未自动验证"));
     if (request_period_ > 0.0) {
       timer_ = create_wall_timer(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::duration<double>(request_period_)), [this]() { request_once(); });
@@ -168,8 +174,27 @@ public:
       std::lock_guard<std::recursive_mutex> lock(protocol_mutex_);
       // 协议规定：先停止采集，再退出 debug，最后释放串口。
       RCLCPP_INFO(get_logger(), "Stopping sensor: stop acquisition, then exit debug");
-      send_command(acquisition_stop_command());
+      unit_ready_ = false;
+      streaming_ = false;
+      const bool stopped = send_command(acquisition_stop_command());
       std::this_thread::sleep_for(std::chrono::milliseconds(stop_exit_delay_ms_));
+      if (switch_unit_on_startup_ && restore_kg_on_shutdown_) {
+        bool restored = stopped && (unit_ == "kg");
+        if (stopped && unit_ == "N") {
+          // /sensor/stop 可能已经退出 debug，正常退出前需要重新进入再切换。
+          restored = send_command(command(0x32));
+          std::this_thread::sleep_for(std::chrono::milliseconds(command_delay_ms_));
+          if (restored) restored = send_command(unit_command());
+          if (restored) unit_ = "kg";
+          else unit_ = "unknown";
+          std::this_thread::sleep_for(std::chrono::milliseconds(unit_switch_delay_ms_));
+        }
+        if (restored) {
+          RCLCPP_INFO(get_logger(), "正常退出：已按已知档位恢复 kg，下一次启动按 kg 处理");
+        } else {
+          RCLCPP_ERROR(get_logger(), "退出时未能恢复 kg；下次使用前请重新给传感器上电，不能假定当前档位");
+        }
+      }
       send_command(debug_exit_command());
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       running_ = false;
@@ -269,6 +294,7 @@ private:
   bool start_stream(bool force_calibration = false)
   {
     std::lock_guard<std::recursive_mutex> lock(protocol_mutex_);
+    if (switch_unit_on_startup_) return start_known_unit_stream();
     const bool calibrate = auto_calibrate_unit_ || force_calibration;
     if (calibrate) begin_unit_collection();
     else {
@@ -293,6 +319,45 @@ private:
     }
     return streaming_;
   }
+  bool start_known_unit_stream()
+  {
+    // 本方法只使用已知的当前档位；35 是切换命令，不能在未知档位时盲发。
+    unit_ready_ = false;
+    streaming_ = false;
+    if (unit_ != "N" && unit_ != "kg") {
+      unit_status("UNIT_UNKNOWN", "档位未知；重新给传感器上电并重启节点，不自动重复切换");
+      return false;
+    }
+    unit_status("SETTING_UNIT", "按厂家默认档位对齐目标单位，不做前后采样比较");
+    if (!send_command(command(0x32))) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(command_delay_ms_));
+    if (target_unit_ != "keep" && unit_ != target_unit_) {
+      if (!send_command(acquisition_stop_command())) return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(unit_switch_delay_ms_));
+      discard_pending_input();
+      if (!send_command(unit_command())) {
+        unit_ = "unknown";  // 发送失败时可能有部分字节已到设备，不能重试翻转。
+        unit_status("UNIT_UNKNOWN", "单位切换发送失败，暂停控制用力输出");
+        return false;
+      }
+      unit_ = target_unit_;
+      std::this_thread::sleep_for(std::chrono::milliseconds(unit_switch_delay_ms_));
+      discard_pending_input();
+    }
+    unit_scale_ = unit_ == "kg" ? sensor_units::kGravity : 1.0;
+    if (zero_before_request_) {
+      if (!send_command(zero_command())) return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(zero_wait_ms_));
+    }
+    discard_pending_input();
+    streaming_ = send_command(command(0x02));
+    unit_ready_ = streaming_;
+    unit_status(unit_ready_ ? "READY" : "START_FAILED",
+      "依据上电默认档位及已发送切换命令；scale=" + std::to_string(unit_scale_) +
+      "; 此协议未提供绝对档位读回验证");
+    return streaming_;
+  }
+
   bool stop_stream()
   {
     std::lock_guard<std::recursive_mutex> lock(protocol_mutex_);
@@ -315,9 +380,12 @@ private:
   {
     std::lock_guard<std::recursive_mutex> lock(protocol_mutex_);
     const auto bytes = parse_hex(request->data);
-    if (calibration_active() || calibration_requested_ || bytes == unit_command()) {
+    const auto toggle = unit_command();
+    const bool contains_toggle = std::search(
+      bytes.begin(), bytes.end(), toggle.begin(), toggle.end()) != bytes.end();
+    if (calibration_active() || calibration_requested_ || contains_toggle) {
       response->success = false;
-      response->message = "单位检测期间不允许插入命令；单位切换请使用 /sensor/calibrate_unit";
+      response->message = "单位检测期间不允许插入命令；单位切换请使用 /sensor/set_unit 或 /sensor/toggle_unit";
       return;
     }
     response->success = !bytes.empty() && send_command(bytes);
@@ -366,7 +434,19 @@ private:
   void unit_callback(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     const std::shared_ptr<std_srvs::srv::Trigger::Response> response)
   {
-    // 兼容旧服务名，改为带前后采样验证的切换，而非根据配置盲猜新单位。
+    if (switch_unit_on_startup_) {
+      std::lock_guard<std::recursive_mutex> lock(protocol_mutex_);
+      if (unit_ != "N" && unit_ != "kg") {
+        response->success = false;
+        response->message = "当前档位未知，请重新给传感器上电并重启节点";
+        return;
+      }
+      target_unit_ = unit_ == "N" ? "kg" : "N";
+      set_parameter(rclcpp::Parameter("target_unit", target_unit_));
+      response->success = start_stream();
+      response->message = response->success ? "已按已知档位切换，ROS 输出仍为 N/N·m" : "切换失败";
+      return;
+    }
     calibration_callback(request, response);
   }
 
@@ -536,16 +616,22 @@ private:
           RCLCPP_WARN(get_logger(), "Sensor connection lost; reconnecting");
         }
         streaming_ = false;
-        unit_ready_ = !auto_calibrate_unit_;
+        unit_ready_ = !auto_calibrate_unit_ && !switch_unit_on_startup_;
         calibration_phase_ = CalibrationPhase::Idle;
         calibration_requested_ = false;
-        unit_status("DISCONNECTED", "连接中断，自动模式将在重连后重新识别单位");
+        if (switch_unit_on_startup_ && connection_seen_) unit_ = "unknown";
+        unit_status("DISCONNECTED", switch_unit_on_startup_ ?
+          "连接断开；已连接过的设备不猜测是否掉电，不重复切换单位" :
+          "连接中断，自动模式将在重连后重新识别单位");
         frame_buffer_.clear();
         ascii_buffer_.clear();
         close_connection();
         if (running_ && open_connection()) {
           RCLCPP_INFO(get_logger(), "Sensor connection opened");
-          if (auto_start_) start_stream();
+          connection_seen_ = true;
+          if (auto_start_ && !start_stream()) {
+            unit_status("START_FAILED", "启动失败或档位未知；暂停控制用力输出");
+          }
         } else if (running_) {
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 5000,
@@ -640,6 +726,12 @@ private:
     }
     target_unit_ = requested;
     set_parameter(rclcpp::Parameter("target_unit", request->unit));
+    if (switch_unit_on_startup_) {
+      response->success = start_stream();
+      response->message = response->success ? "已对齐目标单位，ROS 输出仍为 N/N·m" :
+        "切换失败或当前档位未知，请查看 /sensor/unit_status";
+      return;
+    }
     calibration_requested_ = true;
     unit_ready_ = false;
     response->success = true;
@@ -654,6 +746,12 @@ private:
     if (calibration_active() || calibration_requested_) {
       response->success = false;
       response->message = "单位检测正在进行，请查看 /sensor/unit_status";
+      return;
+    }
+    if (switch_unit_on_startup_) {
+      response->success = start_stream();
+      response->message = response->success ? "已对齐目标单位，无需采样标定" :
+        "当前单位无法对齐，请查看 /sensor/unit_status";
       return;
     }
     calibration_requested_ = true;
@@ -817,7 +915,8 @@ private:
 
   enum class CalibrationPhase {Idle, Before, After, VerifyTarget, Failed};
   CalibrationPhase calibration_phase_{CalibrationPhase::Idle};
-  bool auto_calibrate_unit_{true}, unit_ready_{false}, calibration_requested_{false};
+  bool auto_calibrate_unit_{false}, unit_ready_{false}, calibration_requested_{false};
+  bool switch_unit_on_startup_{true}, restore_kg_on_shutdown_{true}, connection_seen_{false};
   bool calibration_zero_each_group_{true};
   int calibration_samples_{100};
   double unit_scale_{1.0}, calibration_timeout_, calibration_min_force_;

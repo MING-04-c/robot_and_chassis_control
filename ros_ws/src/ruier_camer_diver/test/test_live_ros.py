@@ -138,11 +138,28 @@ def main():
         pump(lambda: status.get("state") == "LOST" and
              status.get("lost_reason") == "no_blue_pixels" and
              status.get("target_x") is None, grey)
+        request = SetParametersAtomically.Request()
+        request.parameters = [Parameter("extended_join_gap_ratio", value=0.30).to_parameter_msg(),
+                              Parameter("hough_join_support", value=True).to_parameter_msg(),
+                              Parameter("local_brightness_normalization", value=True).to_parameter_msg()]
+        future = client.call_async(request)
+        pump(future.done, grey)
+        assert future.result().result.successful
+        reflection = empty.copy()
+        cv2.line(reflection, (286, 80), (320, 200), (220, 80, 20), 21)
+        cv2.line(reflection, (320, 300), (281, 440), (220, 80, 20), 21)
+        pump(lambda: status.get("lost") is False and
+             sum(c["retained"] for c in status.get("candidates", [])) == 2 and
+             status.get("hough_supported_candidates", 0) >= 2, reflection)
+        pump(lambda: bool(path) and any(p.y < 180 for p in path[0].polygon.points) and
+             any(p.y > 330 for p in path[0].polygon.points) and
+             all(not 220 < p.y < 280 for p in path[0].polygon.points), reflection)
         pump(lambda: status.get("state") == "STALE_FRAME", seconds=3)
         assert status["lost"] and status["error_pixels"] is None
         pump(lambda: bool(estimated) and not estimated[0].polygon.points, seconds=2)
         print("PASS: NO_FRAME -> TRACKING -> OCCLUDED -> PARTIAL -> noise rejected -> STALE_FRAME")
         print("PASS: real ROS Image dashboard, pixel path, null error when lost, empty path on loss")
+        print("PASS: intersecting extensions retain both measured segments without fake gap pixels")
     finally:
         process.send_signal(signal.SIGINT) if process.poll() is None else None
         try:

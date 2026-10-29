@@ -1,31 +1,45 @@
 line_follow_controller:
   ros__parameters:
     enabled: true                    # 有效蓝线和底盘反馈到齐后开始循迹
-    forward_speed: 0.05               # m/s：0.05 = 5 cm/s，可在线调整
+    forward_speed: 0.075              # m/s：7.5 cm/s，可在线调整
     max_forward_speed: 0.30           # 前进速度参数上限，m/s
     image_forward_direction: down    # 实际轮子/车身在画面上方，前方朝画面下方
     vehicle_reference_x_ratio: 0.5   # 虚拟车身参考横坐标；对准车身中心线后校准
     vehicle_reference_y_ratio: -0.05 # 画面上方5%的虚拟参考，需按轮轴位置校准
     lookahead_distance_ratio: 0.45   # 从车身参考向前看的距离 / 图像高度
     near_edge_margin_ratio: 0.25    # 上方轮子近端区域，地面检查起点向前移图高25%
-    max_near_gap_ratio: 0.35         # 从可见地面检查起点起，缺线超过图高35%停车
-    heading_gain: 0.5                 # 车身参考到前瞻点的方向误差 -> rad/s
+    max_near_gap_ratio: 0.40         # 从可见地面检查起点起，缺线超过图高40%停车，给弯道近端留余量
+    heading_gain: 0.35                 # 车身参考到前瞻点的方向误差 -> rad/s
+    curve_entry_time_sec: 0.35       # 逐渐进入转弯优先，避免第一下转太多
+    curve_detection_angle_rad: 0.12  # 走向偏离前方或切线变化约7度后逐渐启用转弯优先
+    curve_error_deadband: 0.18       # 弯道中心容差：半图宽18%，直线仍6%
+    curve_center_gain_factor: 0.35   # 弯道降低追回中心的力度
+    curve_heading_gain: 0.55        # 弯道增强跟随前方走向
+    curve_max_angular_speed: 0.28    # 弯道转速上限约16度/秒，直线仍约14度/秒
+    curve_angular_acceleration: 0.30 # 弯道限制首次转向增量，仍经过滤波和变化率限制
     max_heading_error_rad: 1.2        # 偏离前进轴超过约69度则停车
-    steering_gain: 1.2                # 近端中线横向误差 -> rad/s
+    steering_gain: 0.65                # 近端中线横向误差 -> rad/s
     steering_sign: -1.0               # down 下有效转向符号为 +1，保持已校正的左右关系
-    max_angular_speed: 0.5            # rad/s，约 28.6 度/秒
-    error_deadband: 0.03              # 横向偏差连续死区，抑制直线小抖动
-    heading_deadband_rad: 0.035      # 方向误差连续死区，约2度
+    max_angular_speed: 0.25            # 直线纠偏上限，约14.3度/秒
+    error_deadband: 0.06              # 横向偏差连续死区，允许偏离半图宽的6%
+    heading_deadband_rad: 0.05      # 方向误差连续死区，约2.9度
     steering_filter_time_sec: 0.2    # 转向低通时间常数；0关闭，过大会拖慢弯道响应
-    curve_slowdown: 0.7               # 偏差越大，前进越慢
+    curve_slowdown: 0.4               # 减轻正常横向偏差引起的减速
     min_speed_factor: 0.3
     estimated_speed_factor: 0.3       # 估计目标/疑似遮挡时再减速
     fallback_speed_factor: 0.5        # 前瞻目标回退时再减速
-    linear_acceleration: 0.15         # m/s²；丢线时立即发零，不使用缓降
-    angular_acceleration: 0.5         # rad/s²，限制转向变化速度
-    min_valid_row_fraction: 0.2       # 有效扫描行比例，不是安全置信度
+    linear_acceleration: 0.08         # m/s²；有效跟线时缓加减速，丢线仍立即零速
+    angular_acceleration: 0.35         # 直线转向变化上限，rad/s²
+    min_valid_row_fraction: 0.06      # 有效扫描行比例；新帧中仍有短近端实测段时低速多推进一点
     allow_curved_candidates: true    # 横向分类的弯线需通过实际前方几何检查
-    min_forward_span_ratio: 0.15     # 观测中线前后跨度至少为图高15%
+    min_forward_span_ratio: 0.05     # 近端实测段最低跨度；与有效比例门槛共同生效
+    max_trusted_gap_ratio: 0.06      # 连续实测点纵向缺口上限；不跨缺口选择远处线段
+    max_bridge_gap_ratio: 0.30      # 两端几何吻合且支撑足够长时，反光缺口总长度 / 图高；0禁用
+    bridge_support_span_ratio: 0.10  # 缺口每一侧实测连续段至少占图高10%
+    bridge_lateral_tolerance_ratio: 0.04  # 两端切线预测位置偏差 / 图宽
+    bridge_heading_tolerance_rad: 0.25   # 两端切线角差上限，约14度
+    bridge_intersection_angle_rad: 0.85  # 延长线在缺口内相交时，允许约49度转角续接，仍要求两侧实测支撑和交点在缺口内
+    bridge_speed_factor: 1.0        # 两端几何确认后按同一条线行走，不额外缺口减速
     require_bottom_connected: false  # 允许有效可见中线；true 强制胶带连接画面底部
     input_timeout_sec: 0.5            # 视觉/底盘状态超时即停车
     comm_timeout_sec: 2.5             # 通信状态默认约 1 Hz
@@ -36,3 +50,14 @@ line_follow_controller:
     comm_status_topic: /masc_chassis/comm_status
     chassis_status_topic: /masc_chassis/chassis_status
     cmd_vel_topic: /cmd_vel
+    stop_marker_enabled: true
+    stop_marker_target_ratio: 0.5       # 原始相机处理画面高度中间，不是拼接预览的中间
+    stop_marker_position_tolerance_ratio: 0.01 # 高480时约±5像素；实际误差见状态
+    stop_marker_slowdown_ratio: 0.25    # 距目标还有图高25%时开始接近减速
+    stop_marker_creep_speed: 0.008      # m/s，近距离最低接近限速，不会抬高已有更低限速
+    stop_marker_min_span_ratio: 0.12    # 横线长度 / 图宽
+    stop_marker_min_arm_ratio: 0.035    # 主线两侧必须分别伸出这么长 / 图宽
+    stop_marker_angle_tolerance_rad: 0.26 # 横线与局部主线垂直误差约15度
+    stop_marker_confirmation_frames: 3
+    stop_marker_continuation_ratio: 0.10 # 前方继续主线的最小可见长度 / 图高
+    stop_marker_release_ratio: 0.08     # 恢复后越过旧横线才解除去重

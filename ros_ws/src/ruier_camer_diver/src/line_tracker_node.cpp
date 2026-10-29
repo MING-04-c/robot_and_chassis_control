@@ -41,6 +41,7 @@ public:
     DECLARE_INT(hue_low); DECLARE_INT(hue_high);
     DECLARE_INT(saturation_min); DECLARE_INT(value_min);
     DECLARE_VALUE(illumination_support);
+    DECLARE_VALUE(local_brightness_normalization); DECLARE_VALUE(hough_join_support);
     DECLARE_INT(weak_saturation_min); DECLARE_INT(weak_value_min); DECLARE_INT(weak_seed_pixels);
     DECLARE_VALUE(blue_excess_min);
     DECLARE_VALUE(strong_blue_excess_min); DECLARE_INT(weak_support_distance);
@@ -58,6 +59,8 @@ public:
     DECLARE_VALUE(min_row_coverage); DECLARE_VALUE(max_shape_center_step);
     DECLARE_VALUE(min_core_fraction); DECLARE_VALUE(max_width_spread);
     DECLARE_INT(max_occlusion_gap); DECLARE_VALUE(max_occlusion_offset);
+    DECLARE_VALUE(extended_join_gap_ratio); DECLARE_VALUE(extended_join_support_ratio);
+    DECLARE_VALUE(extended_join_angle_rad);
     DECLARE_VALUE(use_occlusion_edges);
     DECLARE_VALUE(allow_reacquire); DECLARE_VALUE(show_canny);
     DECLARE_INT(canny_low); DECLARE_INT(canny_high);
@@ -80,6 +83,7 @@ public:
             SET_INT(processing_width); SET_INT(hue_low); SET_INT(hue_high);
             SET_INT(saturation_min); SET_INT(value_min);
             SET_BOOL(illumination_support);
+            SET_BOOL(local_brightness_normalization); SET_BOOL(hough_join_support);
             SET_INT(weak_saturation_min); SET_INT(weak_value_min); SET_INT(weak_seed_pixels);
             SET_DOUBLE(blue_excess_min);
             SET_DOUBLE(strong_blue_excess_min); SET_INT(weak_support_distance);
@@ -95,6 +99,8 @@ public:
             SET_DOUBLE(min_row_coverage); SET_DOUBLE(max_shape_center_step);
             SET_DOUBLE(min_core_fraction); SET_DOUBLE(max_width_spread);
             SET_INT(max_occlusion_gap); SET_DOUBLE(max_occlusion_offset);
+            SET_DOUBLE(extended_join_gap_ratio); SET_DOUBLE(extended_join_support_ratio);
+            SET_DOUBLE(extended_join_angle_rad);
             SET_BOOL(use_occlusion_edges);
             SET_BOOL(allow_reacquire); SET_BOOL(show_canny);
             SET_INT(canny_low); SET_INT(canny_high); SET_DOUBLE(lookahead_ratio);
@@ -165,6 +171,7 @@ private:
          << ",\"occlusion_suspected\":" << (result && !lost && result->occlusion_suspected ? "true" : "false")
          << ",\"occlusion_edge_pixels\":" << (result ? result->occlusion_edge_pixels : 0)
          << ",\"selected_candidate\":" << (result ? result->selected_candidate : 0)
+         << ",\"hough_supported_candidates\":" << (result ? result->hough_supported_candidates : 0)
          << ",\"processing_over_budget\":" <<
       (milliseconds > timeout_ * 1000 ? "true" : "false")
          << ",\"valid_row_fraction\":" << (result ? result->confidence : 0)
