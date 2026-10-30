@@ -1,0 +1,11 @@
+{
+  "robot_host": "169.254.199.100",
+  "control_port": 9010,
+  "hk_port": 9002,
+  "rgbd_bind": "0.0.0.0",
+  "rgbd_port": 9030,
+  "output_dir": "received",
+  "timeout": 5,
+  "status_interval": 2,
+  "use_shared_key": false
+}

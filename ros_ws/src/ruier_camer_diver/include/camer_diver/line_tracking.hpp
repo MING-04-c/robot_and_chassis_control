@@ -13,6 +13,7 @@ struct LineConfig
   bool illumination_support = true;
   bool local_brightness_normalization = false;
   bool hough_join_support = false;
+  bool separate_stop_bars = true;
   int weak_saturation_min = 12, weak_value_min = 8, weak_seed_pixels = 20;
   double blue_excess_min = 0.025;
   double strong_blue_excess_min = 0.12;
@@ -72,7 +73,7 @@ struct JoinDiagnostic
 
 struct LineResult
 {
-  cv::Mat image, mask, strong_mask, weak_mask, gray, edges, debug;
+  cv::Mat image, mask, marker_mask, strong_mask, weak_mask, gray, edges, debug;
   std::vector<ScanRow> rows;
   std::vector<CandidateDiagnostic> candidates;
   std::vector<JoinDiagnostic> joins;
@@ -83,6 +84,8 @@ struct LineResult
   bool target_estimated = false;
   int inferred_rows = 0;
   bool horizontal = false, occlusion_suspected = false;
+  bool scan_reversed = false;
+  int separated_stop_bars = 0;
   int occlusion_edge_pixels = 0;
   int selected_candidate = 0;
   int hough_supported_candidates = 0;

@@ -1,0 +1,40 @@
+{
+  "schema": "paint_v54_xyz_demo_v1",
+  "status": "DEMO_ONLY_NOT_VALID_MEASUREMENT",
+  "demo_only": true,
+  "depth_source": "ASSUMED_NOT_MEASURED",
+  "assumed_depth_mm": 1200.0,
+  "coordinate_frame": "CAMERA_PINHOLE_PRELIMINARY",
+  "target": "RIGHT_LOWER_DARK_CASE_PANEL",
+  "points_xyz_camera_mm": [
+    {
+      "point_id": "P1",
+      "uv": [
+        390,
+        370
+      ],
+      "xyz_camera_mm": [
+        161.206,
+        326.23,
+        1200.0
+      ],
+      "depth_mm": 1200.0
+    },
+    {
+      "point_id": "P2",
+      "uv": [
+        515,
+        370
+      ],
+      "xyz_camera_mm": [
+        490.919,
+        326.23,
+        1200.0
+      ],
+      "depth_mm": 1200.0
+    }
+  ],
+  "robot_motion_authorized": false,
+  "robot_base_coordinate_calibrated": false,
+  "robot_command": null
+}

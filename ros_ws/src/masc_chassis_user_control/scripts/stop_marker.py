@@ -1,12 +1,13 @@
 """垂直于主线的停止横线识别，以及居中停车/等待新消息继续的状态机。"""
 import math
-from statistics import median
+from statistics import median, fmean
+from time import monotonic
 
 import cv2
 import numpy as np
 
 
-def detect_stop_markers(mask, points, config):
+def detect_stop_markers(mask, points, config, reference=None):
     """输入同尺寸单通道蓝线掩膜、实测中线点；输出横线交点及后续主线类别。"""
     if mask is None or mask.ndim != 2 or len(points) < 3:
         return []
@@ -36,6 +37,11 @@ def detect_stop_markers(mask, points, config):
             continue
         slope = median(slopes)
         intercept = median(x-slope*y for x, y in local)
+        if (reference is not None and 'main_slope' in reference
+                and abs(middle_y-reference['y']) < .08*height):
+            # 停车后相机朝向不变，固定主线参考轴；横线位置仍每帧从真实像素重测。
+            slope = reference['main_slope']
+            intercept = reference['x']-slope*reference['y']
         if abs(slope*dx+dy) / (math.hypot(slope, 1)*length) > math.sin(config.stop_marker_angle_tolerance_rad):
             continue
         denominator = dx-slope*dy
@@ -66,6 +72,32 @@ def detect_stop_markers(mask, points, config):
             continue
         offset = float(np.median(offsets))
         cx, cy = cx+offset*nx, cy+offset*ny
+        # 用两侧实体像素按列估计横线中心轴，避免挑中上/下边缘或不同短边而改变交点。
+        if abs(dx) > .3*length:
+            wing_x, wing_y = (xs+left)[wing], (ys+top)[wing]
+            samples = []
+            bin_width = max(3, int(.01*width))
+            for x in range(int(wing_x.min()), int(wing_x.max())+1, bin_width):
+                selected = (wing_x >= x) & (wing_x < x+bin_width)
+                if np.count_nonzero(selected) >= 8:
+                    samples.append((float(np.median(wing_x[selected])),
+                                    float(np.median(wing_y[selected]))))
+            bar_slopes = [(b[1]-a[1])/(b[0]-a[0]) for i, a in enumerate(samples)
+                          for b in samples[i+1:] if abs(b[0]-a[0]) >= 2*bin_width]
+            if not bar_slopes:
+                continue
+            bar_slope = median(bar_slopes)
+            bar_intercept = median(y-bar_slope*x for x, y in samples)
+            divisor = 1-bar_slope*slope
+            if abs(divisor) < 1e-6:
+                continue
+            cy = (bar_intercept+bar_slope*intercept)/divisor
+            cx = intercept+slope*cy
+        else:
+            correction = (slope*cy+intercept-cx)/(ux-slope*uy)
+            cx, cy = cx+correction*ux, cy+correction*uy
+        if not (0 <= cx < width and 0 <= cy < height):
+            continue
 
         def supported_rows(direction, distance):
             hits = []
@@ -98,29 +130,32 @@ def detect_stop_markers(mask, points, config):
         if any(abs(cy-m['y']) < .035*height and abs(cx-m['x']) < .06*width for m in found):
             continue
         found.append({'x': float(cx), 'y': float(cy), 'kind': kind,
-                      'span': length, 'angle_rad': math.atan2(dy, dx)})
+                      'span': length, 'angle_rad': math.atan2(dy, dx),
+                      'main_slope': float(slope)})
     return found
 
 
 class StopMarkerGate:
-    """只根据新图像累计确认；停车锁存，途中站收到新的 resume 消息才解除。"""
+    """对同一横线的新帧位置滚动平均；未到继续前进，到位或轻微越线才停车。"""
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.marker = None
-        self.confirmations = self.kind_confirmations = 0
-        self.stopped = False
+        self.marker = self.reference_marker = None
+        self.confirmations = self.kind_confirmations = self.settled_frames = 0
+        self.stopped = self.position_confirmed = False
         self.latched_kind = None
-        self.settled_frames = 0
+        self.samples = []
+        self.error = self.raw_error = self.height = None
         self.ignored = None
         self.ignore_missing = 0
         self.station_id = 0
-        self.height = None
-        self.error = None
+        self.station_counted = False
         self.missing = False
 
-    def observe(self, candidates, height, config):
+    def observe(self, candidates, height, config, now=None):
+        """每张新图像调用一次；缺失帧不以零误差混入平均值。"""
+        now = monotonic() if now is None else now
         self.height = height
         forward = 1.0 if config.image_forward_direction == 'down' else -1.0
         def distance(marker):
@@ -139,86 +174,110 @@ class StopMarkerGate:
                 if self.ignore_missing >= config.stop_marker_confirmation_frames:
                     self.ignored = None
         match = None
+        same_marker = False
         if self.marker is not None:
             match = min(remaining, key=lambda m: abs(m['y']-self.marker['y']), default=None)
-            if match is not None and abs(match['y']-self.marker['y']) > .08*height:
+            same_marker = match is not None and abs(match['y']-self.marker['y']) <= .08*height
+            if not same_marker:
                 match = None
         if match is None and not self.stopped:
-            ahead = [m for m in remaining if distance(m) >= -config.stop_marker_position_tolerance_ratio]
-            match = min(ahead, key=distance, default=None)
+            # 启动时已略过中心的横线也需识别；轻微越线可作为到达。
+            ahead = [m for m in remaining if distance(m) >= -2*config.stop_marker_overshoot_tolerance_ratio]
+            match = min(ahead, key=lambda m: abs(distance(m)), default=None)
+        self.samples = [(t, value) for t, value in self.samples
+                        if 0 <= now-t <= config.stop_marker_average_max_age_sec]
         if match is None:
-            if not self.stopped:
-                if (self.confirmations >= config.stop_marker_confirmation_frames
-                        and self.error is not None and self.error <= config.stop_marker_slowdown_ratio):
-                    self.missing = True
-                    return
-                self.marker = None
-                self.confirmations = self.kind_confirmations = 0
+            self.settled_frames = 0
+            self.position_confirmed = False
+            if self.marker is not None:
+                self.missing = True
             return
-        if self.marker is not None and abs(match['y']-self.marker['y']) <= .08*height:
-            self.confirmations += 1
-            self.kind_confirmations = self.kind_confirmations+1 if match['kind'] == self.marker['kind'] else 1
-        else:
-            self.confirmations = self.kind_confirmations = 1
+        if not same_marker:
+            self.samples.clear()
+            self.confirmations = self.kind_confirmations = 0
+            self.latched_kind = None
+            self.reference_marker = None
+            self.station_counted = False
+        previous_kind = self.marker['kind'] if same_marker else None
+        self.confirmations += 1
+        self.kind_confirmations = self.kind_confirmations+1 if match['kind'] == previous_kind else 1
         self.marker = dict(match)
         self.missing = False
-        self.error = distance(match)
-        if self.stopped:
-            self.settled_frames = (self.settled_frames+1 if abs(self.error) <=
-                                   config.stop_marker_position_tolerance_ratio else 0)
-        if (self.stopped and self.latched_kind == 'unknown'
-                and self.kind_confirmations >= config.stop_marker_confirmation_frames
-                and match['kind'] != 'unknown'):
-            self.latched_kind = match['kind']
+        self.raw_error = distance(match)
+        self.samples.append((now, self.raw_error))
+        self.samples = self.samples[-config.stop_marker_average_frames:]
+        self.error = fmean(value for _, value in self.samples)
+        ready = len(self.samples) == config.stop_marker_average_frames
+        within = (ready and -config.stop_marker_overshoot_tolerance_ratio-1e-9 <= self.error
+                  <= config.stop_marker_position_tolerance_ratio+1e-9)
+        self.stopped = within
+        if within:
+            self.settled_frames += 1
+            if self.reference_marker is None:
+                self.reference_marker = dict(match)
+            if self.latched_kind is None or self.latched_kind == 'unknown':
+                self.latched_kind = (match['kind'] if self.kind_confirmations >=
+                                     config.stop_marker_confirmation_frames else 'unknown')
+            self.position_confirmed = self.settled_frames >= config.stop_marker_confirmation_frames
+            if self.position_confirmed and not self.station_counted:
+                self.station_id += 1
+                self.station_counted = True
+        else:
+            # 平均位置不在容差内就继续调整，不能被历史停车标志锁住。
+            self.settled_frames = 0
+            self.position_confirmed = False
+            self.reference_marker = None
 
     def state(self, config):
-        if self.missing and not self.stopped:
+        if self.missing:
             return 'missing'
-        if not self.stopped:
-            return 'approaching' if self.marker else 'searching'
-        if self.error is not None and self.error < -config.stop_marker_position_tolerance_ratio:
+        if self.marker is None or self.error is None:
+            return 'searching'
+        ready = len(self.samples) == config.stop_marker_average_frames
+        tolerance = config.stop_marker_position_tolerance_ratio
+        if not ready:
+            return 'averaging' if self.error < -tolerance else 'approaching'
+        if self.error < -config.stop_marker_overshoot_tolerance_ratio-1e-9:
             return 'overshoot'
-        if self.settled_frames < config.stop_marker_confirmation_frames:
+        if self.error > tolerance+1e-9:
+            return 'approaching'
+        if not self.position_confirmed:
             return 'settling'
         return 'stopped_'+(self.latched_kind or 'unknown')
 
     def limit(self, speed, config):
-        """返回限速与站点状态；停车指令绕过缓降，实际位置误差仍需图像复核。"""
+        """平均位置未到时持续靠近；到位/轻微越线为零速，不自动倒车。"""
         state = self.state(config)
-        if self.stopped or self.missing:
-            return 0.0, state
-        if self.marker is None or self.error is None:
+        if state == 'searching':
             return speed, state
-        if self.error <= config.stop_marker_position_tolerance_ratio:
-            if self.confirmations >= config.stop_marker_confirmation_frames:
-                self.stopped = True
-                self.settled_frames = 0
-                self.latched_kind = (self.marker['kind'] if self.kind_confirmations >=
-                                     config.stop_marker_confirmation_frames else 'unknown')
-                self.station_id += 1
-                return 0.0, self.state(config)
-            return 0.0, 'confirming'
-        cap = max(config.stop_marker_creep_speed,
-                  config.forward_speed*min(1.0, self.error/config.stop_marker_slowdown_ratio))
-        return min(speed, cap), 'approaching'
+        if state == 'approaching':
+            cap = config.stop_marker_creep_speed
+            if len(self.samples) == config.stop_marker_average_frames:
+                cap = max(cap, config.forward_speed*min(1., self.error/config.stop_marker_slowdown_ratio))
+            return min(max(0., speed), cap), state
+        return 0., state
 
     def resume(self, config):
         if self.state(config) != 'stopped_intermediate':
             return False
-        self.ignored = dict(self.marker)
-        self.ignore_missing = 0
-        self.missing = False
-        self.marker = None
-        self.confirmations = self.kind_confirmations = 0
-        self.stopped = False
-        self.latched_kind = None
-        self.error = None
+        ignored, station_id = dict(self.marker), self.station_id
+        self.reset()
+        self.ignored, self.station_id = ignored, station_id
         return True
 
     def snapshot(self, config):
+        average_y = None
+        if self.height and self.error is not None:
+            forward = 1. if config.image_forward_direction == 'down' else -1.
+            average_y = self.height*(config.stop_marker_target_ratio+forward*self.error)
         return {'enabled': config.stop_marker_enabled, 'state': self.state(config),
                 'kind': self.latched_kind, 'station_id': self.station_id,
-                'marker': self.marker, 'error_ratio': self.error,
-                'overshoot': self.error is not None and self.error < -config.stop_marker_position_tolerance_ratio,
+                'marker': self.marker, 'error_ratio': self.error, 'raw_error_ratio': self.raw_error,
+                'average_y': average_y, 'sample_count': len(self.samples),
+                'average_frames': config.stop_marker_average_frames, 'filter': 'arithmetic_mean',
+                'position_tolerance_ratio': config.stop_marker_position_tolerance_ratio,
+                'position_confirmed': self.position_confirmed,
+                'overshoot_tolerance_ratio': config.stop_marker_overshoot_tolerance_ratio,
+                'overshoot': self.state(config) == 'overshoot',
                 'target_ratio': config.stop_marker_target_ratio,
                 'waiting_for_resume': config.stop_marker_enabled and self.state(config) == 'stopped_intermediate'}

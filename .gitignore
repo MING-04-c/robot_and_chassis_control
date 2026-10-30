@@ -7,4 +7,8 @@ install/
 
 # Python runtime caches
 __pycache__/
+.pytest_cache/
 *.py[cod]
+
+# Shared TCP communication key
+industrial_pc.key

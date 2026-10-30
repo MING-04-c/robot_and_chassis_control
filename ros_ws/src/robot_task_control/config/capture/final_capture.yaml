@@ -1,0 +1,23 @@
+# 顺序采集：一张 HK + 一组 RGB/原始深度；不打开预览或点云。
+output_dir: ~/robot_data/task_final
+receiver_ip: 169.254.199.120
+hk_bind_ip: 169.254.199.100
+hk_port: 9002
+rgbd_port: 9030
+transfer_timeout_sec: 60.0
+robot_settle_sec: 3.0
+camera_warmup_sec: 3.0
+stable_frames: 8
+# 在160×120灰度缩略图上比较相邻新帧的平均绝对差（0～255）。
+# 只是画面稳定性检查，不代表清晰度、对焦或深度精度已验证。
+frame_difference_threshold: 3.0
+stability_timeout_sec: 30.0
+pause_line_camera: true
+line_streaming_service: /line_camera/camera_node/streaming
+hk_image_topic: /camera/image
+hk_frame_rate: 10.0
+jpeg_quality: 95
+# 留空则复用各驱动原来的参数文件；可填外部绝对路径。
+hk_params: ''
+depth_params: ''
+depth_namespace: final_depth

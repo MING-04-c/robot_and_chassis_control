@@ -50,9 +50,12 @@ class ControlConfig:
 
     stop_marker_enabled: bool = True
     stop_marker_target_ratio: float = 0.5
-    stop_marker_position_tolerance_ratio: float = 0.01
+    stop_marker_position_tolerance_ratio: float = 0.008
     stop_marker_slowdown_ratio: float = 0.25
     stop_marker_creep_speed: float = 0.008
+    stop_marker_average_frames: int = 5
+    stop_marker_average_max_age_sec: float = 1.0
+    stop_marker_overshoot_tolerance_ratio: float = 0.02
     stop_marker_min_span_ratio: float = 0.12
     stop_marker_min_arm_ratio: float = 0.035
     stop_marker_angle_tolerance_rad: float = 0.26
@@ -91,6 +94,12 @@ class ControlConfig:
                 raise ValueError(f'{name} must be between 0 and 1')
         if not isinstance(self.stop_marker_enabled, bool):
             raise ValueError('stop_marker_enabled must be boolean')
+        if (type(self.stop_marker_average_frames) is not int
+                or not 3 <= self.stop_marker_average_frames <= 15):
+            raise ValueError('stop_marker_average_frames must be integer 3..15')
+        if (not .2 <= self.stop_marker_average_max_age_sec <= 2.
+                or not self.stop_marker_position_tolerance_ratio <= self.stop_marker_overshoot_tolerance_ratio <= .1):
+            raise ValueError('invalid stop marker average/overshoot limits')
         if (isinstance(self.stop_marker_confirmation_frames, bool)
                 or not isinstance(self.stop_marker_confirmation_frames, int)
                 or not 2 <= self.stop_marker_confirmation_frames <= 20):
@@ -261,6 +270,15 @@ def tracking_geometry(points, width, height, config):
         return None, 'near_line_missing'
     requested_y = ry + forward * config.lookahead_distance_ratio * (height - 1)
     target_x, target_y = min(ahead, key=lambda p: abs(p[1] - requested_y))
+    # 在相邻实测行之间连续取前瞻点，避免目标在两行之间来回跳而导致转向顿挫。
+    # 未批准的缺口仍由 trusted 前缀截断；这里不向可见范围以外延长。
+    for first, second in zip(ahead, ahead[1:]):
+        if (min(first[1], second[1]) <= requested_y <= max(first[1], second[1])
+                and abs(second[1]-first[1]) <= config.max_trusted_gap_ratio * (height-1)):
+            fraction = (requested_y-first[1])/(second[1]-first[1]) if second[1] != first[1] else 0.0
+            target_x = first[0] + fraction*(second[0]-first[0])
+            target_y = requested_y
+            break
     target_gap_interpolated = False
     for bridge in bridges:
         start, end = bridge['from'], bridge['to']

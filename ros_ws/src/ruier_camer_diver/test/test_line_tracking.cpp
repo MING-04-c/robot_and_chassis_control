@@ -17,22 +17,50 @@ cv::Mat stripe(cv::Scalar floor = {240, 240, 240}, int x = 320)
 TEST(BlueLineTracking, TerminalCrossbarDoesNotHideLongSlantedMainLine)
 {
   camer_diver::LineConfig config;
-  config.max_center_jump = 65;
+  // 收紧跳变限值以稳定复现横线种子锁死；主线相邻行仅约3像素偏移。
+  config.max_center_jump = 4;
+  config.separate_stop_bars = false;
   config.search_radius = 80;
   for (const int end_x : {240, 290, 350, 420}) {
-  SCOPED_TRACE(end_x);
-  cv::Mat image(480, 640, CV_8UC3, cv::Scalar(235, 235, 235));
-  const cv::Scalar blue(220, 80, 20);
-  // 末端横线倾斜且延伸至图像底边，会把首次扫描种子拉离主线。
-  cv::line(image, {150, 440}, {350, 0}, blue, 24);
-  cv::line(image, {100, 425}, {end_x, 479}, blue, 22);
-  const auto result = camer_diver::track_blue_line(image, config);
-  EXPECT_FALSE(result.lost);
-  int main_rows = 0;
-  for (const auto & row : result.rows) {
-    if (row.valid && row.y < 200) {++main_rows;}
+    SCOPED_TRACE(end_x);
+    cv::Mat image(480, 640, CV_8UC3, cv::Scalar(235, 235, 235));
+    const cv::Scalar blue(220, 80, 20);
+    // 末端横线倾斜且延伸至图像底边，会把首次扫描种子拉离主线。
+    cv::line(image, {150, 440}, {350, 0}, blue, 24);
+    cv::line(image, {100, 425}, {end_x, 479}, blue, 22);
+    const auto result = camer_diver::track_blue_line(image, config);
+    EXPECT_FALSE(result.lost);
+    EXPECT_TRUE(result.scan_reversed);
+    int main_rows = 0;
+    for (const auto & row : result.rows) {
+      if (row.valid && row.y < 200) {++main_rows;}
+    }
+    EXPECT_GT(main_rows, 20);
   }
-  EXPECT_GT(main_rows, 20);
+}
+
+TEST(BlueLineTracking, LongStopBarIsSeparateFromMainPathAndRetainedForStopping)
+{
+  camer_diver::LineConfig config;
+  for (const int bar_y : {240, 330, 400}) {
+    SCOPED_TRACE(bar_y);
+    cv::Mat image(480, 640, CV_8UC3, cv::Scalar(235, 235, 235));
+    const cv::Scalar blue(220, 80, 20);
+    cv::line(image, {330, 0}, {180, 479}, blue, 24);
+    cv::line(image, {100, bar_y-30}, {460, bar_y+60}, blue, 20);
+    const auto result = camer_diver::track_blue_line(image, config);
+    EXPECT_FALSE(result.lost);
+    EXPECT_GT(result.separated_stop_bars, 0);
+    EXPECT_GT(cv::countNonZero(result.marker_mask)-cv::countNonZero(result.mask), 1000);
+    EXPECT_GT(result.valid_rows, 50);
+    EXPECT_GT(result.marker_mask.at<uint8_t>(bar_y-25, 120), 0);
+    EXPECT_EQ(result.mask.at<uint8_t>(bar_y-25, 120), 0);
+    // 主线交汇处必须仍为实际蓝色，不能因为去侧翼把主线挖断。
+    for (const auto & row : result.rows) {
+      if (row.valid) {
+        EXPECT_GT(result.marker_mask.at<uint8_t>(row.y, cvRound(row.center)), 0);
+      }
+    }
   }
 }
 

@@ -1,0 +1,73 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.1
+      Plane Cell Count: 20
+      Alpha: 0.3
+      Value: true
+    - Class: rviz_default_plugins/RobotModel
+      Name: Live Robot From TF
+      Enabled: true
+      Alpha: 1
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Visual Enabled: true
+      Collision Enabled: false
+      Update Interval: 0
+      Links:
+        All Links Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Pixel Point And Actual Probe Trail
+      Enabled: true
+      Topic:
+        Value: /pixel_point_simulation/markers
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Namespaces: {}
+      Value: true
+  Enabled: true
+  Global Options:
+    Fixed Frame: world
+    Background Color: 48; 48; 48
+    Frame Rate: 20
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.7
+      Focal Point:
+        X: -0.3
+        Y: 0.12
+        Z: 0.45
+      Pitch: 0.3
+      Yaw: 0.7
+      Near Clip Distance: 0.01
+      Target Frame: <Fixed Frame>
+  Value: true
+Window Geometry:
+  Width: 1200
+  Height: 800
+  Hide Left Dock: false
+  Hide Right Dock: false

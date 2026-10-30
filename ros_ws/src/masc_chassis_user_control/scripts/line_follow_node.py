@@ -97,7 +97,7 @@ class LineFollowNode(Node):
         self.create_subscription(
             Image, debug_image_topic, self.on_debug_image,
             QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
-        marker_mask_topic = self.declare_parameter('stop_marker_mask_topic', '/camera/line/mask', fixed).value
+        marker_mask_topic = self.declare_parameter('stop_marker_mask_topic', '/camera/line/stop_marker_mask', fixed).value
         self.create_subscription(Image, marker_mask_topic, self.on_marker_mask,
                                  QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
         self.create_subscription(Empty, '/line_follow/resume', self.on_resume_marker, 10)
@@ -130,7 +130,8 @@ class LineFollowNode(Node):
                     mask.shape != (self.status.get('image_height'), self.status.get('image_width'))):
                 self.marker_time = None
                 return
-            self.marker_candidates = detect_stop_markers(mask, self.path_points, self.config)
+            self.marker_candidates = detect_stop_markers(
+                mask, self.path_points, self.config, self.marker_gate.reference_marker)
             self.marker_gate.observe(self.marker_candidates, mask.shape[0], self.config)
             self.marker_header = message.header
             self.marker_time = time.monotonic()
@@ -166,7 +167,10 @@ class LineFollowNode(Node):
             return SetParametersResult(successful=False, reason=str(error))
         marker_was_enabled = self.config.stop_marker_enabled
         self.config = candidate
-        if candidate.stop_marker_enabled and not marker_was_enabled:
+        if ((candidate.stop_marker_enabled and not marker_was_enabled) or updates.keys() & {
+                'stop_marker_target_ratio', 'stop_marker_average_frames',
+                'stop_marker_average_max_age_sec', 'stop_marker_position_tolerance_ratio',
+                'stop_marker_overshoot_tolerance_ratio', 'image_forward_direction'}):
             self.marker_gate.reset()
             self.marker_time = self.marker_stamp = None
         if enabled and not self.enabled:
@@ -470,7 +474,7 @@ class LineFollowNode(Node):
                 # 横线接近限速和停车必须盖过平滑器，不能为了缓降而滑过目标。
                 if marker_state != 'searching':
                     reason = 'stop_marker_'+marker_state.removeprefix('stopped_')
-                    if v == 0:
+                    if v <= 0:
                         w = 0.0
         else:
             v = w = 0.0
@@ -481,7 +485,16 @@ class LineFollowNode(Node):
         self.cmd_pub.publish(command)
         if reason != self.reason:
             self.reason = reason
-            self.get_logger().info(f'Line following state: {reason}')
+            position = ''
+            if reason.startswith('stop_marker_') and self.marker_gate.height:
+                gate = self.marker_gate
+                if gate.error is not None and gate.raw_error is not None:
+                    position = (f'; position_error={gate.error*gate.height:+.2f}px'
+                                f'; raw_error={gate.raw_error*gate.height:+.2f}px'
+                                f'; mean_frames={len(gate.samples)}/{self.config.stop_marker_average_frames}'
+                                f'; tolerance=[-{self.config.stop_marker_overshoot_tolerance_ratio*gate.height:.2f},'
+                                f'+{self.config.stop_marker_position_tolerance_ratio*gate.height:.2f}]px')
+            self.get_logger().info(f'Line following state: {reason}{position}')
         if now - self.last_state >= 0.5:
             self.last_state = now
             self.state_pub.publish(String(data=json.dumps({

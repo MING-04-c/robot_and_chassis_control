@@ -78,3 +78,15 @@ workflow:
         position_mode: absolute
         position: [0.3, 0.2, 0.6]
         orientation: [-160.0, 0.0, -77.0]
+
+    # 四点运动完成后，再确认底盘停稳，按需串行拍照并发送到主机。
+    - action: wait_chassis_stopped
+      stable_seconds: 1.0
+      linear_tolerance: 0.005
+      angular_tolerance: 0.02
+      data_timeout_sec: 0.5
+      step_timeout_sec: 10.0
+
+    - action: final_capture
+      config_file: final_capture.yaml
+      step_timeout_sec: 300.0

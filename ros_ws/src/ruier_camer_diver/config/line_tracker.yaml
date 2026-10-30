@@ -10,6 +10,7 @@
     illumination_support: true # 弱蓝色仅在连通区域含足够强蓝色像素时接纳
     local_brightness_normalization: true # 局部明度归一化，原始色相/饱和度及蓝色优势仍必需
     hough_join_support: true # 按实测点数量自适应投票阈值，用霍夫线段稳定两端拟合
+    separate_stop_bars: true # 长横线侧翼从循迹掩膜分离，完整蓝线另发 stop_marker_mask 供停车识别
     weak_saturation_min: 12
     weak_value_min: 8
     weak_seed_pixels: 20

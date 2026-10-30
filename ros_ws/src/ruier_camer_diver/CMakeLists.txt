@@ -10,6 +10,7 @@ find_package(rclcpp REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(camera_info_manager REQUIRED)
@@ -25,7 +26,7 @@ target_link_libraries(camera_capture PUBLIC ${OpenCV_LIBS})
 add_executable(camera_node src/camera_node.cpp)
 target_link_libraries(camera_node camera_capture)
 ament_target_dependencies(camera_node
-  rclcpp rcl_interfaces sensor_msgs std_msgs cv_bridge camera_info_manager)
+  rclcpp rcl_interfaces sensor_msgs std_msgs std_srvs cv_bridge camera_info_manager)
 
 add_library(line_tracking src/line_tracking.cpp)
 target_include_directories(line_tracking PUBLIC

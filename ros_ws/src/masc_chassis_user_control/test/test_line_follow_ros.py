@@ -193,7 +193,12 @@ def main():
         pump(0.2)
         stopped()
         controller.set_parameters([Parameter('require_bottom_connected', value=False)])
-        pump(0.3)
+        # 等到3帧重新确认及对应速度消息，而不是依赖机器负载下恰好0.3秒完成。
+        deadline = time.monotonic()+1.5
+        while time.monotonic() < deadline:
+            pump(.1)
+            if commands[-1].linear.x > 0.0:
+                break
         assert commands[-1].linear.x > 0.0
         # 有远端缺口时只走近段；近段不足停车，新帧变清楚后经连续有效帧恢复。
         path_ranges = [(120, 270), (430, 470)]
@@ -251,8 +256,15 @@ def main():
         resume_pub.publish(Empty())  # 提前的消息不授权未来站点自动通过。
         for marker_y in (400, 370, 340, 310, 280, 255, 242):
             pump(.2)
+        pump(.8)
         assert controller.marker_gate.state(controller.config) == 'stopped_intermediate'
         pump(.3)
+        stopped()
+        first_command = len(commands)
+        marker_y = 232  # 轻微越线8像素仍到位，不能输出倒车命令。
+        pump(.8)
+        assert controller.marker_gate.state(controller.config) == 'stopped_intermediate'
+        assert all(cmd.linear.x >= 0 for cmd in commands[first_command:])
         stopped()
         resume_pub.publish(Empty())
         pump(.3)
@@ -263,6 +275,7 @@ def main():
         for marker_y in (400, 370, 340, 310, 280, 255, 240):
             path_ranges = [(120, int(marker_y))]
             pump(.2)
+        pump(.8)
         assert controller.marker_gate.state(controller.config) == 'stopped_final'
         stopped()
         resume_pub.publish(Empty())

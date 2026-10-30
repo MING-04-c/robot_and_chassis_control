@@ -1,11 +1,12 @@
 industrial_pc:
   ros__parameters:
-    # 工控机 IP：169.254.199.120；由工控机主动连接树莓派的 9010 端口。
+    # 工控机169.254.199.120主动连接树莓派169.254.199.100:9010，传检测点、任务命令和状态请求。
     # 此处填写树莓派本机监听地址，不能填写远端工控机 IP。
     bind_host: 0.0.0.0
     port: 9010
     socket_timeout: 5.0
-    key_file: ~/.config/robot_control/industrial_pc.key
+    use_shared_key: false
+    key_file: ""
     output_dir: ~/robot_data/industrial_pc/results
     # 原始结果是光学坐标：X 向右、Y 向下、Z 向前，不能直接写 terminal_link_1。
     camera_optical_frame: camera_color_optical_frame

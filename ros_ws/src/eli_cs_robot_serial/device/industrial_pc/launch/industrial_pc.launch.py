@@ -1,4 +1,4 @@
-"""工控机结果回传及可选的独立海康照片通道，不启动相机或机器人。"""
+"""工控机结果、任务命令/状态及可选海康照片通道；本launch不启动相机或机器人驱动。"""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -14,6 +14,7 @@ def setup(context):
         value = LaunchConfiguration(name).perform(context)
         if value:
             overrides[name] = int(value) if name == "port" else value
+    overrides["use_shared_key"] = LaunchConfiguration("use_shared_key").perform(context).lower() == "true"
     hk_overrides = {}
     for argument, parameter in (("hk_bind_host", "listen_ip"),
                                 ("industrial_pc_ip", "allowed_client_ip"),
@@ -43,6 +44,7 @@ def generate_launch_description():
             [*config_dir, "industrial_pc.yaml"])),
         *[DeclareLaunchArgument(name, default_value="", description="留空使用 YAML 配置")
           for name in ("bind_host", "port", "key_file", "output_dir")],
+        DeclareLaunchArgument("use_shared_key", default_value="false"),
         DeclareLaunchArgument("start_hk_transfer", default_value="false",
                               description="启用独立海康拍照发送通道；不启动相机或触发拍照"),
         DeclareLaunchArgument("hk_config_file", default_value=PathJoinSubstitution(

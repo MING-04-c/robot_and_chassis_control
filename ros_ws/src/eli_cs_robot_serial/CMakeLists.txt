@@ -92,6 +92,9 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 # 旧 robot_task_control 入口导入此模块，避免反向依赖任务包。
+install(FILES device/industrial_pc/host_tools/capture_storage.py
+  device/industrial_pc/src/industrial_pc_protocol.py
+  DESTINATION ${PYTHON_INSTALL_DIR})
 install(FILES device/industrial_pc/src/industrial_pc_hk_transfer.py
   DESTINATION ${PYTHON_INSTALL_DIR}
 )
@@ -111,6 +114,14 @@ install(FILES
   device/industrial_pc/src/industrial_pc_client.py
   device/industrial_pc/src/industrial_pc_protocol.py
   device/industrial_pc/src/industrial_pc_hk_receiver.py
+  DESTINATION share/${PROJECT_NAME}/device/industrial_pc/host_tools
+)
+install(DIRECTORY device/industrial_pc/host_tools/
+  DESTINATION share/${PROJECT_NAME}/device/industrial_pc/host_tools
+  USE_SOURCE_PERMISSIONS PATTERN "__pycache__" EXCLUDE
+)
+# 主机工具沿用深度包唯一编解码实现，导出时与发送端保持一致。
+install(FILES ../geminipro_camer_calibration/scripts/capture_transfer.py
   DESTINATION share/${PROJECT_NAME}/device/industrial_pc/host_tools
 )
 

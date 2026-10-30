@@ -3,12 +3,14 @@
 
 from collections import deque
 import ipaddress
+import hashlib
 import json
 import signal
 import socketserver
 import struct
 import threading
 import time
+from uuid import uuid4
 
 import cv2
 import rclpy
@@ -188,6 +190,7 @@ class CameraImageTcpNode(Node):
         self.frames = PhotoQueue() if self.delivery_mode == "photos" else LatestFrame()
         self.sequence = 0
         self.last_publish_time = 0.0
+        self.transfer_session_id = uuid4().hex
         self.server = ImageTcpServer(
             (listen_ip, listen_port), self.frames, allowed_client_ip
         )
@@ -286,7 +289,14 @@ class CameraImageTcpNode(Node):
                 "encoding": "jpeg",
                 "payload_length": len(payload),
             }
+        header["payload_sha256"] = hashlib.sha256(payload).hexdigest()
         self.sequence += 1
+        if self.delivery_mode == "photos":
+            # 分组含义明确为“本发送进程内连续两张”，不冒充工作流检测点编号。
+            header.update({"transfer_session_id": self.transfer_session_id,
+                           "capture_set_id": f"{self.transfer_session_id}_{(self.sequence-1)//2+1:06d}",
+                           "capture_index": (self.sequence-1) % 2+1,
+                           "grouping": "consecutive_pair"})
         header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
         packet = MAGIC + struct.pack("!I", len(header_bytes)) + header_bytes + payload
         if self.frames.publish(self.sequence, packet) is False:

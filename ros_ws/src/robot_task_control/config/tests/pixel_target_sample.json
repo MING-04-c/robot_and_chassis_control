@@ -1,0 +1,60 @@
+{
+  "schema": "v54_depth_pixel_xyz_diagnostic_v1",
+  "status": "TEST_PIXEL_XYZ_PRELIMINARY_NO_PAINT_VALIDATION",
+  "coordinate_frame": "CAMERA_PINHOLE_PRELIMINARY",
+  "robot_motion_authorized": false,
+  "paint_semantics_verified": false,
+  "not_p1_or_p2": true,
+  "source_capture": "/media/abc/D6A0A29CA0A2831B/visual-inspection/Unet/runs/paint_rgbd_v5_4_camera_smoke/camera_v5_4_20261030_161722_111642_831ed984/attempt_01",
+  "source_rgb_sha256": "07fe53cd2b619b14d88e68bcf6d274083ea504798bcefd9f803f1741530a78fb",
+  "source_depth_sha256": "8c5bbfbd6b4bbeab2fb7764b0432030634d2584f027b775178e8a509aca18b0d",
+  "depth_scale_mm_per_raw": 1.0,
+  "intrinsic_used": {
+    "fx": 454.9403381347656,
+    "fy": 454.9403381347656,
+    "cx": 328.8841857910156,
+    "cy": 246.32077026367188,
+    "width": 640,
+    "height": 480
+  },
+  "source_pairing": {
+    "color_format_id": 5,
+    "depth_format_id": 8,
+    "rgb_system_timestamp_raw": 1793348243455,
+    "depth_system_timestamp_raw": 1793348243438,
+    "system_timestamp_delta_raw": 17,
+    "sdk_color_timestamp_fields_raw": {
+      "timeStampUs": 58167775000,
+      "timeStamp": 58167775,
+      "systemTimeStamp": 1793348243455
+    },
+    "sdk_depth_timestamp_fields_raw": {
+      "timeStampUs": 1793348243438000,
+      "timeStamp": 1793348243438,
+      "systemTimeStamp": 1793348243438
+    },
+    "source": "ONE_SDK_FRAMESET_LEGACY_SW_D2C",
+    "exposure_sync_verified": false,
+    "rgbd_geometric_registration_verified": false,
+    "robot_motion_authorized": false
+  },
+  "test_pixel_point": {
+    "point_id": "TEST_PIXEL_NOT_UNET_P1_P2",
+    "pixel_uv": [
+      320,
+      240
+    ],
+    "depth_raw_center": 275,
+    "center_z_mm": 275.0,
+    "depth_mm_used_median7x7": 275.0,
+    "local_valid_fraction": 1.0,
+    "local_p90_minus_p10_mm": 1.0,
+    "xyz_mm_pinhole_preliminary": [
+      -5.370267016871055,
+      -3.820746759094509,
+      275.0
+    ],
+    "point_source": "MANUAL_NUMERICAL_TEST_PIXEL_NOT_UNET_NOT_PAINT"
+  },
+  "warning": "This is the surface measured at a manually selected RGB pixel, not verified paint nor a robot target."
+}

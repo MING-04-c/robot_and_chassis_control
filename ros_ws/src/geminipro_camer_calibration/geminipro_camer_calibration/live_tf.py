@@ -2,7 +2,7 @@
 
 from threading import Thread
 from uuid import uuid4
-from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
+from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException, ShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from tf2_ros import Buffer, TransformListener
@@ -31,16 +31,22 @@ class LiveRobotTransforms:
 
     def spin(self):
         try:
-            self.executor.spin()
-        except ExternalShutdownException:
+            while not self.closed and self.node.context.ok():
+                self.executor.spin_once(timeout_sec=0.1)
+        except (ExternalShutdownException, ShutdownException):
             pass
 
     def close(self):
         if self.closed:
             return
         self.closed = True
-        self.executor.shutdown(timeout_sec=2.0)
-        self.thread.join(timeout=2.0)
+        # 先唤醒并等待 spin 退出，再销毁执行器，避免两个线程同时清理等待集。
+        self.executor.wake()
+        self.thread.join(timeout=1.0)
+        if self.thread.is_alive():
+            self.node.get_logger().warning('TF线程未在1秒内退出，交由ROS context收尾')
+            return
+        self.executor.shutdown(timeout_sec=0.5)
         # 在 context 与节点仍有效时解除订阅并释放监听器。
         self.listener.unregister()
         self.listener = None

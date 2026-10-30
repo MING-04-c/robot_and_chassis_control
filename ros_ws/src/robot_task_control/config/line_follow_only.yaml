@@ -1,7 +1,7 @@
 # 独立循迹逐帧延伸可信段；视觉不足先零速等5秒恢复，未恢复才结束；单轮最多90秒。
 workflow:
   name: line_follow_only
-  auto_start: false
+  auto_start: true
   steps:
   - action: line_follow
     until_untrusted: true

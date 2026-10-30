@@ -1,4 +1,4 @@
-"""生成单个虚拟探头检测点，自动测试接近、接触保持和回原位。"""
+"""共用检测驱动栈：供真机检测入口复用，保留假硬件调试参数。"""
 
 import math
 
@@ -24,11 +24,15 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def launch_setup(context):
-    simulation_value = LaunchConfiguration("simulation").perform(context).lower()
+    # 延迟事件会在 include 的局部参数作用域结束后执行；此处先冻结参数值。
+    def config(name):
+        return LaunchConfiguration(name).perform(context)
+
+    simulation_value = config("simulation").lower()
     if simulation_value not in ("true", "false"):
         raise ValueError("simulation 必须为 true 或 false")
     simulation = simulation_value == "true"
-    profile = LaunchConfiguration("test_config")
+    profile = config("test_config")
     actions = []
 
     def include(package, filename, arguments, **kwargs):
@@ -48,7 +52,7 @@ def launch_setup(context):
         )
 
     if simulation:
-        domain = int(LaunchConfiguration("simulation_domain").perform(context))
+        domain = int(config("simulation_domain"))
         if not 0 <= domain <= 232:
             raise ValueError("simulation_domain 必须在 0～232 之间")
         actions.append(SetEnvironmentVariable("ROS_DOMAIN_ID", str(domain)))
@@ -59,7 +63,7 @@ def launch_setup(context):
                     "eli_cs_robot_driver",
                     "elite_control.launch.py",
                     {
-                        "cs_type": LaunchConfiguration("cs_type"),
+                        "cs_type": config("cs_type"),
                         "robot_ip": "127.0.0.1",
                         "use_fake_hardware": "true",
                         "launch_rviz": "false",
@@ -71,7 +75,7 @@ def launch_setup(context):
                     "eli_cs_robot_moveit_config",
                     "cs_moveit.launch.py",
                     {
-                        "cs_type": LaunchConfiguration("cs_type"),
+                        "cs_type": config("cs_type"),
                         "use_fake_hardware": "true",
                         "launch_rviz": "false",
                         "launch_servo": "false",
@@ -111,25 +115,25 @@ def launch_setup(context):
     else:
         actions.append(include(
             "eli_cs_robot_serial", "detactor.launch.py",
-            {"config_file": LaunchConfiguration("detactor_config_file"),
+            {"config_file": config("detactor_config_file"),
              "auto_request": "false", "data_directory": "~/.ros/eli_cs_robot_serial/detactor"},
-            condition=IfCondition(LaunchConfiguration("start_thickness_detector")),
+            condition=IfCondition(config("start_thickness_detector")),
         ))
         actions.append(
             include(
                 "eli_cs_robot_driver",
                 "elite_control.launch.py",
                 {
-                    "cs_type": LaunchConfiguration("cs_type"),
-                    "robot_ip": LaunchConfiguration("robot_ip"),
-                    "local_ip": LaunchConfiguration("local_ip"),
-                    "headless_mode": LaunchConfiguration("headless_mode"),
+                    "cs_type": config("cs_type"),
+                    "robot_ip": config("robot_ip"),
+                    "local_ip": config("local_ip"),
+                    "headless_mode": config("headless_mode"),
                     "use_fake_hardware": "false",
                     "launch_rviz": "false",
                     "initial_joint_controller": "scaled_joint_trajectory_controller",
                     "activate_joint_controller": "true",
                 },
-                condition=IfCondition(LaunchConfiguration("start_arm_driver")),
+                condition=IfCondition(config("start_arm_driver")),
             )
         )
         # 后续组件先收集起来，待驱动控制器与外控连接稳定后统一加载。
@@ -137,16 +141,16 @@ def launch_setup(context):
             "eli_cs_robot_usr",
             "compliant_control_real.launch.py",
             {
-                "cs_type": LaunchConfiguration("cs_type"),
+                "cs_type": config("cs_type"),
                 "launch_rviz": "false",
                 "auto_start_admittance": "false",
                 "admittance_enabled_on_startup": "false",
                 "launch_executor": "false",
                 "launch_coordinator": "false",
                 "launch_target_publisher": "false",
-                "launch_sensor": LaunchConfiguration("launch_force_sensor"),
+                "launch_sensor": config("launch_force_sensor"),
                 **{
-                    key: LaunchConfiguration(key)
+                    key: config(key)
                     for key in (
                         "sensor_host",
                         "sensor_port",
@@ -161,12 +165,13 @@ def launch_setup(context):
                 },
             },
         )
+    startup_action_count = len(actions)
     actions.append(
         Node(
             package="rviz2",
             executable="rviz2",
             name="detection_test_rviz",
-            condition=IfCondition(LaunchConfiguration("launch_rviz")),
+            condition=IfCondition(config("launch_rviz")),
             output="log",
             arguments=[
                 "-d",
@@ -194,6 +199,8 @@ def launch_setup(context):
                 executable="detect_controller.py",
                 name="detect_controller",
                 output="screen",
+                sigterm_timeout="3.0",
+                sigkill_timeout="2.0",
                 parameters=[
                     PathJoinSubstitution(
                         [FindPackageShare("detect_control"), "config", "detect.yaml"]
@@ -201,7 +208,7 @@ def launch_setup(context):
                     profile,
                     {
                         "targets_file": ParameterValue(
-                            LaunchConfiguration("targets_file"), value_type=str
+                            config("targets_file"), value_type=str
                         )
                     },
                 ],
@@ -210,24 +217,25 @@ def launch_setup(context):
                 package="robot_task_control",
                 executable="virtual_detection_task",
                 name="virtual_detection_task",
+                condition=IfCondition(config("start_test_task")),
                 output="screen",
                 parameters=[profile, {"simulation": simulation}],
             ),
         ]
     )
     if not simulation:
-        enabled = LaunchConfiguration("start_arm_control").perform(context).lower()
+        enabled = config("start_arm_control").lower()
         if enabled not in ("true", "false"):
             raise ValueError("start_arm_control 必须为 true 或 false")
         if enabled == "true":
             delay = float(
-                LaunchConfiguration("arm_control_start_delay").perform(context)
+                config("arm_control_start_delay")
             )
             if not math.isfinite(delay) or delay < 0:
                 raise ValueError("arm_control_start_delay 必须为有限非负秒数")
             # RViz、检测节点与 MoveIt 一并延后，避免挤占控制器加载阶段的 CPU。
-            stack = [control_stack, *actions[1:]]
-            actions = actions[:1]
+            stack = [control_stack, *actions[startup_action_count:]]
+            actions = actions[:startup_action_count]
             gate = Node(
                 package="eli_cs_robot_usr",
                 executable="auto_admittance_start.py",
@@ -274,6 +282,8 @@ def generate_launch_description():
                 description="true: start mock arm; false: start real arm and detection task.",
             ),
             DeclareLaunchArgument("simulation_domain", default_value="186"),
+            DeclareLaunchArgument("start_test_task", default_value="true",
+                                  description="false: 只启动检测驱动和控制系统，不自动发送旧测试点"),
             DeclareLaunchArgument("cs_type", default_value="ls65"),
             DeclareLaunchArgument("robot_ip", default_value="169.254.199.150"),
             DeclareLaunchArgument("local_ip", default_value="0.0.0.0"),
@@ -331,6 +341,7 @@ def generate_launch_description():
                     [
                         FindPackageShare("robot_task_control"),
                         "config",
+                        "tests",
                         "detection_test.yaml",
                     ]
                 ),

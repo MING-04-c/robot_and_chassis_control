@@ -3,6 +3,10 @@
 
 import json
 import math
+import os
+import signal
+import subprocess
+import sys
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
@@ -33,6 +37,7 @@ SUPPORTED_ACTIONS = set(CONTROL_COMMANDS) | {
     "arm_poses",
     "arm_move",
     "hk_capture",
+    "final_capture",
     "line_follow",
     "wait_chassis_stopped",
 }
@@ -44,6 +49,9 @@ class WorkflowController(Node):
         workflow_file = str(self.declare_parameter("workflow_file", "").value)
         if not workflow_file:
             raise ValueError("workflow_file parameter is required")
+        self.capture_process = None
+        self.capture_only = False
+        self.capture_config_file = str(self.declare_parameter("capture_config_file", "").value)
         self.workflow_path = Path(workflow_file).resolve()
         self.workflow = self.load_workflow(self.workflow_path)
         self.workflow_name = str(self.workflow.get("name", "unnamed_workflow"))
@@ -127,6 +135,7 @@ class WorkflowController(Node):
             Trigger, "/hk_image_transfer/ready"
         )
         self.capture_client = self.create_client(Trigger, "/dataset_capture/capture")
+        self.line_stream_client = self.create_client(SetBool, "/line_camera/camera_node/streaming")
         self.follow_status = None
         self.follow_status_time = None
         self.wheel_odom = None
@@ -202,13 +211,16 @@ class WorkflowController(Node):
         )
 
         self.stop_server = self.create_service(Trigger, "~/stop", self.on_stop_request)
+        self.capture_server = self.create_service(Trigger, "~/capture", self.on_capture_request)
         self.generation = 0
+        self.run_id = uuid4().hex
         self.execution_ids = {}
         self.cancelled_execution_ids = set()
         self.step_started = monotonic()
 
         self.active = self.auto_start
         self.failed = False
+        self.last_failure = ""
         self.step_index = 0
         self.phase = "ready"
         self.deadline_ns = 0
@@ -219,6 +231,10 @@ class WorkflowController(Node):
         self.waiting_for_wrench_logged = False
         self.arm_control_mode = None
         self.timer = self.create_timer(0.1, self.advance)
+        self.workflow_status_pub = self.create_publisher(
+            String, "~/status", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        )
+        self.create_timer(.5, self.publish_workflow_status)
         self.get_logger().info(
             f"Loaded workflow '{self.workflow_name}' with {len(self.steps)} steps "
             f"from {workflow_file}"
@@ -227,6 +243,23 @@ class WorkflowController(Node):
             self.get_logger().info("Workflow will start automatically")
         else:
             self.get_logger().info("Call /task_controller/start to begin")
+
+    def publish_workflow_status(self):
+        """发布任务状态快照，供工控机监听；不会触发任务。"""
+        step = self.current_step()
+        self.workflow_status_pub.publish(String(data=json.dumps({
+            "schema": "robot_workflow_status_v1",
+            "workflow": "camera_capture_only" if self.capture_only else self.workflow_name,
+            "capture_only": self.capture_only,
+            "run_id": getattr(self, "run_id", ""), "active": self.active,
+            "failed": self.failed, "failure_reason": self.last_failure,
+            "phase": self.phase,
+            "step_index": int(self.phase == "capture_complete") if self.capture_only else self.step_index,
+            "step_count": 1 if self.capture_only else len(self.steps),
+            "action": step["action"] if step else None,
+            "follow_state": self.follow_status,
+            "stamp_ns": self.get_clock().now().nanoseconds,
+        }, ensure_ascii=False)))
 
     @staticmethod
     def load_workflow(path):
@@ -255,6 +288,9 @@ class WorkflowController(Node):
             seconds = float(step.get("seconds", -1.0)) if action == "delay" else 0.0
             if action == "delay" and (not math.isfinite(seconds) or seconds < 0.0):
                 raise ValueError(f"workflow step {index} has invalid seconds")
+            if action == "final_capture" and "config_file" in step:
+                if not isinstance(step["config_file"], str) or not step["config_file"].strip():
+                    raise ValueError(f"workflow step {index} requires a valid config_file path")
             if action == "line_follow":
                 until_untrusted = step.get("until_untrusted", False)
                 if not isinstance(until_untrusted, bool):
@@ -402,22 +438,38 @@ class WorkflowController(Node):
             )
 
     def current_step(self):
+        if self.capture_only:
+            return None if self.phase == "capture_complete" else {
+                "action": "final_capture", "step_timeout_sec": 300.,
+                **({"config_file": self.capture_config_file} if self.capture_config_file else {}),
+            }
         if self.step_index >= len(self.steps):
             return None
         return self.steps[self.step_index]
 
     def on_start_request(self, request, response):
+        if self.workflow.get("camera_only", False):
+            return self.on_capture_request(request, response)
         del request
+        if self.capture_process is not None and self.capture_process.poll() is None:
+            response.success = False
+            response.message = "previous camera capture is still stopping"
+            return response
         if self.active:
             response.success = False
             response.message = "workflow is already running"
             return response
+        if self.capture_only:
+            self.capture_only = False
+            self.step_index = 0
         if self.step_index >= len(self.steps) and not self.failed:
             self.step_index = 0
         if self.failed:
             self.step_index = 0
             self.failed = False
         self.generation += 1
+        self.run_id = uuid4().hex
+        self.last_failure = ""
         self.mux_run_ready = not self.use_velocity_mux
         self.execution_ids.clear()
         self.cancelled_execution_ids.clear()
@@ -427,15 +479,41 @@ class WorkflowController(Node):
         self.phase = "ready"
         self.active = True
         self.reset_device_checks()
+        if self.line_stream_client.service_is_ready():
+            resume = SetBool.Request()
+            resume.data = True
+            self.line_stream_client.call_async(resume)
         response.success = True
         response.message = f"workflow '{self.workflow_name}' started"
         self.get_logger().info(response.message)
         return response
 
+    def on_capture_request(self, request, response):
+        del request
+        if self.active or (self.capture_process is not None and self.capture_process.poll() is None):
+            response.success = False
+            response.message = "任务或相机采集正在运行，不能并发单独采集"
+            return response
+        self.capture_only = True
+        self.active, self.failed = True, False
+        self.generation += 1
+        self.run_id = uuid4().hex
+        self.last_failure = ""
+        self.step_started = monotonic()
+        self.phase = "ready"
+        response.success = True
+        response.message = "camera capture accepted; run_id="+self.run_id
+        self.get_logger().info(response.message)
+        return response
+
     def on_stop_request(self, request, response):
         del request
+        capture_only = self.capture_only
         self.fail_workflow("stopped by user")
         response.success = True
+        if capture_only:
+            response.message = "Camera capture stop requested; motion drivers unchanged"
+            return response
         response.message = (
             "Stop requested for chassis and admittance; see controller logs"
         )
@@ -482,6 +560,60 @@ class WorkflowController(Node):
         self.checked_bool(future, "ready")
         if not self.failed:
             self.mux_run_ready = True
+
+    def advance_final_capture(self, step):
+        if self.phase == "ready":
+            from ament_index_python.packages import get_package_share_directory
+            config = Path(step.get("config_file") or (
+                Path(get_package_share_directory("robot_task_control")) / "config/capture/final_capture.yaml")).expanduser()
+            if not config.is_absolute():
+                config = self.workflow_path.parent / config
+            # 相机仅在这个步骤启动；重编码、保存和TCP不阻塞控制器ROS回调。
+            try:
+                self.capture_process = self.launch_capture_process(
+                    [sys.executable, "-m", "robot_task_control.final_capture",
+                     "--config", str(config.expanduser()), "--run-id", self.run_id,
+                     *(["--allow-no-line-camera"] if self.capture_only else [])],
+                )
+                self.phase = "final_capture_running"
+            except OSError as error:
+                self.fail_workflow(f"Cannot start final capture: {error}")
+        elif self.phase == "final_capture_running":
+            code = self.capture_process.poll()
+            if code is None:
+                return
+            self.capture_process = None
+            if code == 0:
+                self.get_logger().info("HK和RGB-D已采集并完成TCP发送")
+                self.complete_step()
+            else:
+                self.fail_workflow(f"任务末尾拍照/发送失败，退出码{code}；本地数据保留，查看采集日志和status.json")
+
+    def launch_capture_process(self, command):
+        return subprocess.Popen(command, start_new_session=True)
+
+    def stop_capture_process(self, wait=False):
+        process = self.capture_process
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            if wait:
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=3)
+
+    def destroy_node(self):
+        self.stop_capture_process(wait=True)
+        return super().destroy_node()
 
     def advance_hk_capture(self):
         if self.phase == "ready" and self.require_image_receiver:
@@ -530,6 +662,7 @@ class WorkflowController(Node):
             self.follow_last_tick = monotonic()
             self.follow_last_tracking = monotonic()
             self.follow_boundary_since = None
+            self.follow_station_confirm_since = None
             if not self.stop_pid_before_follow:
                 self.phase = "follow_select"
                 return
@@ -567,7 +700,20 @@ class WorkflowController(Node):
             if fresh and self.follow_status == "stop_marker_intermediate":
                 self.follow_last_tracking = now
                 self.follow_boundary_since = None
+                self.follow_station_confirm_since = None
                 return  # 等待 /line_follow/resume，新消息到达前既不完成也不累计行走时间。
+            if fresh and self.follow_status in (
+                    "stop_marker_settling", "stop_marker_confirming", "stop_marker_averaging", "stop_marker_overshoot",
+                    "stop_marker_missing", "stop_marker_unknown"):
+                if self.follow_station_confirm_since is None:
+                    self.follow_station_confirm_since = now
+                if now-self.follow_station_confirm_since > 5.0:
+                    self.fail_workflow("停止线位置在5秒内未稳定到停车容差内；保持停车，请检查位置误差")
+                    return
+                self.follow_last_tracking = now
+                self.follow_boundary_since = None
+                return  # 已输出零速，停车确认使用独立期限，不触发普通行走进度超时。
+            self.follow_station_confirm_since = None
             if fresh and self.follow_status in ("tracking", "stop_marker_approaching"):
                 self.follow_tracking_seconds += dt
                 self.follow_last_tracking = now
@@ -675,6 +821,13 @@ class WorkflowController(Node):
     def advance(self):
         if not self.active or self.failed:
             return
+        if self.capture_only:
+            # 独立拍照不启用底盘选择器、导纳或机器人动作，也不要求运动驱动在线。
+            if monotonic()-self.step_started > 300.:
+                self.fail_workflow("独立相机采集超过300秒；文件保留")
+            else:
+                self.advance_final_capture(self.current_step())
+            return
         if not self.devices_checked and not self.advance_device_checks():
             return
         step = self.current_step()
@@ -690,7 +843,9 @@ class WorkflowController(Node):
         now_ns = self.get_clock().now().nanoseconds
 
         if (action == "line_follow" and self.phase == "follow_tracking"
-                and self.follow_status == "stop_marker_intermediate"
+                and self.follow_status in (
+                    "stop_marker_intermediate", "stop_marker_settling", "stop_marker_confirming", "stop_marker_averaging",
+                    "stop_marker_overshoot", "stop_marker_missing", "stop_marker_unknown")
                 and self.follow_status_time is not None
                 and monotonic()-self.follow_status_time <= 1.0):
             # 只暂停人工站点等待的时钟；状态失联后仍恢复超时保护。
@@ -716,7 +871,9 @@ class WorkflowController(Node):
                 self.phase = "mux_enable_pending"
                 self.request_bool(self.mux_enable_client, True, self.on_mux_run_ready)
             return
-        if action == "hk_capture":
+        if action == "final_capture":
+            self.advance_final_capture(step)
+        elif action == "hk_capture":
             self.advance_hk_capture()
         elif action == "wait_chassis_stopped":
             self.advance_chassis_stopped(step, now_ns)
@@ -1308,12 +1465,23 @@ class WorkflowController(Node):
             self.fail_workflow(f"Robot motion failed: {response.message}")
 
     def complete_step(self):
+        if self.capture_only:
+            self.active = False
+            self.phase = "capture_complete"
+            self.get_logger().info("独立相机采集和TCP发送完成")
+            return
         self.step_started = monotonic()
         self.step_index += 1
         self.phase = "ready"
 
     def fail_workflow(self, message):
+        self.stop_capture_process()
+        self.last_failure = str(message)
         self.generation += 1
+        if self.capture_only:
+            self.failed, self.active, self.phase = True, False, "failed"
+            self.get_logger().error("独立相机采集失败："+str(message))
+            return
         for client in (self.mux_enable_client, self.follow_enable_client):
             if client.service_is_ready():
                 request = SetBool.Request()

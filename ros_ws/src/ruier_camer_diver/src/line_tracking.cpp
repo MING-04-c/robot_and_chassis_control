@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
 
@@ -75,6 +76,83 @@ cv::Vec2d robust_line(const std::vector<cv::Vec3d> & points)
   for (const auto & p : points) {intercepts.push_back(p[1] - slope * p[0]);}
   std::sort(intercepts.begin(), intercepts.end());
   return {intercepts.empty() ? 0 : intercepts[intercepts.size() / 2], slope};
+}
+
+// 先分离长横线的侧翼，保留主线交汇处的真实像素；原始掩膜另供停车识别。
+int separate_stop_bars(cv::Mat & mask, const LineConfig & config)
+{
+  const cv::Mat evidence = mask.clone();
+  const int width = mask.cols, height = mask.rows;
+  cv::Mat edges;
+  cv::Canny(evidence, edges, 40, 100);
+  std::vector<cv::Vec4i> lines;
+  // 横线边缘会被主线交汇处打断，允许跨过约一条胶带宽的边缘缺口。
+  cv::HoughLinesP(edges, lines, 1, CV_PI / 180, 30, width * .18, width * .08);
+  std::sort(lines.begin(), lines.end(), [](const auto & a, const auto & b) {
+      return std::hypot(a[2]-a[0], a[3]-a[1]) > std::hypot(b[2]-b[0], b[3]-b[1]);
+    });
+  std::vector<double> separated_y;
+  for (size_t index = 0; index < std::min<size_t>(lines.size(), 40); ++index) {
+    const auto & line = lines[index];
+    const double dx = line[2]-line[0], dy = line[3]-line[1];
+    if (std::abs(dx) < width*.18 || std::abs(dy) > .6*std::abs(dx)) {continue;}
+    const double middle_y = (line[1]+line[3])*.5, middle_x = (line[0]+line[2])*.5;
+    if (std::any_of(separated_y.begin(), separated_y.end(), [&](double y) {
+        return std::abs(y-middle_y) < height*.06;
+      })) {continue;}
+    const double length = std::hypot(dx, dy), band = std::max(8.0, height*.04);
+    std::vector<cv::Vec3d> sides[2];
+    // 横线两侧分别拟合主线，允许终点只有一侧存在主线，不把两侧曲率强行合成直线。
+    for (int y = std::max(0, int(middle_y-height*.25));
+      y < std::min(height, int(middle_y+height*.25)); y += config.row_step)
+    {
+      const auto * pixels = evidence.ptr<uint8_t>(y);
+      cv::Vec3d best;
+      double distance = width;
+      for (int x = 0; x < width;) {
+        if (!pixels[x]) {++x; continue;}
+        const int left = x;
+        while (x < width && pixels[x]) {++x;}
+        const int span = x-left;
+        const double center = (left+x-1)*.5;
+        if (span < config.min_line_width || span > width*.10 ||
+          std::abs(dx*(y-line[1])-dy*(center-line[0]))/length <= band*1.5) {continue;}
+        if (std::abs(center-middle_x) < distance) {
+          distance = std::abs(center-middle_x); best = {double(y), center, double(span)};
+        }
+      }
+      if (distance < width*.25) {sides[y > middle_y].push_back(best);}
+    }
+    const auto & support = sides[sides[1].size() > sides[0].size() ? 1 : 0];
+    if (support.size() < 8 || support.back()[0]-support.front()[0] < height*.10) {continue;}
+    const auto fit = robust_line(support);
+    // 主线与横线必须近似垂直，并且交点两侧确有横线侧翼。
+    if (std::abs(fit[1]*dx+dy)/(std::hypot(fit[1], 1)*length) > .42) {continue;}
+    const double fraction = (fit[0]+fit[1]*line[1]-line[0])/(dx-fit[1]*dy);
+    if (std::min(fraction, 1-fraction)*length < width*.035) {continue;}
+    std::vector<double> widths;
+    bool stable = true;
+    for (const auto & p : support) {
+      widths.push_back(p[2]);
+      if (std::abs(p[1]-fit[0]-fit[1]*p[0]) > std::max(6.0, p[2]*.6)) {stable = false;}
+    }
+    if (!stable) {continue;}
+    std::sort(widths.begin(), widths.end());
+    const double half_width = widths[widths.size()/2]*.6+2;
+    for (int y = std::max(0, int(std::min(line[1], line[3])-band));
+      y < std::min(height, int(std::max(line[1], line[3])+band+1)); ++y)
+    {
+      auto * pixels = mask.ptr<uint8_t>(y);
+      for (int x = std::max(0, int(std::min(line[0], line[2])-band));
+        x < std::min(width, int(std::max(line[0], line[2])+band+1)); ++x)
+      {
+        const double normal = std::abs(dx*(y-line[1])-dy*(x-line[0]))/length;
+        if (normal <= band && std::abs(x-fit[0]-fit[1]*y) > half_width) {pixels[x] = 0;}
+      }
+    }
+    separated_y.push_back(middle_y);
+  }
+  return static_cast<int>(separated_y.size());
 }
 
 void label(cv::Mat & image, const std::string & text)
@@ -213,6 +291,10 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
       auto * output = result.mask.ptr<uint8_t>(y);
       for (int x = 0; x < width; ++x) {output[x] = keep[ids[x]];}
     }
+  }
+  result.marker_mask = result.mask.clone();
+  if (config.separate_stop_bars) {
+    result.separated_stop_bars = separate_stop_bars(result.mask, config);
   }
   result.blue_fraction = double(cv::countNonZero(result.mask)) /
     (width * (result.roi_bottom - result.roi_top + 1));
@@ -575,63 +657,93 @@ LineResult track_blue_line(const cv::Mat & bgr, const LineConfig & config)
   result.target_y = result.roi_bottom - static_cast<int>(config.lookahead_ratio *
     (result.roi_bottom - result.roi_top));
 
-  int seed = width / 2, missing = 0;
-  bool have_valid_seed = false, stopped = false;
-  for (int y = result.roi_bottom; y >= result.roi_top; y -= config.row_step) {
-    ScanRow row;
-    row.y = y;
-    row.axis_coordinate = y;
-    row.seed = seed;
-    const auto * pixels = result.mask.ptr<uint8_t>(y);
-    int start = seed;
-    if (stopped || blue_interference) {
-      row.reason = blue_interference ? "too much blue" : "search stopped after gap";
-      row.left = 0; row.right = width - 1; row.center = (width - 1) / 2.0;
-    } else {
-      if (!pixels[start] && config.allow_reacquire) {
-        const int radius = have_valid_seed ? config.search_radius : config.initial_search_radius;
-        for (int offset = 1; offset <= radius; ++offset) {
-          // Conservative nearest-blue reacquisition, not global leftmost/rightmost pooling.
-          if (seed - offset >= 0 && pixels[seed - offset]) {start = seed - offset; break;}
-          if (seed + offset < width && pixels[seed + offset]) {start = seed + offset; break;}
-        }
-        row.reacquired = start != seed;
-      }
-      if (!pixels[start]) {
+  const auto scan_vertical = [&](bool reverse) {
+    int seed = width / 2, missing = 0;
+    bool have_valid_seed = false, stopped = false;
+    const int row_count = (result.roi_bottom - result.roi_top) / config.row_step + 1;
+    for (int index = 0; index < row_count; ++index) {
+      // 两次扫描使用完全相同的采样行，便于比较且不增加虚构观测。
+      const int y = result.roi_bottom -
+        (reverse ? row_count - 1 - index : index) * config.row_step;
+      ScanRow row;
+      row.y = y;
+      row.axis_coordinate = y;
+      row.seed = seed;
+      const auto * pixels = result.mask.ptr<uint8_t>(y);
+      int start = seed;
+      if (stopped || blue_interference) {
+        row.reason = blue_interference ? "too much blue" : "search stopped after gap";
         row.left = 0; row.right = width - 1; row.center = (width - 1) / 2.0;
-        row.reason = "seed outside blue";
       } else {
-        int left = start, right = start;
-        while (left > 0 && pixels[left - 1]) {--left;}
-        while (right < width - 1 && pixels[right + 1]) {++right;}
-        row.left = left; row.right = right;
-        row.left_point = {left, y}; row.right_point = {right, y};
-        row.cross_width = right - left + 1;
-        row.center = (left + right) / 2.0;
-        row.clipped = left == 0 || right == width - 1;
-        const int line_width = right - left + 1;
-        if (row.clipped) {row.reason = "boundary clipped";}
-        else if (line_width < config.min_line_width) {row.reason = "too narrow";}
-        else if (line_width > width * config.max_width_fraction) {row.reason = "too wide / bend / junction";}
-        else if (have_valid_seed && std::abs(row.center - seed) > config.max_center_jump) {
-          row.reason = "center jump / bend / junction";
-        } else {row.valid = true;}
+        if (!pixels[start] && config.allow_reacquire) {
+          const int radius = have_valid_seed ? config.search_radius : config.initial_search_radius;
+          for (int offset = 1; offset <= radius; ++offset) {
+            // Conservative nearest-blue reacquisition, not global leftmost/rightmost pooling.
+            if (seed - offset >= 0 && pixels[seed - offset]) {start = seed - offset; break;}
+            if (seed + offset < width && pixels[seed + offset]) {start = seed + offset; break;}
+          }
+          row.reacquired = start != seed;
+        }
+        if (!pixels[start]) {
+          row.left = 0; row.right = width - 1; row.center = (width - 1) / 2.0;
+          row.reason = "seed outside blue";
+        } else {
+          int left = start, right = start;
+          while (left > 0 && pixels[left - 1]) {--left;}
+          while (right < width - 1 && pixels[right + 1]) {++right;}
+          row.left = left; row.right = right;
+          row.left_point = {left, y}; row.right_point = {right, y};
+          row.cross_width = right - left + 1;
+          row.center = (left + right) / 2.0;
+          row.clipped = left == 0 || right == width - 1;
+          const int line_width = right - left + 1;
+          if (row.clipped) {row.reason = "boundary clipped";}
+          else if (line_width < config.min_line_width) {row.reason = "too narrow";}
+          else if (line_width > width * config.max_width_fraction) {row.reason = "too wide / bend / junction";}
+          else if (have_valid_seed && std::abs(row.center - seed) > config.max_center_jump) {
+            row.reason = "center jump / bend / junction";
+          } else {row.valid = true;}
+        }
       }
+      if (row.valid) {
+        ++result.valid_rows;
+        seed = std::clamp(static_cast<int>(std::round(row.center)), 0, width - 1);
+        have_valid_seed = true;
+        missing = 0;
+      } else {
+        ++result.rejected_rows;
+        // Keep the last valid seed. Never steer using an edge fallback midpoint.
+        // Empty rows before the first acquisition are not a tracking gap.
+        const int gap_limit = std::max({config.max_missing_rows, retained_gap_rows,
+          (config.max_occlusion_gap + config.row_step - 1) / config.row_step});
+        if (have_valid_seed && ++missing > gap_limit) {stopped = true;}
+      }
+      result.rows.push_back(row);
     }
-    if (row.valid) {
-      ++result.valid_rows;
-      seed = std::clamp(static_cast<int>(std::round(row.center)), 0, width - 1);
-      have_valid_seed = true;
-      missing = 0;
+    if (reverse) {std::reverse(result.rows.begin(), result.rows.end());}
+    return stopped;
+  };
+  const bool stopped = scan_vertical(false);
+  if (stopped && !result.horizontal && config.allow_reacquire && !blue_interference) {
+    // 横线可先拉偏底部种子，之后的长主线即使仍在掩膜内，也会被永久停止扫描。
+    // 在同一个已筛选掩膜内反向复核，选择实测跨度更长且采样更多的一次，不拼接两条路径。
+    auto original_rows = std::move(result.rows);
+    const int original_valid = result.valid_rows, original_rejected = result.rejected_rows;
+    result.rows.clear(); result.valid_rows = 0; result.rejected_rows = 0;
+    scan_vertical(true);
+    const auto span = [](const std::vector<ScanRow> & rows) {
+        int top = std::numeric_limits<int>::max(), bottom = -1;
+        for (const auto & row : rows) {
+          if (row.valid) {top = std::min(top, row.y); bottom = std::max(bottom, row.y);}
+        }
+        return bottom < 0 ? 0 : bottom - top;
+      };
+    if (result.valid_rows <= original_valid || span(result.rows) <= span(original_rows)) {
+      result.rows = std::move(original_rows);
+      result.valid_rows = original_valid; result.rejected_rows = original_rejected;
     } else {
-      ++result.rejected_rows;
-      // Keep the last valid seed. Never steer using an edge fallback midpoint.
-      // Empty rows before the first acquisition are not a tracking gap.
-      const int gap_limit = std::max({config.max_missing_rows, retained_gap_rows,
-        (config.max_occlusion_gap + config.row_step - 1) / config.row_step});
-      if (have_valid_seed && ++missing > gap_limit) {stopped = true;}
+      result.scan_reversed = true;
     }
-    result.rows.push_back(row);
   }
   if (result.horizontal && !blue_interference) {
     result.rows.clear(); result.valid_rows = 0; result.rejected_rows = 0;

@@ -42,6 +42,7 @@ public:
     DECLARE_INT(saturation_min); DECLARE_INT(value_min);
     DECLARE_VALUE(illumination_support);
     DECLARE_VALUE(local_brightness_normalization); DECLARE_VALUE(hough_join_support);
+    DECLARE_VALUE(separate_stop_bars);
     DECLARE_INT(weak_saturation_min); DECLARE_INT(weak_value_min); DECLARE_INT(weak_seed_pixels);
     DECLARE_VALUE(blue_excess_min);
     DECLARE_VALUE(strong_blue_excess_min); DECLARE_INT(weak_support_distance);
@@ -94,6 +95,7 @@ public:
             SET_INT(max_center_jump); SET_DOUBLE(max_width_fraction); SET_DOUBLE(max_blue_fraction);
             SET_INT(initial_search_radius); SET_INT(bottom_anchor_tolerance_rows);
             SET_BOOL(require_bottom_anchor);
+            SET_BOOL(separate_stop_bars);
             SET_INT(max_missing_rows); SET_INT(min_valid_rows);
             SET_DOUBLE(min_line_aspect); SET_DOUBLE(min_row_fill);
             SET_DOUBLE(min_row_coverage); SET_DOUBLE(max_shape_center_step);
@@ -121,6 +123,7 @@ public:
     const auto qos = rclcpp::SensorDataQoS().keep_last(1);
     debug_pub_ = create_publisher<sensor_msgs::msg::Image>("line/debug_image", qos);
     mask_pub_ = create_publisher<sensor_msgs::msg::Image>("line/mask", qos);
+    marker_mask_pub_ = create_publisher<sensor_msgs::msg::Image>("line/stop_marker_mask", qos);
     edges_pub_ = create_publisher<sensor_msgs::msg::Image>("line/edges", qos);
     path_pub_ = create_publisher<geometry_msgs::msg::PolygonStamped>("line/centerline", qos);
     estimated_pub_ = create_publisher<geometry_msgs::msg::PolygonStamped>("line/estimated_centerline", qos);
@@ -168,6 +171,8 @@ private:
          << ",\"inferred_rows\":" << (result ? result->inferred_rows : 0)
          << ",\"target_estimated\":" << (result && !lost && result->target_estimated ? "true" : "false")
          << ",\"orientation\":\"" << (result && result->horizontal ? "horizontal" : "vertical") << "\""
+         << ",\"scan_reversed\":" << (result && result->scan_reversed ? "true" : "false")
+         << ",\"separated_stop_bars\":" << (result ? result->separated_stop_bars : 0)
          << ",\"occlusion_suspected\":" << (result && !lost && result->occlusion_suspected ? "true" : "false")
          << ",\"occlusion_edge_pixels\":" << (result ? result->occlusion_edge_pixels : 0)
          << ",\"selected_candidate\":" << (result ? result->selected_candidate : 0)
@@ -251,6 +256,8 @@ private:
       }
       debug_pub_->publish(*cv_bridge::CvImage(message->header, "bgr8", result.debug).toImageMsg());
       mask_pub_->publish(*cv_bridge::CvImage(message->header, "mono8", result.mask).toImageMsg());
+      marker_mask_pub_->publish(
+        *cv_bridge::CvImage(message->header, "mono8", result.marker_mask).toImageMsg());
       if (config_.show_canny) {
         edges_pub_->publish(*cv_bridge::CvImage(message->header, "mono8", result.edges).toImageMsg());
       }
@@ -381,7 +388,7 @@ private:
   cv::Mat last_debug_, last_sample_image_;
   std::string sample_text_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_pub_, mask_pub_, edges_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_pub_, mask_pub_, marker_mask_pub_, edges_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PolygonStamped>::SharedPtr path_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PolygonStamped>::SharedPtr estimated_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;

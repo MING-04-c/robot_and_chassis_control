@@ -52,9 +52,12 @@ line_follow_controller:
     cmd_vel_topic: /cmd_vel
     stop_marker_enabled: true
     stop_marker_target_ratio: 0.5       # 原始相机处理画面高度中间，不是拼接预览的中间
-    stop_marker_position_tolerance_ratio: 0.01 # 高480时约±5像素；实际误差见状态
+    stop_marker_position_tolerance_ratio: 0.008 # 高480时约±3.8像素；以多帧平均位置判断
     stop_marker_slowdown_ratio: 0.25    # 距目标还有图高25%时开始接近减速
     stop_marker_creep_speed: 0.008      # m/s，近距离最低接近限速，不会抬高已有更低限速
+    stop_marker_average_frames: 5      # 同一横线最近5张新图像取算术平均
+    stop_marker_average_max_age_sec: 1.0 # 旧样本过期剔除，缺失帧不当作零误差
+    stop_marker_overshoot_tolerance_ratio: 0.02 # 平均位置轻微越过目标不超过图高2%也视为到达，不倒车
     stop_marker_min_span_ratio: 0.12    # 横线长度 / 图宽
     stop_marker_min_arm_ratio: 0.035    # 主线两侧必须分别伸出这么长 / 图宽
     stop_marker_angle_tolerance_rad: 0.26 # 横线与局部主线垂直误差约15度

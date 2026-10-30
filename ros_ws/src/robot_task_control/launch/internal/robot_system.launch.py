@@ -116,6 +116,7 @@ def generate_launch_description():
                 [
                     FindPackageShare("robot_task_control"),
                     "config",
+                    "capture",
                     "hk_capture.yaml",
                 ]
             ),
@@ -126,8 +127,8 @@ def generate_launch_description():
         ],
     )
     hk_transfer = Node(
-        package="robot_task_control",
-        executable="hk_image_transfer",
+        package="eli_cs_robot_serial",
+        executable="industrial_pc_hk_transfer.py",
         name="hk_image_transfer",
         output="screen",
         condition=IfCondition(LaunchConfiguration("start_image_transfer")),
@@ -198,7 +199,10 @@ def generate_launch_description():
                 "debug_image_topic": "/line_camera/line/debug_image",
                 "line_status_topic": "/line_camera/line/status",
                 "centerline_topic": "/line_camera/line/centerline",
-                "stop_marker_mask_topic": "/line_camera/line/mask",
+                "stop_marker_mask_topic": "/line_camera/line/stop_marker_mask",
+                "stop_marker_target_ratio": ParameterValue(
+                    LaunchConfiguration("line_stop_marker_target_ratio"), value_type=float
+                ),
                 "cmd_vel_topic": "/robot_control/line_follow/cmd_vel",
                 "forward_speed": ParameterValue(
                     LaunchConfiguration("line_follow_speed"), value_type=float
@@ -325,6 +329,7 @@ def generate_launch_description():
             DeclareLaunchArgument("hk_output_dir", default_value="~/robot_data/hk"),
             DeclareLaunchArgument("line_camera_device", default_value="/dev/video0"),
             DeclareLaunchArgument("line_follow_speed", default_value="0.075"),
+            DeclareLaunchArgument("line_stop_marker_target_ratio", default_value="0.5"),
             DeclareLaunchArgument("line_show_window", default_value="false"),
             DeclareLaunchArgument("line_adaptive_exposure", default_value="true"),
             DeclareLaunchArgument("line_image_forward_direction", default_value="down"),
@@ -381,7 +386,7 @@ def generate_launch_description():
                     [
                         FindPackageShare("robot_task_control"),
                         "config",
-                        "workflow.yaml",
+                        "line_follow_arm_test.yaml",
                     ]
                 ),
             ),

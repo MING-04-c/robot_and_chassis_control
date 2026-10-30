@@ -1,0 +1,8 @@
+# 独立相机模式：不加载机器人、CAN、循迹驱动；等待远程capture命令。
+workflow:
+  name: camera_capture_only
+  auto_start: false
+  camera_only: true
+  steps:
+    - action: final_capture
+      step_timeout_sec: 300.0

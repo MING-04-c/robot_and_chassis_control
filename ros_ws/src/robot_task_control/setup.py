@@ -10,10 +10,12 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml", "README.md"]),
-        ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
-        ("share/" + package_name + "/config", glob("config/*.yaml")),
+        *[("share/" + package_name + "/" + folder, glob(folder + "/*.launch.py"))
+          for folder in ("launch", "launch/internal", "launch/tests")],
+        *[("share/" + package_name + "/" + folder,
+           glob(folder + "/*.yaml") + glob(folder + "/*.json"))
+          for folder in ("config", "config/capture", "config/tests")],
         ("share/" + package_name + "/rviz", glob("rviz/*.rviz")),
-        ("share/" + package_name + "/tools", glob("tools/*.py")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -23,10 +25,12 @@ setup(
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
-            "hk_image_transfer = robot_task_control.hk_image_transfer:main",
+            "hk_image_transfer = industrial_pc_hk_transfer:main",
             "velocity_mux = robot_task_control.velocity_mux:main",
             "task_controller = robot_task_control.workflow_controller:main",
-            "virtual_detection_task = robot_task_control.virtual_detection_task:main",
+            "pixel_point_simulation = robot_task_control.testing.pixel_point_simulation:main",
+            "camera_detection_task = robot_task_control.camera_detection_task:main",
+            "virtual_detection_task = robot_task_control.testing.virtual_detection_task:main",
         ],
     },
 )

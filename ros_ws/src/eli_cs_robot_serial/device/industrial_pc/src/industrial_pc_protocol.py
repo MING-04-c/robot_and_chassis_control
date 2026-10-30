@@ -19,6 +19,23 @@ class ProtocolError(ValueError):
     """格式、完整性或签名校验失败。"""
 
 
+def validate_command(payload):
+    """校验任务/状态请求；只允许固定动作，不能传入任意 ROS 服务或系统命令。"""
+    identity = payload.get("message_id")
+    if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", identity):
+        raise ProtocolError("message_id 缺失或无效")
+    schema = payload.get("schema")
+    if schema == "paint_robot_status_request_v1":
+        if set(payload) != {"schema", "message_id"}:
+            raise ProtocolError("状态查询包含未知字段")
+        return "status"
+    if (schema != "paint_robot_task_request_v1" or
+            set(payload) != {"schema", "message_id", "action"} or
+            payload.get("action") not in ("start", "stop", "resume", "capture")):
+        raise ProtocolError("任务请求仅支持 start/stop/resume/capture")
+    return payload["action"]
+
+
 def validate_thickness(reading):
     """校验最新单值回包；时间是串口接收时间，不冒充仪器测量时间。"""
     if not isinstance(reading, dict) or reading.get("schema") != "paint_thickness_measurement_v1":
@@ -62,11 +79,11 @@ def load_key(path):
 
 
 def envelope(payload, key):
-    """为 payload 生成与现有结果文件一致的 SHA256/HMAC 封装。"""
+    """默认生成SHA256完整性封装；提供key时才追加兼容旧模式的HMAC。"""
     body = canonical(payload)
     return {"protocol": PROTOCOL, "payload": payload,
             "payload_sha256": hashlib.sha256(body).hexdigest(),
-            "hmac_sha256": hmac.new(key, body, hashlib.sha256).hexdigest()}
+            **({"hmac_sha256": hmac.new(key, body, hashlib.sha256).hexdigest()} if key is not None else {})}
 
 
 def _unique_object(pairs):
@@ -93,15 +110,17 @@ def decode(body):
 
 
 def authenticate(message, key):
-    """验证消息封装，返回已验证 payload；HMAC 覆盖规范 payload 字节。"""
+    """校验完整性并返回payload；仅显式提供key时验证HMAC。"""
     if message.get("protocol") != PROTOCOL or not isinstance(message.get("payload"), dict):
         raise ProtocolError("协议名称或 payload 无效")
     payload = message["payload"]
     body = canonical(payload)
-    for name, expected in (
-        ("payload_sha256", hashlib.sha256(body).hexdigest()),
-        ("hmac_sha256", hmac.new(key, body, hashlib.sha256).hexdigest()),
-    ):
+    checks = [("payload_sha256", hashlib.sha256(body).hexdigest())]
+    if key is not None:
+        checks.append(("hmac_sha256", hmac.new(key, body, hashlib.sha256).hexdigest()))
+    elif message.get("hmac_sha256"):
+        raise ProtocolError("当前为无密钥模式，请同步更新两端配置 use_shared_key=false")
+    for name, expected in checks:
         actual = message.get(name)
         if not isinstance(actual, str) or not hmac.compare_digest(actual, expected):
             raise ProtocolError(name + " 校验失败")

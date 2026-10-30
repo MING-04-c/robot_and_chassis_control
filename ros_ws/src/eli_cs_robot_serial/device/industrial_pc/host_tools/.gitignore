@@ -1,0 +1,6 @@
+industrial_pc.key
+received/
+__pycache__/
+*.py[cod]
+.legacy/
+received_clean/

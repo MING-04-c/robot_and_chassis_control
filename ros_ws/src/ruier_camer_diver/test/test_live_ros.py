@@ -7,6 +7,7 @@ Run from the workspace root after building and sourcing the install:
 import json
 from pathlib import Path
 import signal
+import sys
 import subprocess
 import time
 
@@ -26,6 +27,9 @@ from geometry_msgs.msg import PolygonStamped
 def main():
     package = Path(__file__).resolve().parents[1]
     workspace = package.parents[1]
+    sys.path.insert(0, str(package.parent / "masc_chassis_user_control/scripts"))
+    from stop_marker import detect_stop_markers
+    from line_follow_control import ControlConfig
     binary = workspace / "install/ruier_camer_diver/lib/ruier_camer_diver/line_tracker_node"
     process = subprocess.Popen([
         str(binary), "--ros-args", "-r", "__ns:=/line_integration_test",
@@ -37,6 +41,11 @@ def main():
         node = Node("line_integration_probe")
         bridge = CvBridge()
         status, debug, path, estimated = {}, [], [], []
+        masks, marker_masks = [], []
+        node.create_subscription(Image, "/line_integration_test/line/mask",
+                                 lambda m: masks.__setitem__(slice(None), [m]), qos_profile_sensor_data)
+        node.create_subscription(Image, "/line_integration_test/line/stop_marker_mask",
+                                 lambda m: marker_masks.__setitem__(slice(None), [m]), qos_profile_sensor_data)
         node.create_subscription(String, "/line_integration_test/line/status",
                                  lambda m: status.update(json.loads(m.data)), 10)
         node.create_subscription(Image, "/line_integration_test/line/debug_image",
@@ -154,12 +163,34 @@ def main():
         pump(lambda: bool(path) and any(p.y < 180 for p in path[0].polygon.points) and
              any(p.y > 330 for p in path[0].polygon.points) and
              all(not 220 < p.y < 280 for p in path[0].polygon.points), reflection)
+        for terminal in (False, True):
+            crossing = empty.copy()
+            end_y = round((330+27.5)/(1+37.5/479)) if terminal else 479
+            cv2.line(crossing, (330, 0), (round(330-150*end_y/479), end_y), (220, 80, 20), 24)
+            cv2.line(crossing, (100, 300), (460, 390), (220, 80, 20), 20)
+
+            def separated_and_detected():
+                if (status.get("lost") is not False or status.get("separated_stop_bars", 0) == 0
+                        or not masks or not marker_masks or not path):
+                    return False
+                if not (masks[0].header.stamp == marker_masks[0].header.stamp == path[0].header.stamp):
+                    return False
+                main = bridge.imgmsg_to_cv2(masks[0], desired_encoding="mono8")
+                marker = bridge.imgmsg_to_cv2(marker_masks[0], desired_encoding="mono8")
+                points = [(p.x, p.y) for p in path[0].polygon.points]
+                if len(points) < 35 or cv2.countNonZero(marker)-cv2.countNonZero(main) < 1000:
+                    return False
+                found = detect_stop_markers(marker, points, ControlConfig())
+                return any(m["kind"] == ("final" if terminal else "intermediate") for m in found)
+
+            pump(separated_and_detected, crossing)
         pump(lambda: status.get("state") == "STALE_FRAME", seconds=3)
         assert status["lost"] and status["error_pixels"] is None
         pump(lambda: bool(estimated) and not estimated[0].polygon.points, seconds=2)
         print("PASS: NO_FRAME -> TRACKING -> OCCLUDED -> PARTIAL -> noise rejected -> STALE_FRAME")
         print("PASS: real ROS Image dashboard, pixel path, null error when lost, empty path on loss")
         print("PASS: intersecting extensions retain both measured segments without fake gap pixels")
+        print("PASS: separate main/marker masks preserve slanted path and classify cross/T stops")
     finally:
         process.send_signal(signal.SIGINT) if process.poll() is None else None
         try:

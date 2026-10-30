@@ -6,6 +6,7 @@
 #include <cv_bridge/cv_bridge.hpp>
 #include <linux/videodev2.h>
 #include <memory>
+#include <functional>
 #include <opencv2/imgcodecs.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -14,6 +15,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <stdexcept>
 #include <string>
+#include <std_srvs/srv/set_bool.hpp>
 
 namespace camer_diver
 {
@@ -44,7 +46,10 @@ public:
               "framerate 1..240, jpeg_quality 1..100, nonempty frame_id and an enabled output required");
     }
 
-    capture_.open_device(device, width, height, fps, format);
+    open_capture_ = [this, device, width, height, fps, format]() {
+        capture_.open_device(device, width, height, fps, format);
+      };
+    open_capture_();
     RCLCPP_INFO(get_logger(), "Camera: %s (%s)", capture_.description().c_str(), device.c_str());
     if (capture_.width() != static_cast<uint32_t>(width) ||
       capture_.height() != static_cast<uint32_t>(height))
@@ -71,6 +76,27 @@ public:
     last_frame_ = std::chrono::steady_clock::now();
     // Nonblocking poll: the executor remains responsive to SIGINT and services.
     timer_ = create_wall_timer(std::chrono::milliseconds(2), [this]() {capture_and_publish();});
+    streaming_service_ = create_service<std_srvs::srv::SetBool>("~/streaming",
+      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+      std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+        try {
+          if (request->data && !streaming_) {
+            open_capture_();
+            last_frame_ = std::chrono::steady_clock::now();
+            timer_->reset();
+          } else if (!request->data && streaming_) {
+            timer_->cancel();
+            capture_.close_device();
+            frame_.data.clear();
+          }
+          streaming_ = request->data;
+          response->success = true;
+          response->message = streaming_ ? "USB streaming resumed" : "USB camera released";
+        } catch (const std::exception & error) {
+          response->success = false;
+          response->message = error.what();
+        }
+      });
   }
 
 private:
@@ -131,6 +157,9 @@ private:
   }
 
   V4L2Capture capture_;
+  std::function<void()> open_capture_;
+  bool streaming_ = true;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr streaming_service_;
   Frame frame_;
   std::string frame_id_;
   bool publish_raw_;

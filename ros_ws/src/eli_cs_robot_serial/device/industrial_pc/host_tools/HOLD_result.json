@@ -1,0 +1,18 @@
+{
+  "capture_format": "PI5_OR_ORBBEC_V54_ATTEMPT",
+  "capture_manifest_sha256": "b0a34f5cc07a0120bb6d93a48df4cec7b636449d8dfb1e3ddff15267eaad8467",
+  "capture_name": "data_test",
+  "coordinate_frame": "CAMERA_PINHOLE_PRELIMINARY",
+  "created_at_host": "2026-10-19T20:30:24+08:00",
+  "hold_reason": "TwoDHold: HOLD_MULTIPLE_SIZEABLE_PAINT_REGIONS",
+  "message_id": "986a442ccaaa4825844aab1c7ccebb1f",
+  "model_sha256": "5493163a88bc18b19abf7be7d47563a83b15b8fd5b1272e3a0f52ae88f40b7de",
+  "next_step": "WAIT_FOR_ROBOT_EXTRINSIC_CALIBRATION_BEFORE_MOTION",
+  "points_2d_uv": [],
+  "points_xyz_camera_mm": [],
+  "robot_base_coordinate_calibrated": false,
+  "robot_command": null,
+  "robot_motion_authorized": false,
+  "schema": "paint_v54_pi_remote_result_v1",
+  "status": "HOLD_NO_VALID_3D_POINTS"
+}

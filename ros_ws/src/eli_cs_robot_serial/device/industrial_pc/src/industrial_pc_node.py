@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""接收工控机三维检测结果；仅落盘和发布观测，不启动机械臂任务。"""
+"""工控机TCP桥接：检测点只发布观测；独立签名命令启动/停止/继续已加载任务。"""
 
 from datetime import datetime, timezone
 import hashlib
@@ -12,6 +12,7 @@ import signal
 import socket
 import threading
 import tempfile
+import time
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -19,11 +20,12 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import Pose, PoseArray
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
+from std_srvs.srv import Trigger
 
 from industrial_pc_protocol import (
     ProtocolError, authenticate, canonical, envelope, load_key, read_message,
-    validate_result, validate_thickness, validate_thickness_request, decode, write_message,
+    validate_result, validate_thickness, validate_thickness_request, validate_command, decode, write_message,
 )
 
 
@@ -40,7 +42,8 @@ class IndustrialPC(Node):
         self.frame = param("camera_optical_frame", "camera_color_optical_frame")
         self.publish_demo = param("publish_demo_points", True)
         self.output = Path(param("output_dir", "~/robot_data/industrial_pc/results")).expanduser()
-        self.key = load_key(param("key_file", "~/.config/robot_control/industrial_pc.key"))
+        key_file = param("key_file", "")
+        self.key = load_key(key_file) if param("use_shared_key", False) else None
         if (not 1 <= port <= 65535 or not math.isfinite(timeout) or timeout <= 0 or
                 not self.frame or self.frame != self.frame.strip()):
             raise ValueError("端口、超时或光学坐标系参数无效")
@@ -51,6 +54,19 @@ class IndustrialPC(Node):
         self.points_pub = self.create_publisher(PoseArray, "~/camera_points", 10)
         self.demo_pub = self.create_publisher(PoseArray, "~/demo_camera_points", 10)
         self.latest_thickness = None
+        self.observations = {}
+        self.last_result = None
+        self.pending_controls = {}
+        self.command_dir = self.output / "commands"
+        self.command_dir.mkdir(exist_ok=True)
+        self.start_task = self.create_client(Trigger, "/task_controller/start")
+        self.stop_task = self.create_client(Trigger, "/task_controller/stop")
+        self.capture_camera = self.create_client(Trigger, "/task_controller/capture")
+        self.resume_pub = self.create_publisher(Empty, "/line_follow/resume", 10)
+        self.create_subscription(String, "/task_controller/status",
+                                 lambda msg: self.cache_status("task", msg), retained)
+        self.create_subscription(String, "/line_follow/status",
+                                 lambda msg: self.cache_status("line_follow", msg), 10)
         self.create_subscription(String, "/detactor/measurement", self.on_thickness, retained)
         self.requests = queue.Queue(maxsize=16)
         self.stop_event = threading.Event()
@@ -67,11 +83,123 @@ class IndustrialPC(Node):
         self.thread = threading.Thread(target=self.serve, name="industrial-pc-tcp", daemon=True)
         self.thread.start()
         self.create_timer(0.02, self.process_requests)
+        self.create_timer(.1, self.check_control_timeouts)
         self.status("LISTENING", endpoint=f"{host}:{port}")
         self.get_logger().info(
             f"工控机结果接口监听 {host}:{port}；保存到 {self.output}；"
-            "演示数据与正式观测分话题发布，不发送机器人运动命令"
+            "检测点只发布观测；独立任务请求可调用已加载任务的 start/stop/resume/capture"
         )
+
+    def cache_status(self, name, message):
+        try:
+            self.observations[name] = (decode(message.data.encode("utf-8")), time.monotonic())
+        except ProtocolError:
+            pass
+
+    def robot_status(self):
+        """缓存不存在或过期时明确显示，不用旧状态冒充当前就绪。"""
+        output = {}
+        for name in ("task", "line_follow"):
+            value, received = self.observations.get(name, (None, None))
+            age = time.monotonic()-received if received is not None else None
+            output[name] = {"available": value is not None, "fresh": age is not None and age < 2,
+                            "age_seconds": age, "data": value}
+        return {**output, "latest_result": self.last_result,
+                "latest_thickness": self.thickness_snapshot(),
+                "start_service_ready": self.start_task.service_is_ready(),
+                "stop_service_ready": self.stop_task.service_is_ready(),
+                "capture_service_ready": self.capture_camera.service_is_ready()}
+
+    @staticmethod
+    def save_json(path, value):
+        """同目录原子落盘；命令回执必须先持久化，再回到网络线程。"""
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, mode="wb", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(canonical(value))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def finish_command(self, identity, ack):
+        entry = self.pending_controls.pop(identity, None)
+        if entry is None:
+            return
+        entry["record"]["ack"] = ack
+        try:
+            self.save_json(entry["path"], entry["record"])
+        except OSError as error:
+            ack = self.ack(False, message_id=identity, execution_unknown=True,
+                           reason="命令已提交，但回执保存失败："+str(error))
+        entry["job"]["ack"] = ack
+        entry["job"]["done"].set()
+
+    def check_control_timeouts(self):
+        for identity, entry in list(self.pending_controls.items()):
+            if time.monotonic() >= entry["deadline"]:
+                self.finish_command(identity, self.ack(
+                    False, message_id=identity, execution_unknown=True,
+                    reason="任务服务3秒内未回复；不要换新ID盲目重试，请先查询任务状态"))
+
+    def handle_command(self, job, packet, payload):
+        """固定接口桥接；同一ID永久去重，网络重试不会再次启动任务。"""
+        action = validate_command(payload)
+        identity = payload["message_id"]
+        if action == "status":
+            job["ack"] = self.ack(True, message_id=identity, robot_status=self.robot_status())
+            return False
+        path = self.command_dir / (hashlib.sha256(identity.encode()).hexdigest()+".json")
+        if path.exists():
+            record = decode(path.read_bytes())
+            if record.get("payload_sha256") != packet["payload_sha256"]:
+                raise ProtocolError("命令 message_id 已使用但内容不同")
+            job["ack"] = dict(record.get("ack") or self.ack(
+                False, message_id=identity, execution_unknown=True,
+                reason="该ID的命令仍在处理或曾被中断；查询状态，不重复执行"))
+            job["ack"]["disposition"] = "duplicate"
+            return False
+        # 在调用 ROS 之前写入 pending。进程若中途退出，同ID也不会再次执行。
+        record = {"payload_sha256": packet["payload_sha256"], "action": action, "ack": None}
+        self.save_json(path, record)
+        self.pending_controls[identity] = {"job": job, "record": record, "path": path,
+                                           "deadline": time.monotonic()+3}
+        job["deferred"] = True
+        if action == "resume":
+            line = self.robot_status()["line_follow"]
+            data = line["data"] or {}
+            if not line["fresh"] or data.get("state") != "stop_marker_intermediate":
+                self.finish_command(identity, self.ack(False, message_id=identity,
+                                    reason="当前不在有效途中停车等待状态，不能继续"))
+            else:
+                self.resume_pub.publish(Empty())
+                self.finish_command(identity, self.ack(True, message_id=identity,
+                                    action=action, disposition="published", robot_motion_authorized=True,
+                                    message="继续消息已发布，执行进展请查看状态"))
+            return True
+        client = {"start": self.start_task, "stop": self.stop_task,
+                  "capture": self.capture_camera}[action]
+        if not client.service_is_ready():
+            self.finish_command(identity, self.ack(False, message_id=identity,
+                                reason="任务服务未启动；请先在树莓派启动对应任务launch"))
+            return True
+        def finished(future):
+            try:
+                result = future.result()
+                ack = self.ack(bool(result.success), message_id=identity, action=action,
+                               message=result.message, disposition="executed",
+                               robot_motion_authorized=bool(result.success) and action != "capture")
+            except Exception as error:
+                ack = self.ack(False, message_id=identity, execution_unknown=True, reason=str(error))
+            self.finish_command(identity, ack)
+        try:
+            client.call_async(Trigger.Request()).add_done_callback(finished)
+        except Exception as error:
+            self.finish_command(identity, self.ack(False, message_id=identity, reason=str(error)))
+        return True
 
     def status(self, state, **fields):
         self.status_pub.publish(String(data=canonical({"state": state, **fields}).decode()))
@@ -136,6 +264,10 @@ class IndustrialPC(Node):
         try:
             packet = job["message"]
             payload = authenticate(packet, self.key)
+            if payload.get("schema") in ("paint_robot_task_request_v1", "paint_robot_status_request_v1"):
+                identity = payload.get("message_id", "")
+                self.handle_command(job, packet, payload)
+                return
             if payload.get("schema") == "paint_thickness_latest_request_v1":
                 validate_thickness_request(payload)
                 identity = payload["message_id"]
@@ -173,6 +305,7 @@ class IndustrialPC(Node):
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
             self.result_pub.publish(String(data=canonical(payload).decode()))
+            self.last_result = {"message_id": identity, "kind": kind, "point_count": len(points)}
             published = False
             if points and (kind != "demo" or self.publish_demo):
                 output = PoseArray()
@@ -196,8 +329,9 @@ class IndustrialPC(Node):
             self.get_logger().warning("工控机结果被拒绝：" + str(error))
         finally:
             # 结果接收 ACK 也附带此刻最新单值，主机不需要解析历史十值窗口。
-            job["ack"].setdefault("latest_thickness", self.thickness_snapshot())
-            job["done"].set()
+            if not job.get("deferred"):
+                job["ack"].setdefault("latest_thickness", self.thickness_snapshot())
+                job["done"].set()
 
     def close(self):
         self.stop_event.set()

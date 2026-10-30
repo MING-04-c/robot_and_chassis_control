@@ -25,7 +25,7 @@ def main():
         child = commands.add_parser(command)
         child.add_argument("--host", required=True, help="树莓派 IP")
         child.add_argument("--port", type=int, default=9010)
-        child.add_argument("--key-file", required=True)
+        child.add_argument("--key-file", default="", help="留空为默认无密钥模式")
         if command != "thickness":
             child.add_argument("--file", required=True, help="结果 JSON 或原始 DEMO_XYZ 文件")
         child.add_argument("--retries", type=int, default=2)
@@ -42,7 +42,7 @@ def main():
         return
     if not 0 <= args.retries <= 10:
         parser.error("--retries 必须在 0～10 之间")
-    key = load_key(args.key_file)
+    key = load_key(args.key_file) if args.key_file else None
     value = (decode(Path(args.file).expanduser().read_bytes())
              if args.command != "thickness" else None)
     if args.command == "thickness":

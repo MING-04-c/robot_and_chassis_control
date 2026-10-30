@@ -1,0 +1,33 @@
+camera_detection_task:
+  ros__parameters:
+    # Joint_1 已由用户确认为实际光心与光学轴，直接采用模型变换。
+    camera_frame: terminal_link_1
+    probe_frame: terminal_link_2
+    base_frame: base_link
+    # 模式由 launch 的 target_source 选择：默认 tcp；下面点位仅 local 模式使用。
+    # 本地测试点，相对于本次启动时相机光学坐标系，单位毫米。
+    # 沿用像素测试的数值，不表示旧照片目标在当前现场的位置。
+    # 多点按 x1,y1,z1,x2,y2,z2... 连续填写；每个点检测后返回初始位置。
+    camera_points_mm: [-5.370267016871055, -3.820746759094509, 275.0]
+    startup_timeout: 120.0
+    capture_timeout: 240.0
+    result_timeout: 300.0
+    contact_timeout: 600.0
+    # 记录位姿后、开始执行前，保持当前姿态，超限则取消本轮。
+    hold_position_tolerance: 0.001
+    hold_angle_tolerance_deg: 0.5
+    report_directory: ~/.ros/camera_detection
+
+detect_controller:
+  ros__parameters:
+    initial_position_enabled: false  # 使用启动时已经到达的拍照位置，不去旧测试点。
+    target_source: camera
+    targets_file: ~/.ros/detect_control/camera_detection_targets.yaml
+    approach_clearance: 0.02
+    approach_speed: 0.002
+    max_penetration: 0.005
+    contact_force: 20.0
+    overload_force: 40.0
+    hold_seconds: 5.0
+    velocity_scaling: 0.1
+    acceleration_scaling: 0.1

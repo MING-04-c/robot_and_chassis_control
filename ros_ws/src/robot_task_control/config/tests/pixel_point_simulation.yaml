@@ -1,0 +1,21 @@
+# 仅GenericSystem仿真：测量点为相机坐标，不直接当base_link坐标。
+pixel_point_simulation:
+  ros__parameters:
+    mount_to_optical_rpy_deg: [0.0, 0.0, 0.0]  # 临时假设光学轴与Joint_1安装轴一致，未实测
+    reference_joints: [0.3, -1.2, 2.4, -3.0, -1.57, 0.0]  # 仿真参考姿态，rad；光轴朝下，目标/预接近点数值可达
+    approach_clearance: 0.02
+    contact_force: 20.0
+    simulated_contact_force: 21.0  # 模拟力事件，不是Gazebo接触动力学或真实传感器
+    report_file: /tmp/pixel_point_simulation_report.json
+
+detect_controller:
+  ros__parameters:
+    initial_position_enabled: false
+    target_source: camera
+    targets_file: /tmp/pixel_point_simulation_targets.yaml
+    contact_force: 20.0
+    overload_force: 40.0
+    hold_seconds: 5.0
+    approach_clearance: 0.02
+    approach_speed: 0.002
+    max_penetration: 0.005

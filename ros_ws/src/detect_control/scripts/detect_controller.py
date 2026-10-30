@@ -13,6 +13,7 @@ import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from rclpy.signals import SignalHandlerOptions
@@ -205,7 +206,7 @@ class DetectController(Node):
         self.create_service(Trigger, "~/prepare_initial", self.prepare_initial)
         self.create_service(Trigger, "~/clear_targets", self.clear_targets)
         self.create_service(Trigger, "~/load_targets", self.load_targets)
-        self.create_timer(1 / self.cfg["rate"], self.tick)
+        self.tick_timer = self.create_timer(1 / self.cfg["rate"], self.tick)
         self.get_logger().info(
             "检测接口就绪；不会因收到目标而自动运动。接触阈值 20N 默认可配置。"
         )
@@ -1111,26 +1112,45 @@ class DetectController(Node):
 
 def main():
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    stopping, expedite = False, False
 
-    def interrupt(signum, frame):
-        raise KeyboardInterrupt
+    def interrupt(signum, _):
+        nonlocal stopping, expedite
+        expedite = expedite or stopping or signum == signal.SIGTERM
+        stopping = True
 
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)
-    node = DetectController()
+    node = None
+    executor = SingleThreadedExecutor()
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        # ROS context 仍有效时尽力发出取消和位置保持，不把进程退出当作停止确认。
-        if rclpy.ok() and node.active:
-            node.fail("节点退出")
-            end = monotonic() + 1.0
-            while monotonic() < end and node.stop_future is not None:
-                rclpy.spin_once(node, timeout_sec=0.05)
+        node = DetectController()
+        executor.add_node(node)
+        while rclpy.ok() and not stopping:
+            executor.spin_once(timeout_sec=.05)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        stopping = True
     finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            if node is not None:
+                node.tick_timer.cancel()
+                try:
+                    # 不在信号处理函数中打断 ROS 锁；先取消并请求当前位置保持。
+                    if rclpy.ok() and node.active:
+                        node.get_logger().info('收到退出请求，取消检测并请求当前位置保持')
+                        node.fail('节点退出')
+                        deadline = monotonic()+1.
+                        while (rclpy.ok() and not expedite and monotonic() < deadline
+                               and node.stop_future is not None and not node.stop_future.done()):
+                            executor.spin_once(timeout_sec=.05)
+                        if node.stop_future is not None and not node.stop_future.done():
+                            node.get_logger().warning('退出保持未确认；请检查机器人停止状态')
+                finally:
+                    executor.remove_node(node)
+                    node.destroy_node()
+        finally:
+            executor.shutdown(timeout_sec=.5)
+            rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

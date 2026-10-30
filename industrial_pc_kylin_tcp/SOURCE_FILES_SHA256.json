@@ -1,0 +1,21 @@
+{
+  ".gitignore": "de3521289a6d6c20878566b32056eb0ea7ac8b2864ef66b2c905736f93ce0d52",
+  "DEMO_XYZ_1200mm.json": "94e9134498b7f4063fdb234cd26f62b14d1ab31dc1cd90fa20155b17f3cdba53",
+  "DEMO_XYZ_800mm.json": "04f85b690b884f9f794e530324dc20ba4f0b144e0063f9edcec6e29c1385857d",
+  "HOLD_result.json": "f88f62e20329bc34d20e2c0157634b209a463f9b590688937273b45254bf5b1f",
+  "QUICKSTART.md": "84ef2725a33a98c1ef2565684b791a5932a49b24ab3567ea1e7229fc5b90422a",
+  "README.md": "7b0336d3592431aafbc010e47b3d30a12dbba1de61fc581bc1c59731b8ac32f9",
+  "TCP\u901a\u8baf\u534f\u8bae_\u9e92\u9e9f\u5de5\u63a7\u673a.md": "fb0508d2d9947a9453e7072887b443ab3e9d9e71fa2c74e125e995bb899810e0",
+  "capture_storage.py": "76651f7097133f7c891ddb2251a21bc72c616a79fe97da2e77fad3d6fd5899b9",
+  "capture_transfer.py": "250382a1e22c15e52c30a8ab8c1f0cc6bacfbbddbe16d8297ebddb0bc754fee5",
+  "config.json": "74e3f9b555477989ad2d837c9cf48bbe1c8f6065a54bb7e05c00ba5fe3dff8f8",
+  "industrial_pc_client.py": "28892660bdd54e40bb1ee0a4651155fab83b4163a5ae602124d0d34e3174304e",
+  "industrial_pc_hk_receiver.py": "a3c69411e5981e47f3ba251b991762d383605c5743ad657efdf05d121f67b77f",
+  "industrial_pc_network_test.py": "b0fb748205d66d6fd95a5b510d46f28be40169ce76e86ab6878e8125e9e3dc0a",
+  "industrial_pc_protocol.py": "f95ce3ea54b8c8a4a7bfac9c3ec58f9fc6d4efda203f4445841e0e5b05cf53aa",
+  "listen_robot.py": "fe1c06f9da59cd6fdc4d9368f8d2a39840be082e87b786fa662dd68455003459",
+  "robot_tcp_common.py": "32b25371bac481ffb70733527cd3342e6484e94dcafcdd9a66c7082ded2f5723",
+  "send_points.py": "e1b7cb40ce12ad0a499dedc7e3b5723f7f397b3c486a0bff51d4be0b24b98090",
+  "start_capture.py": "8ec58275f31344e40e7d60eb114f9071e03457a72783bde58a92ca19885ea418",
+  "start_task.py": "f70a6c29dfdfb07bf6b84e4f068805f006da9de43a7cdddea7cd6c213074a576"
+}

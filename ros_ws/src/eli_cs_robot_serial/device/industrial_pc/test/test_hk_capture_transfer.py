@@ -20,7 +20,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
-from robot_task_control.hk_image_transfer import CameraImageTcpNode, PhotoQueue
+from industrial_pc_hk_transfer import CameraImageTcpNode, PhotoQueue
 
 
 def load_file(name, path):
@@ -36,7 +36,7 @@ capture_module = load_file(
     / "lib/hik_camera_ros2_driver/dataset_capture_node.py",
 )
 receiver = load_file(
-    "receiver", Path(__file__).parents[1] / "tools/receive_camera_tcp.py"
+    "receiver", Path(__file__).resolve().parents[1] / "src/industrial_pc_hk_receiver.py"
 )
 
 

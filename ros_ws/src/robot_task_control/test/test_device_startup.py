@@ -30,7 +30,7 @@ class DeviceStartupTest(unittest.TestCase):
     def test_all_devices_before_any_task(self):
         config = (
             Path(__file__).resolve().parents[1]
-            / "config/arm_admittance_line_follow.yaml"
+            / "test/fixtures/arm_admittance_line_follow.yaml"
         )
         rclpy.init(
             args=[
@@ -276,7 +276,7 @@ class DeviceStartupTest(unittest.TestCase):
     def test_device_timeout_does_not_enter_task(self):
         config = (
             Path(__file__).resolve().parents[1]
-            / "config/arm_admittance_line_follow.yaml"
+            / "test/fixtures/arm_admittance_line_follow.yaml"
         )
         rclpy.init(
             args=[

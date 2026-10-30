@@ -35,6 +35,7 @@ def generate_launch_description():
     admittance = Node(
         package="eli_cs_robot_usr", executable="admittance_pose_controller",
         name="admittance_controller", output="screen",
+        sigterm_timeout="3.0", sigkill_timeout="2.0",
         parameters=[PathJoinSubstitution([usr, "config", "compliant_real.yaml"]),
                     PathJoinSubstitution([moveit_cfg, "config", "kinematics.yaml"]),
                     {"use_sim_time": False,

@@ -44,6 +44,19 @@ def observation(**updates):
 
 
 class ControlTests(unittest.TestCase):
+    def test_lookahead_does_not_jump_with_scan_row_phase(self):
+        config = ControlConfig()
+        targets = []
+        for phase in range(6):
+            points = [(320+.3*(y-200), y) for y in range(120+phase, 470, 6)]
+            geometry, reason = raw_tracking_geometry(points, 640, 480, config)
+            self.assertIsNone(reason)
+            targets.append((geometry['target_x'], geometry['target_y']))
+            self.assertAlmostEqual(geometry['target_y'], .4*479)
+            self.assertFalse(geometry['target_gap_interpolated'])
+        for target in targets[1:]:
+            self.assertAlmostEqual(target[0], targets[0][0])
+
     def test_bend_continuity_margin_keeps_supported_turn_and_rejects_large_gap(self):
         config = ControlConfig()
         near = [(300 + .4*(y-260), y) for y in range(150, 222, 6)]
@@ -248,10 +261,10 @@ class ControlTests(unittest.TestCase):
         self.assertEqual([m['kind'] for m in markers], ['intermediate', 'final'])
         gate = StopMarkerGate()
         for y in (290, 265, 240):
-            for _ in range(3):
+            for _ in range(7):
                 gate.observe([{'x': 320., 'y': float(y), 'kind': 'final'}], 480, config)
             gate.limit(.075, config)
-        for _ in range(3):
+        for _ in range(7):
             gate.observe([{'x': 320., 'y': 230., 'kind': 'final'}], 480, config)
         self.assertEqual(gate.limit(.075, config), (0., 'overshoot'))
         self.assertFalse(gate.resume(config))
@@ -259,7 +272,7 @@ class ControlTests(unittest.TestCase):
     def test_station_stays_stopped_until_new_resume_and_does_not_retrigger(self):
         config = ControlConfig()
         gate = StopMarkerGate()
-        def observe(y, kind='intermediate', count=3):
+        def observe(y, kind='intermediate', count=7):
             for _ in range(count):
                 gate.observe([{'x': 320., 'y': float(y), 'kind': kind}], 480, config)
         self.assertFalse(gate.resume(config))  # 提前到达的消息不能解锁未来站点。
@@ -269,7 +282,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(state, 'approaching')
         for y in (310, 290, 270, 250, 242):
             observe(y)
-        self.assertEqual(gate.limit(.075, config), (0., 'settling'))
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
         observe(242)
         self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
         self.assertEqual(gate.limit(.075, config)[0], 0.)
@@ -283,24 +296,140 @@ class ControlTests(unittest.TestCase):
         observe(330, 'final')
         for y in (310, 290, 270, 250, 240):
             observe(y, 'final')
-        self.assertEqual(gate.limit(.075, config), (0., 'settling'))
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_final'))
         observe(240, 'final')
         self.assertEqual(gate.limit(.075, config), (0., 'stopped_final'))
         self.assertFalse(gate.resume(config))
         self.assertEqual(gate.station_id, 2)
 
-    def test_marker_loss_near_target_stops_and_unknown_kind_does_not_guess_final(self):
+    def test_station_mean_filters_jitter_and_uses_tighter_tolerance(self):
         config = ControlConfig()
         gate = StopMarkerGate()
-        for _ in range(3):
-            gate.observe([{'x': 320., 'y': 280., 'kind': 'intermediate'}], 480, config)
+        def observe(error, count=1):
+            for _ in range(count):
+                gate.observe([{'x': 320., 'y': 240.+error, 'kind': 'intermediate'}], 480, config)
+        observe(0, 7)
+        self.assertEqual(gate.state(config), 'stopped_intermediate')
+        for error in (-8, 0, 0, 8, 0, 0):
+            observe(error)
+            self.assertEqual(gate.limit(.075, config)[0], 0.)
+        observe(-8, 7)  # 轻微越线在9.6像素内，按到达处理，不倒车。
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
+        observe(4, 7)  # 未到的一侧仍保持3.84像素容差。
+        self.assertGreater(gate.limit(.075, config)[0], 0.)
+        observe(-10, 7)
+        self.assertEqual(gate.limit(.075, config), (0., 'overshoot'))
+        self.assertFalse(gate.resume(config))
+        self.assertEqual(gate.station_id, 1)
+
+    def test_stopped_bar_position_uses_fixed_axis_but_still_detects_real_motion(self):
+        config = ControlConfig()
+        points = [(320+.3*(y-240), y) for y in range(24, 460, 6)]
+        mask = np.zeros((480, 640), np.uint8)
+        cv2.polylines(mask, [np.array(points, np.int32)], False, 255, 18)
+        cv2.line(mask, (220, 270), (420, 210), 255, 18)
+        reference = detect_stop_markers(mask, points, config)[0]
+        for shift in (-8, -4, 4, 8):
+            noisy_points = [(x+shift, y) for x, y in points]
+            markers = detect_stop_markers(mask, noisy_points, config, reference)
+            self.assertTrue(markers)
+            self.assertAlmostEqual(markers[0]['y'], reference['y'], delta=.5)
+        # 横线真的移动时，仍根据新图像更新位置，不能锁死旧坐标来掩盖过冲。
+        moved = cv2.warpAffine(mask, np.float32([[1, 0, 0], [0, 1, -8]]), (640, 480))
+        markers = detect_stop_markers(moved, points, config, reference)
+        self.assertTrue(markers)
+        self.assertLess(markers[0]['y']-reference['y'], -6)
+
+    def test_station_does_not_resume_using_marker_position_before_loss(self):
+        config = ControlConfig()
+        gate = StopMarkerGate()
+        marker = {'x': 320., 'y': 240., 'kind': 'intermediate'}
+        for _ in range(7):
+            gate.observe([marker], 480, config)
+        self.assertEqual(gate.state(config), 'stopped_intermediate')
         gate.observe([], 480, config)
         self.assertEqual(gate.limit(.075, config), (0., 'missing'))
-        for _ in range(3):
-            gate.observe([{'x': 320., 'y': 240., 'kind': 'unknown'}], 480, config)
-        self.assertEqual(gate.limit(.075, config), (0., 'settling'))
-        for _ in range(3):
-            gate.observe([{'x': 320., 'y': 240., 'kind': 'unknown'}], 480, config)
+        self.assertFalse(gate.resume(config))
+
+    def test_mean_position_controls_forward_and_accepts_slight_overshoot(self):
+        config = ControlConfig()
+        gate = StopMarkerGate()
+        def observe(y, count=7):
+            for _ in range(count):
+                gate.observe([{'x': 320., 'y': float(y), 'kind': 'intermediate'}], 480, config, now=0.)
+        observe(246)
+        self.assertEqual(gate.limit(.075, config), (config.stop_marker_creep_speed, 'approaching'))
+        self.assertFalse(gate.position_confirmed)
+        observe(242)
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
+        self.assertEqual(gate.station_id, 1)
+        observe(246)
+        self.assertGreater(gate.limit(.075, config)[0], 0.)  # 不再被历史停车标志锁住。
+        observe(230.4)  # 负向容差边界：恰好越过图高2%。
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
+        observe(230)
+        self.assertEqual(gate.limit(.075, config), (0., 'overshoot'))
+        self.assertFalse(gate.resume(config))
+        for bad in ({'stop_marker_average_frames': 2}, {'stop_marker_overshoot_tolerance_ratio': .004},
+                    {'stop_marker_average_max_age_sec': 0}, {'stop_marker_overshoot_tolerance_ratio': .11}):
+            with self.assertRaises(ValueError):
+                replace(config, **bad).validate()
+
+    def test_five_frame_mean_decides_stop_instead_of_single_frame(self):
+        config = ControlConfig()
+        gate = StopMarkerGate()
+        values = []
+        for error in (6, 6, -3, 6, 6):
+            values.append(error)
+            gate.observe([{'x': 320., 'y': 240.+error, 'kind': 'intermediate'}], 480, config)
+            self.assertGreater(gate.limit(.075, config)[0], 0.)
+            self.assertFalse(gate.position_confirmed)
+        self.assertAlmostEqual(gate.snapshot(config)['error_ratio']*480, 4.2)
+        for error in (-3, 6, -3, 6, -3, 6, -3):
+            values.append(error)
+            gate.observe([{'x': 320., 'y': 240.+error, 'kind': 'intermediate'}], 480, config)
+            self.assertAlmostEqual(gate.error*480, sum(values[-5:])/5)
+        self.assertEqual(gate.state(config), 'stopped_intermediate')
+        self.assertEqual(gate.station_id, 1)
+        self.assertEqual(gate.snapshot(config)['filter'], 'arithmetic_mean')
+
+    def test_mean_stop_converges_from_either_side_in_both_image_directions(self):
+        # 合成像素运动只用于验证反馈符号和收敛，不是实际相机的米制标定。
+        for direction in ('down', 'up'):
+            config = replace(ControlConfig(), image_forward_direction=direction, stop_marker_target_ratio=.46)
+            forward = 1. if direction == 'down' else -1.
+            for initial_error in (12., -8.):
+                gate, error = StopMarkerGate(), initial_error
+                for index in range(400):
+                    now = index*.05
+                    marker = {'x': 320., 'y': 480*.46+forward*error, 'kind': 'intermediate'}
+                    gate.observe([marker], 480, config, now=now)
+                    speed, state = gate.limit(.075, config)
+                    self.assertGreaterEqual(speed, 0.)
+                    error -= speed*1000*.05
+                    if state == 'stopped_intermediate':
+                        break
+                self.assertEqual(state, 'stopped_intermediate', (direction, initial_error, error))
+                self.assertEqual(speed, 0.)
+                self.assertGreaterEqual(error, -.02*480)
+                self.assertLessEqual(error, .008*480)
+                self.assertEqual(gate.station_id, 1)
+
+    def test_average_discards_old_samples_and_missing_frames_do_not_count_as_zero(self):
+        config = ControlConfig()
+        gate = StopMarkerGate()
+        marker = {'x': 320., 'y': 246., 'kind': 'unknown'}
+        for _ in range(5):
+            gate.observe([marker], 480, config, now=0.)
+        gate.observe([], 480, config, now=.1)
+        self.assertEqual(gate.limit(.075, config), (0., 'missing'))
+        self.assertAlmostEqual(gate.error*480, 6.)
+        gate.observe([marker], 480, config, now=2.)
+        self.assertEqual(len(gate.samples), 1)
+        self.assertFalse(gate.position_confirmed)
+        marker['y'] = 240.
+        for _ in range(8):
+            gate.observe([marker], 480, config, now=2.)
         self.assertEqual(gate.limit(.075, config), (0., 'stopped_unknown'))
         self.assertFalse(gate.resume(config))
 

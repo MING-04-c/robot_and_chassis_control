@@ -423,6 +423,9 @@ class LocalControlTest(unittest.TestCase):
         self.assertEqual(len(captures), 1)
 
     def test_marker_station_wait_pauses_timeout_and_requires_final_marker(self):
+        workflow_states = []
+        self.node.create_subscription(String, '/task_controller/status',
+                                      lambda msg: workflow_states.append(json.loads(msg.data)), 10)
         mux = VelocityMux()
         self.executor.add_node(mux)
         self.addCleanup(mux.destroy_node)
@@ -449,6 +452,14 @@ class LocalControlTest(unittest.TestCase):
         self.controller.on_start_request(Trigger.Request(), Trigger.Response())
         self.wait_for(lambda: flags['following'], 1.5)
         self.pump(.2)
+        flags['state'] = 'stop_marker_settling'
+        self.pump(.8)  # 停车确认可以超过普通0.4秒进度超时，仍保持零速等待。
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.controller.failed)
+        self.assertTrue(workflow_states)
+        self.assertTrue(workflow_states[-1]['active'])
+        self.assertEqual(workflow_states[-1]['action'], 'line_follow')
+        self.assertTrue(workflow_states[-1]['run_id'])
         flags['state'] = 'stop_marker_intermediate'
         self.pump(2.3)  # 超过总超时和进度超时，人工站点等待仍不能结束或失败。
         self.assertTrue(self.controller.active)
@@ -470,6 +481,21 @@ class LocalControlTest(unittest.TestCase):
         flags['state'] = 'insufficient_forward_span'
         self.wait_for(lambda: self.controller.failed, 1)
         self.assertEqual(self.controller.step_index, 0)
+        # 一直无法确认位置也不能无限等待；5秒确认期限到后保持停车并明确失败。
+        self.controller.steps = [step]
+        self.controller.on_start_request(Trigger.Request(), Trigger.Response())
+        flags['state'] = 'stop_marker_settling'
+        self.wait_for(lambda: flags['following'], 1.5)
+        for index in range(24):
+            if self.controller.failed:
+                break
+            flags['state'] = ('stop_marker_settling', 'stop_marker_missing',
+                              'stop_marker_overshoot')[index % 3]
+            self.pump(.25)  # 不同确认失败状态之间跳转也不能反复重置5秒期限。
+        self.assertTrue(self.controller.failed)
+        self.wait_for(lambda: not flags['following'], 1)
+        self.wait_for(lambda: workflow_states[-1]['failed'], 1)
+        self.assertIn('5秒', workflow_states[-1]['failure_reason'])
 
     def test_minimal_profiles_without_distance_pid(self):
         # Exercise the actual three YAML files with no PID service available.
@@ -557,7 +583,7 @@ class LocalControlTest(unittest.TestCase):
             with self.subTest(profile=name):
                 arm_expected[0] = with_arm
                 config = WorkflowController.load_workflow(
-                    Path(__file__).parents[1] / "config" / f"{name}.yaml"
+                    Path(__file__).parents[1] / ("test/fixtures" if name == "arm_admittance_line_follow" else "config") / f"{name}.yaml"
                 )
                 self.controller.steps = config["steps"]
                 until_boundary[0] = name == "line_follow_only"
