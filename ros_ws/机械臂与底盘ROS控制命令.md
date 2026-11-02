@@ -21,6 +21,8 @@ source install/setup.bash
 
 不需要额外 source `scripts/raspberry_pi_env.bash`。默认地址：机器人 `169.254.199.150`，力传感器 `169.254.199.80:9001`，树莓派 `169.254.199.100`，麒麟 `169.254.199.120`。
 
+单独连接真机时，`ros2 launch eli_cs_robot_driver elite_control.launch.py` 已默认自动完成 dashboard 上电、待机、释放抱闸、确认 RUNNING，再启动控制器；不再需要另开终端调用 power_on/brake_release。原有 IP、型号参数不变；仿真硬件不执行上电操作。只需连接、暂不自动上电时可加 `auto_power_on:=false`。
+
 ## 2. 入口速查
 
 以下均在树莓派执行，命令前缀是 `ros2 launch robot_task_control`。
@@ -28,7 +30,7 @@ source install/setup.bash
 | 文件名 | 功能 | 是否自动开始 |
 |---|---|---|
 | arm_admittance_only.launch.py | 机械臂导纳 | 是 |
-| line_follow_only.launch.py | 底盘循迹 | 就绪后自动 |
+| line_follow_only.launch.py | 前进/后退循迹 | 就绪后自动 |
 | keyboard_teleop.launch.py | 底盘键盘 | 按键控制 |
 | line_follow_arm_test.launch.py | 整体联动：循迹、四点运动、末尾拍照发送 | 默认是；remote_control:=true 等主机 start |
 | camera_capture_remote.launch.py | 只采图发送 | 否，主机发 capture |
@@ -59,6 +61,25 @@ ros2 launch robot_task_control line_follow_only.launch.py \
   line_camera_device:=/dev/video0 line_show_window:=true line_follow_speed:=0.075
 ```
 
+倒车原路返回：先执行上面的前进循迹，到站锁停并实际停稳，看到“前进路线已停稳保存”后关闭旧 launch，保持小车位置、朝向不变，再启动：
+
+```bash
+ros2 launch robot_task_control line_follow_only.launch.py drive_direction:=reverse line_show_window:=true
+```
+
+前进会自动把实际里程计路线保存到 `~/.ros/line_follow/last_route.json`（至少10cm，结束并停稳后标记为有效；行驶中草稿不可用于倒车）。倒车默认用记录路线控制车后轨迹，在可信直线段加入小幅视觉横移修正，同时通过前置相机横线暂停；图像丢线不当作正常倒车结束。默认7.5cm/s，上限8cm/s，`line_follow_speed:=0.04` 可调慢；剩余60cm内连续确认近端可纠偏、剩余路径为小弯/直线且转向速率稳定后切相机找中心；未满足条件时最后30cm减速对齐，不按距离强制接管（最多3cm/s），末段未居中时先停纵向、横移回中并旋转摆正，连续3帧合格后再倒向横线；横线到位且对齐确认通过才完成返程。驱动重启归零时会将记录终点对齐当前里程计，前提是中间没有移动小车。默认 `route_visual_strafe=true`，横移上限2.5cm/s、旋转上限0.06rad/s；横向偏差不再用倒车画弧线追回。`reverse_steering_sign` 仅在旧相机模式整体反号，不影响前段记录路线追踪。
+
+两个命令可用同一个 `route_file:=/绝对路径/route.json` 指定文件。倒车状态为 `reverse_route_tracking` / `reverse_visual_finish_aligning`（横移/摆正，纵向已停）/ `reverse_route_complete`，剩余距离见 `/line_follow/status`；路线可通过 `/line_follow/recorded_path` 在 RViz 查看。没有有效路线、里程计超时/跳变、偏离超限时停车。默认回程在新横线处居中锁停，等待继续消息；视觉阶段中剩余30cm内的横线按终点处理，不再等待继续；里程计到起点而未见横线时最多再后退10cm，超限故障停车。相机配对数据超时也暂停。里程计会有漂移，不能据2cm判定容差承诺实车精度。
+
+
+倒车横线暂停后继续（工控机发送 `resume`，不是重复启动任务）：
+
+```bash
+ros2 topic pub --once /line_follow/resume std_msgs/msg/Empty '{}'
+```
+
+同一出发横线会去重。仅回归原里程计倒车可在启动命令增加 `route_camera_stop:=false`；默认启用，不额外启动摄像头进程。
+
 默认驱动和视觉就绪后自动开始，不需要调用 start 服务。若只想预览、暂不行走，启动时加 `auto_start:=false`。
 
 途中站继续：
@@ -67,7 +88,7 @@ ros2 launch robot_task_control line_follow_only.launch.py \
 ros2 topic pub --once /line_follow/resume std_msgs/msg/Empty '{}'
 ```
 
-十字形中途站停车后才接受继续；最终 T 形站不恢复。单独循迹停车位置默认图高46%，改为正中可传 `line_stop_marker_target_ratio:=0.5`。窗口 `CONTROL: disabled` 时先检查任务是否启动；`LAST BLOCK` 是上一次阻塞原因。[循迹逻辑说明](docs/chassis/LINE_FOLLOW_REFERENCE_20261029.md)。
+十字形中途站停车后才接受继续；最终 T 形站不恢复。到位状态锁定，后续漏检和图像超时不会把已到站改回寻找横线；途中站继续仍需当前输入有效且横线可见。单独循迹停车位置默认图高46%，位置允许提前图高3%或越线6%（480高约提前14px、越线29px），三帧平均、两次有效到位确认；改为正中可传 `line_stop_marker_target_ratio:=0.5`。窗口 `CONTROL: disabled` 时先检查任务是否启动；`LAST BLOCK` 是上一次阻塞原因。[循迹逻辑说明](docs/chassis/LINE_FOLLOW_REFERENCE_20261029.md)。
 
 底盘键盘：
 
@@ -324,3 +345,37 @@ ros2 launch robot_task_control line_follow_arm_test.launch.py remote_control:=tr
 ```
 
 文中 `config/` 相对路径均位于 `src/robot_task_control/`。配置目录按常用流程、capture和tests分开；旧remote入口统一为 `line_follow_arm_test.launch.py remote_control:=true`。
+
+循迹正常前进设定仍为 0.075 m/s。实测近端已覆盖前瞻点时，不因更远处断线或重复的疑似遮挡标记额外降速。停止横线尚远、主线有效时，确认过的横线漏检最多以 0.008 m/s 缓行 0.6 秒，并受同次漏检5mm速度指令积分限值约束；接近停车容差、持续漏检或主线丢失仍停车。相关参数在 `masc_chassis_user_control/config/line_follow.yaml` 的 `stop_marker_dropout_grace_sec`，设为 0 关闭短时缓行。
+
+直线回中：默认允许半图宽4%的偏差（640宽约13px）；连续5张新图持续偏向同一侧并超过约19px时，允许小幅转向慢慢回中。弯道中心死区仍放宽至半图宽30%，无需另调开关或调用服务。查看日志 `centering=true` 可确认持续偏移纠正正在生效；这不改变停车横线的到位容差。
+
+记录路线倒车已取代旧的前置相机倒车；旧横线离站与反号参数不参与默认回程控制。
+
+横线漏停排查：`/line_follow/status` 的 `stop_detection` 显示长线候选数量及拒绝原因；移动时5秒一次的 `Steering` 日志含 `stop_candidates`、`stop_rejected`。短横臂合并已撤回；转向平滑及到位锁停保持原有设置。
+
+倒车最后直线默认 `route_visual_finish:=true`，进入时日志显示“进入最后相机倒车”。前段横线停车仍用 `resume` 继续；最后视觉阶段要求横线到位且连续3帧对齐确认通过才报 `reverse_route_complete`；未对齐仍可横移/摆正，不会继续纵向越线。若报 `reverse_finish_search_limit` 表示超过允许的找线范围，并非正常完成。只关闭最后视觉纠偏可传 `route_visual_finish:=false`，此时保留相机途中横线保险并按里程计起点终停。
+
+前进横线也执行目标保持和提前零速确认：已经发现的停车目标漏检时不换追下一条，最新观测进入容差便先停稳等多帧确认。途中站仍等 `resume`，最终站结束；不改变前进巡航速度及弯道控制参数。
+
+启动前进时已经停在横线上，会自动略过当前这根出发横线并行走，不用发送 `resume`；下一条横线仍正常停车。运行途中已停车的站点继续仍使用 `/line_follow/resume`。启动时尚在远处的横线不属于出发线，会正常靠近停车。
+
+前进停在途中横线时，即使任务仍启用并等待继续，实际反馈速度归零后也自动保存有效返回路线，日志显示“前进路线已停稳保存”。发送继续消息前会立即把快照恢复为行驶中无效状态。退出ROS时保留已确认的停稳快照，不因时钟已关闭或最后一帧超时清除有效标记；未确认停稳的记录不会因此升级为可返回。
+
+### 循迹站点记录
+
+每次任务按行驶顺序编号横线，终端和画面显示识别、忽略、到站、通过数量；途中站继续后保留计数，同一根横线漏检后重新出现不会重复登记。当前计数及历史见 `/line_follow/status`，新事件见 `/line_follow/station_events`。本轮日志保存到 `~/.ros/line_follow/last_station_log.json`；前进路线同时记录站点事件，下一轮倒车可查看前进站点逆序。旧路线没有这部分记录时，不能从旧文件恢复场地总横线数，需要下一轮前进采集。途中站仍等待新开始/继续消息，增加记录不改变停车规则。
+
+倒车地面映射可选配置：`masc_chassis_user_control/config/line_follow.yaml` 的 `reverse_ground_mapping_file` 指定实测对应点JSON。为空时界面及状态标明 `image_uncalibrated`，只按图像误差伺服；有实测映射时显示 `ground_meters`。文件格式、实测坐标要求见该功能包 README 的“可选实测地面映射”，勿直接使用示例坐标。
+
+## 自动前进循迹、执行中间任务、倒车返回
+
+```bash
+ros2 launch robot_task_control line_follow_only.launch.py round_trip:=true line_show_window:=true
+```
+
+启动后自动前进；途中横线仍等待开始/继续消息，最终横线才结束前进。任务随后确认底盘停稳、封存路线、执行中间步骤，最后切换倒车；返程途中站自动继续，只在原出发点完成。路线只记录本轮前进，不把中间等待或机械臂/TCP处理追加进去。
+
+流程在 `src/robot_task_control/config/line_follow_round_trip.yaml`，当前中间步骤为2秒等待。后续把已有机械臂/采集/TCP动作插入 `save_line_route` 与 reverse步骤之间即可，必须等待动作成功完成才开始倒车。该测试入口没有启动机械臂和TCP进程。不要在中间重启底盘驱动、清零里程计或另外启动前进录制。
+
+封存文件保留在 `~/.ros/line_follow/snapshots/last_route_*.json`，本轮路径也发布到 `/task_controller/status` 的 `route_checkpoint_file`。即使后续启动新一轮前进、覆盖 `last_route.json`，已封存副本仍保留。发现等待期间底盘被移动或里程计不连续时，会拒绝自动套用旧路线。

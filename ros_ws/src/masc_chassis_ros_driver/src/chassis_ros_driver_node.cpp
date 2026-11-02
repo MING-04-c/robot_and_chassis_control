@@ -489,6 +489,15 @@ void ChassisRosDriverNode::CommandTimerCallback() {
         m_auto_lock_controller.Reset();
         return;
     }
+    const double command_age_ms = has_command ? SecondsBetween(stamp, now)*1000.0 : 0.0;
+    const bool timed_out = has_command && command_age_ms > m_command_filter_config.m_timeout_ms;
+    if (timed_out && !m_command_timeout_reported) {
+        MCHASSIS_WARN(this, "cmd_vel timeout: age=%.1fms, limit=%dms; sending zero velocity",
+                      command_age_ms, m_command_filter_config.m_timeout_ms);
+    } else if (!timed_out && m_command_timeout_reported) {
+        MCHASSIS_INFO(this, "cmd_vel reception recovered; age=%.1fms", command_age_ms);
+    }
+    m_command_timeout_reported = timed_out;
     auto command = m_command_filter.BuildCommand(twist, has_command, stamp, now);
     const auto auto_lock_result = m_auto_lock_controller.Update(BuildAutoLockInput(command, now));
     SendAutoLockMotionModeRequest(auto_lock_result);

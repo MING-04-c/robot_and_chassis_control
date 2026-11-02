@@ -2,6 +2,49 @@ line_follow_controller:
   ros__parameters:
     enabled: true                    # 有效蓝线和底盘反馈到齐后开始循迹
     forward_speed: 0.075              # m/s：7.5 cm/s，可在线调整
+    drive_direction: forward          # forward/reverse；前置相机安装方向不随倒车修改
+    reverse_max_speed: 0.04            # 前置相机后退速度绝对值上限，m/s
+    reverse_mode: recorded_route # 默认倒车跟踪前进里程计路线，camera仅保留旧测试模式
+    record_route: true
+    route_visual_finish: true # 最后直线使用相机对线找横线，找到才正常完成
+    route_visual_strafe: true # 已确认底盘可横移：回中用vy，摆正用w；倒车不反转横移方向
+    route_visual_lateral_speed: 0.025 # m/s，末段横移上限；途中可信直线段再限为0.01
+    route_visual_min_lateral_speed: 0.012 # m/s，纠偏有效速度高于底盘0.01零速判定；到容差内直接停
+    route_visual_min_angular_speed: 0.02 # rad/s，摆正时有效转速；到角度容差内直接停
+    route_visual_lateral_gain: 0.5 # 仅标定后的地面米制偏差→横移速度
+    route_visual_image_lateral_gain: 0.05 # 未标定时图像归一化偏差→低速横移，非米制定位
+    route_visual_goal_lateral_m: 0.02 # 有真实地面映射时的最终横向容差，m；不是精度保证
+    reverse_ground_mapping_file: "" # 实测对应点JSON路径；留空为明确标注的图像伺服模式
+    route_finish_distance: 0.30 # m，尚未视觉接管时最后30cm减速对齐；也是终点横线范围
+    route_finish_straight_distance: 0.60 # m，最后60cm内，近端可纠偏且剩余路径为小弯/直线时允许视觉接管
+    route_finish_lateral_sign: 1.0 # 仅visual_strafe=false的回归分支；全向回中不使用此倒车反号
+    route_finish_center_gain: 0.65 # 仅旧纵向+转向分支的回中力度；横移使用route_visual_*_gain
+    route_finish_heading_gain: 0.80 # 末段实测轴向对齐力度，不随横向标定反号
+    route_finish_entry_heading: 0.40 # rad，约23度内且连续确认后允许低速接管
+    route_finish_exit_heading: 0.65 # rad，接管后中等偏差降速纠偏，超过约37度停车
+    route_finish_exit_lateral: 0.75 # 半图宽比例，接管后允许横向纠偏余量；640宽对应±240px，非米
+    route_finish_goal_lateral: 0.08 # 最终到位要求，半图宽比例；640宽对应偏离中心约±26px
+    route_finish_goal_heading: 0.10471975511965978 # rad，最终朝向误差≤6度，连续3帧合格才算完成
+    route_finish_entry_bend: 0.15 # rad，近端与前方实测走势变化约8.6度内允许小弯
+    route_finish_entry_yaw_rate: 0.06 # rad/s，实际和指令转向速率均降到此值才接管
+    route_finish_center_tolerance: 0.02 # 半图宽2%，640宽约6.4px；不是实车定位精度
+    route_finish_speed: 0.03 # m/s，最后直线相机倒车速度上限
+    route_finish_extra_distance: 0.10 # m，超过原记录起点最多10cm找线，超限锁停
+    route_camera_stop: true # 记录路线倒车启用横线停车；相机超时暂停
+    route_file: ~/.ros/line_follow/last_route.json
+    station_log_file: ~/.ros/line_follow/last_station_log.json # 本轮横线身份、动作及计数，后台保存
+    odom_topic: /wheel_odom
+    route_sample_distance: 0.02 # m，路线采样间隔；终点额外保存
+    route_max_speed: 0.08 # m/s，记录路线倒车独立上限，旧camera模式仍为0.04
+    route_approach_distance: 0.10 # m，关闭视觉末段时最后10cm减速，与转向前瞻独立
+    route_lookahead: 0.20 # m，车后记录路线的前瞻弧长
+    route_max_curvature: 2.0 # 1/m，默认最小转弯半径0.5m，需结合实际轨迹验证
+    route_max_tracking_error: 0.15 # m，超出则停车
+    route_goal_tolerance: 0.02 # m，里程计下到起点的停车容差，不是实车精度承诺
+    route_odom_timeout: 0.5
+    reverse_steering_sign: -1.0 # 仅旧camera模式整体反号；新末段改用route_finish_lateral_sign
+    reverse_heading_gain: 1.0          # 倒车用近端实测切线对齐车身，横向纠偏单独反号
+    curve_lookahead_distance_ratio: 0.40 # 直线前瞻0.45，弯道连续缩到0.40图高
     max_forward_speed: 0.30           # 前进速度参数上限，m/s
     image_forward_direction: down    # 实际轮子/车身在画面上方，前方朝画面下方
     vehicle_reference_x_ratio: 0.5   # 虚拟车身参考横坐标；对准车身中心线后校准
@@ -10,20 +53,26 @@ line_follow_controller:
     near_edge_margin_ratio: 0.25    # 上方轮子近端区域，地面检查起点向前移图高25%
     max_near_gap_ratio: 0.40         # 从可见地面检查起点起，缺线超过图高40%停车，给弯道近端留余量
     heading_gain: 0.35                 # 车身参考到前瞻点的方向误差 -> rad/s
-    curve_entry_time_sec: 0.35       # 逐渐进入转弯优先，避免第一下转太多
+    curve_entry_time_sec: 0.20 # 弯道优先平滑切入，缩短原0.35秒响应延迟
     curve_detection_angle_rad: 0.12  # 走向偏离前方或切线变化约7度后逐渐启用转弯优先
-    curve_error_deadband: 0.18       # 弯道中心容差：半图宽18%，直线仍6%
-    curve_center_gain_factor: 0.35   # 弯道降低追回中心的力度
-    curve_heading_gain: 0.55        # 弯道增强跟随前方走向
-    curve_max_angular_speed: 0.28    # 弯道转速上限约16度/秒，直线仍约14度/秒
-    curve_angular_acceleration: 0.30 # 弯道限制首次转向增量，仍经过滤波和变化率限制
+    curve_error_deadband: 0.30 # 弯道允许偏离半图宽30%（640宽约96px）；直线4%
+    curve_center_gain_factor: 0.20 # 弯道只保留20%的追回中心力度，优先跟随线方向
+    curve_heading_gain: 0.70 # 弯道增强沿前方线走向的转向响应
+    curve_max_angular_speed: 0.34 # 弯道转速上限约19.5度/秒，直线仍约14度/秒
+    curve_angular_acceleration: 0.50 # 弯道转向变化上限rad/s²；50Hz首帧增量不超过0.01rad/s
     max_heading_error_rad: 1.2        # 偏离前进轴超过约69度则停车
     steering_gain: 0.65                # 近端中线横向误差 -> rad/s
     steering_sign: -1.0               # down 下有效转向符号为 +1，保持已校正的左右关系
     max_angular_speed: 0.25            # 直线纠偏上限，约14.3度/秒
-    error_deadband: 0.06              # 横向偏差连续死区，允许偏离半图宽的6%
+    error_deadband: 0.04              # 直线允许偏离半图宽4%（640宽约13px）
     heading_deadband_rad: 0.05      # 方向误差连续死区，约2.9度
-    steering_filter_time_sec: 0.2    # 转向低通时间常数；0关闭，过大会拖慢弯道响应
+    steering_filter_time_sec: 0.16 # 保留转向低通，减少拖慢弯道响应的延迟
+    steering_curvature_enter: 0.30   # 1/m，启动小幅转向门槛；按配置速度归一，避免低速放大
+    straight_center_curvature_enter: 0.10 # 持续直线偏移确认后，小幅回中门槛（1/m）
+    straight_center_confirmation_frames: 5 # 同侧偏移达到直线死区1.5倍，连续5张新图才放行
+    steering_curvature_exit: 0.15    # 1/m，退出门槛；迟滞防止小噪声反复启停转向
+    steering_reverse_frames: 3      # 轻微反向需3张新图确认；50Hz重复同帧不累计
+    steering_fast_reverse_curvature: 1.5 # 1/m，明显反向弯缩为2张新图，避免拖慢真实S弯
     curve_slowdown: 0.4               # 减轻正常横向偏差引起的减速
     min_speed_factor: 0.3
     estimated_speed_factor: 0.3       # 估计目标/疑似遮挡时再减速
@@ -51,16 +100,22 @@ line_follow_controller:
     chassis_status_topic: /masc_chassis/chassis_status
     cmd_vel_topic: /cmd_vel
     stop_marker_enabled: true
+    forward_ignore_start_marker: true # 前进启动时整幅画面内最近的一根横线自动作为出发线去重
+    reverse_ignore_start_marker: true # 倒车起步时略过到位区或已在后侧的出发横线
+    stop_marker_departure_hold_distance: 0.25 # m，离站旧横线持续漏检时的去重行程，优先真实里程计
+    reverse_start_marker_max_travel: 0.01 # m，前后共用首次忽略窗口（保留原参数名），按速度指令积分，原地等待不消耗
     stop_marker_target_ratio: 0.5       # 原始相机处理画面高度中间，不是拼接预览的中间
-    stop_marker_position_tolerance_ratio: 0.008 # 高480时约±3.8像素；以多帧平均位置判断
+    stop_marker_position_tolerance_ratio: 0.03 # 提前图高3%可到达；480高约14.4px
     stop_marker_slowdown_ratio: 0.25    # 距目标还有图高25%时开始接近减速
     stop_marker_creep_speed: 0.008      # m/s，近距离最低接近限速，不会抬高已有更低限速
-    stop_marker_average_frames: 5      # 同一横线最近5张新图像取算术平均
+    stop_marker_dropout_grace_sec: 0.6 # 主线/帧有效且确认过的横线尚远，漏检最多缓行0.6秒
+    stop_marker_dropout_max_distance: 0.005 # m，同一次横线漏检最多累计发出5mm行驶指令
+    stop_marker_average_frames: 3 # 同一横线最近3张新图像取平均，减少运动中的位置滞后
     stop_marker_average_max_age_sec: 1.0 # 旧样本过期剔除，缺失帧不当作零误差
-    stop_marker_overshoot_tolerance_ratio: 0.02 # 平均位置轻微越过目标不超过图高2%也视为到达，不倒车
+    stop_marker_overshoot_tolerance_ratio: 0.06 # 越线不超过图高6%也算到达；480高约28.8px，不倒车
     stop_marker_min_span_ratio: 0.12    # 横线长度 / 图宽
     stop_marker_min_arm_ratio: 0.035    # 主线两侧必须分别伸出这么长 / 图宽
     stop_marker_angle_tolerance_rad: 0.26 # 横线与局部主线垂直误差约15度
-    stop_marker_confirmation_frames: 3
+    stop_marker_confirmation_frames: 2 # 平均位置到位后确认2个有效帧；短暂漏检不累计、不清零
     stop_marker_continuation_ratio: 0.10 # 前方继续主线的最小可见长度 / 图高
     stop_marker_release_ratio: 0.08     # 恢复后越过旧横线才解除去重

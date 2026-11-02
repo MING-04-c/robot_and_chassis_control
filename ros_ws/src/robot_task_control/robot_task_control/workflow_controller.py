@@ -20,9 +20,11 @@ from masc_chassis_msgs.msg import TaskStatus
 from masc_chassis_msgs.srv import TaskControl
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.parameter_client import AsyncParameterClient
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, Empty
 from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -40,6 +42,7 @@ SUPPORTED_ACTIONS = set(CONTROL_COMMANDS) | {
     "final_capture",
     "line_follow",
     "wait_chassis_stopped",
+    "save_line_route",
 }
 
 
@@ -128,6 +131,11 @@ class WorkflowController(Node):
         self.follow_enable_client = self.create_client(
             SetBool, "/line_follow_controller/enable"
         )
+        self.follow_parameters = AsyncParameterClient(self, '/line_follow_controller')
+        self.route_checkpoint_client = self.create_client(Trigger, '/line_follow_controller/save_route')
+        self.route_checkpoint_file = None
+        self.follow_resume_publisher = self.create_publisher(Empty, '/line_follow/resume', 10)
+        self.follow_resume_sent = float('-inf')
         self.require_image_receiver = bool(
             self.declare_parameter("require_image_receiver", False).value
         )
@@ -214,6 +222,7 @@ class WorkflowController(Node):
         self.capture_server = self.create_service(Trigger, "~/capture", self.on_capture_request)
         self.generation = 0
         self.run_id = uuid4().hex
+        self.route_checkpoint_file = None
         self.execution_ids = {}
         self.cancelled_execution_ids = set()
         self.step_started = monotonic()
@@ -258,6 +267,7 @@ class WorkflowController(Node):
             "step_count": 1 if self.capture_only else len(self.steps),
             "action": step["action"] if step else None,
             "follow_state": self.follow_status,
+            "route_checkpoint_file": self.route_checkpoint_file,
             "stamp_ns": self.get_clock().now().nanoseconds,
         }, ensure_ascii=False)))
 
@@ -292,6 +302,12 @@ class WorkflowController(Node):
                 if not isinstance(step["config_file"], str) or not step["config_file"].strip():
                     raise ValueError(f"workflow step {index} requires a valid config_file path")
             if action == "line_follow":
+                if 'drive_direction' in step and step['drive_direction'] not in ('forward', 'reverse'):
+                    raise ValueError(f'workflow step {index} drive_direction must be forward or reverse')
+                if type(step.get('skip_intermediate_markers', False)) is not bool:
+                    raise ValueError(f'workflow step {index} skip_intermediate_markers must be boolean')
+                if type(step.get('return_to_start', False)) is not bool:
+                    raise ValueError(f'workflow step {index} return_to_start must be boolean')
                 until_untrusted = step.get("until_untrusted", False)
                 if not isinstance(until_untrusted, bool):
                     raise ValueError(f"workflow step {index} until_untrusted must be boolean")
@@ -469,6 +485,7 @@ class WorkflowController(Node):
             self.failed = False
         self.generation += 1
         self.run_id = uuid4().hex
+        self.route_checkpoint_file = None
         self.last_failure = ""
         self.mux_run_ready = not self.use_velocity_mux
         self.execution_ids.clear()
@@ -498,6 +515,7 @@ class WorkflowController(Node):
         self.active, self.failed = True, False
         self.generation += 1
         self.run_id = uuid4().hex
+        self.route_checkpoint_file = None
         self.last_failure = ""
         self.step_started = monotonic()
         self.phase = "ready"
@@ -650,7 +668,22 @@ class WorkflowController(Node):
         if not self.use_velocity_mux:
             self.fail_workflow("line_follow requires use_velocity_mux=true")
             return
-        if self.phase == "ready":
+        if self.phase == 'ready' and 'drive_direction' in step:
+            if not self.follow_enable_client.service_is_ready():
+                return
+            self.phase = 'follow_direction_disable_pending'
+            self.request_bool(self.follow_enable_client, False,
+                              lambda result: self.checked_bool(result, 'follow_direction_set'))
+            return
+        if self.phase == 'follow_direction_set':
+            if not self.follow_parameters.services_are_ready():
+                return
+            self.phase = 'follow_direction_pending'
+            self.add_callback(self.follow_parameters.set_parameters([
+                Parameter('drive_direction', value=step['drive_direction']),
+                Parameter('reverse_return_to_start', value=step.get('return_to_start', False))]), self.on_follow_direction)
+            return
+        if self.phase in ("ready", 'follow_prepare'):
             if not (
                 self.follow_enable_client.service_is_ready()
                 and self.mux_mode_client.service_is_ready()
@@ -697,7 +730,16 @@ class WorkflowController(Node):
                 self.follow_status_time is not None
                 and now - self.follow_status_time <= 1.0
             )
+            if fresh and self.follow_status == "reverse_finish_goal_not_centered":
+                self.fail_workflow(
+                    "倒车终点横线已到，但横向或朝向尚未达标；底盘保持停车，返程未完成，不执行后续步骤"
+                )
+                return  # 必须早于计时结束判断，不能用运行时长替代最终居中。
             if fresh and self.follow_status == "stop_marker_intermediate":
+                if step.get('skip_intermediate_markers', False) and now-self.follow_resume_sent >= 1.:
+                    self.follow_resume_publisher.publish(Empty())
+                    self.follow_resume_sent = now
+                    self.get_logger().info('返程途中站自动继续，仅在原出发点结束倒车')
                 self.follow_last_tracking = now
                 self.follow_boundary_since = None
                 self.follow_station_confirm_since = None
@@ -714,7 +756,11 @@ class WorkflowController(Node):
                 self.follow_boundary_since = None
                 return  # 已输出零速，停车确认使用独立期限，不触发普通行走进度超时。
             self.follow_station_confirm_since = None
-            if fresh and self.follow_status in ("tracking", "stop_marker_approaching"):
+            if fresh and self.follow_status == "reverse_visual_finish_aligning":
+                self.follow_last_tracking = now
+                self.follow_boundary_since = None
+                return  # 纵向已停，视觉仍在横移/摆正；不计行走时长，也不误报完成。
+            if fresh and self.follow_status in ("tracking", "stop_marker_approaching", "stop_marker_missing_approaching", "reverse_route_tracking", "reverse_visual_finish_tracking"):
                 self.follow_tracking_seconds += dt
                 self.follow_last_tracking = now
                 if self.follow_boundary_since is not None:
@@ -740,11 +786,14 @@ class WorkflowController(Node):
                                   float(step.get("boundary_wait_sec", 0.0)))
             timed_finish = (not until_untrusted and
                             self.follow_tracking_seconds >= float(step["seconds"]))
+            route_complete = fresh and self.follow_status == "reverse_route_complete"
             final_marker = fresh and self.follow_status == "stop_marker_final"
-            if boundary_confirmed and step.get("require_final_marker", False) and not final_marker:
+            if boundary_confirmed and step.get("require_final_marker", False) and not (final_marker or route_complete):
                 self.fail_workflow("最终停止横线尚未确认，主线持续不可用；不会执行后续机械臂点位")
                 return
-            if boundary_confirmed or timed_finish or final_marker:
+            if boundary_confirmed or timed_finish or final_marker or route_complete:
+                if route_complete:
+                    self.get_logger().info("已返回记录路线起点，结束倒车并等待底盘停稳")
                 if final_marker:
                     self.get_logger().info("最终停止横线已居中停车，结束循迹并等待底盘停稳")
                 if boundary_confirmed:
@@ -765,6 +814,29 @@ class WorkflowController(Node):
 
     def on_pid_stopped_for_follow(self, future):
         self.checked_bool(future, "follow_select")
+
+    def on_follow_direction(self, future):
+        try:
+            results = future.result().results
+            if not results or not all(result.successful for result in results):
+                raise RuntimeError('; '.join(result.reason for result in results))
+        except Exception as error:
+            self.fail_workflow('循迹方向切换失败：'+str(error))
+            return
+        self.get_logger().info('循迹方向已切换为 '+self.current_step()['drive_direction'])
+        self.phase = 'follow_prepare'
+
+    def on_route_checkpoint(self, future):
+        try:
+            result = future.result()
+            if not result.success:
+                raise RuntimeError(result.message)
+            self.route_checkpoint_file = json.loads(result.message)['snapshot_file']
+        except Exception as error:
+            self.fail_workflow('返程路线封存失败：'+str(error))
+            return
+        self.get_logger().info('后续倒车使用封存路线：'+self.route_checkpoint_file)
+        self.complete_step()
 
     def on_follow_finished(self, future):
         self.checked_bool(future, "ready")
@@ -873,6 +945,10 @@ class WorkflowController(Node):
             return
         if action == "final_capture":
             self.advance_final_capture(step)
+        elif action == 'save_line_route':
+            if self.phase == 'ready' and self.route_checkpoint_client.service_is_ready():
+                self.phase = 'route_checkpoint_pending'
+                self.add_callback(self.route_checkpoint_client.call_async(Trigger.Request()), self.on_route_checkpoint)
         elif action == "hk_capture":
             self.advance_hk_capture()
         elif action == "wait_chassis_stopped":

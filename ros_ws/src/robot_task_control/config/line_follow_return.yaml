@@ -1,0 +1,11 @@
+# 记录路线倒车，默认最后30cm切相机直线找横线终停；输入失效/搜索超限不算完成。
+workflow:
+  name: line_follow_return
+  auto_start: true
+  steps:
+  - action: line_follow
+    until_untrusted: true
+    require_final_marker: true
+    boundary_wait_sec: 5.0
+    progress_timeout_sec: 3.0
+    step_timeout_sec: 900.0

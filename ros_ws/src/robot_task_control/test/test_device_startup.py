@@ -27,6 +27,112 @@ from robot_task_control.velocity_mux import VelocityMux
 
 
 class DeviceStartupTest(unittest.TestCase):
+    def test_dashboard_automatic_power_brake_sequence(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'eli_cs_robot_driver/scripts'))
+        from auto_power_on import DashboardStartup
+        from eli_common_interface.srv import GetRobotMode, GetSafetyMode
+        from eli_common_interface.msg import RobotMode, SafetyMode
+        for initial, safety, power_ok, brake_ok, expected, result in (
+                (RobotMode.POWER_OFF, SafetyMode.NORMAL, True, True, ['power', 'brake'], 0),
+                (RobotMode.IDLE, SafetyMode.NORMAL, True, True, ['brake'], 0),
+                (RobotMode.RUNNING, SafetyMode.NORMAL, True, True, [], 0),
+                (RobotMode.POWER_OFF, SafetyMode.NORMAL, False, True, ['power'], 1),
+                (RobotMode.POWER_OFF, SafetyMode.PROTECTIVE_STOP, True, True, [], 1),
+                (RobotMode.IDLE, SafetyMode.NORMAL, True, False, ['brake'], 1)):
+            with self.subTest(initial=initial, safety=safety, power_ok=power_ok):
+                rclpy.init(args=['--ros-args', '-p', 'startup_timeout_sec:=4.0',
+                                '-p', 'request_timeout_sec:=1.0', '-p', 'poll_interval_sec:=0.01'])
+                dashboard, startup = Node('mock_dashboard'), DashboardStartup()
+                executor = SingleThreadedExecutor()
+                executor.add_node(dashboard)
+                executor.add_node(startup)
+                current, calls = [initial], []
+                deferred = [None, 0.]
+                def get_mode(request, response):
+                    if deferred[0] is not None and time.monotonic() >= deferred[1]:
+                        current[0], deferred[0] = deferred[0], None
+                    response.success = True
+                    response.mode.mode = current[0]
+                    return response
+                def get_safety(request, response):
+                    response.success = True
+                    response.mode.mode = safety
+                    return response
+                def power(request, response):
+                    calls.append('power')
+                    response.success = power_ok
+                    if power_ok:
+                        current[0] = RobotMode.POWER_ON
+                        deferred[:] = [RobotMode.IDLE, time.monotonic()+.15]
+                    return response
+                def brake(request, response):
+                    self.assertEqual(current[0], RobotMode.IDLE)
+                    calls.append('brake')
+                    if brake_ok:
+                        deferred[:] = [RobotMode.RUNNING, time.monotonic()+.15]
+                    response.success = brake_ok
+                    return response
+                dashboard.create_service(GetRobotMode, '/dashboard_client/robot_mode', get_mode)
+                dashboard.create_service(GetSafetyMode, '/dashboard_client/get_safety_mode', get_safety)
+                dashboard.create_service(Trigger, '/dashboard_client/power_on', power)
+                dashboard.create_service(Trigger, '/dashboard_client/brake_release', brake)
+                try:
+                    deadline = time.monotonic()+5.
+                    while startup.result is None and time.monotonic() < deadline:
+                        executor.spin_once(timeout_sec=.01)
+                    self.assertEqual(startup.result, result)
+                    self.assertEqual(calls, expected)
+                finally:
+                    executor.shutdown()
+                    startup.destroy_node()
+                    dashboard.destroy_node()
+                    rclpy.shutdown()
+
+    def test_dashboard_startup_timeouts_are_bounded(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'eli_cs_robot_driver/scripts'))
+        from auto_power_on import DashboardStartup
+        from rclpy.task import Future
+        rclpy.init(args=['--ros-args', '-p', 'startup_timeout_sec:=0.2'])
+        startup = DashboardStartup()
+        try:
+            end = time.monotonic()+1.
+            while startup.result is None and time.monotonic() < end:
+                rclpy.spin_once(startup, timeout_sec=.01)
+            self.assertEqual(startup.result, 1, 'missing dashboard services waited forever')
+            # 上电/抱闸服务超过原来的10秒仍应等待；普通状态查询仍受短超时约束。
+            from unittest.mock import Mock, patch
+            for kind in ('power', 'brake'):
+                startup.result = None
+                startup.pending = None
+                startup.phase = kind
+                startup.next_check = 0.
+                startup.deadline = 1000.
+                startup.dashboard_clients[kind] = Mock()
+                startup.dashboard_clients[kind].call_async.return_value = Future()
+                with patch('auto_power_on.time.monotonic', return_value=100.):
+                    startup.tick()
+                self.assertEqual(startup.request_deadline, 220.)
+                with patch('auto_power_on.time.monotonic', return_value=111.):
+                    startup.tick()
+                self.assertIsNone(startup.result)
+                self.assertFalse(startup.pending.done())
+                with patch('auto_power_on.time.monotonic', return_value=221.):
+                    startup.tick()
+                self.assertEqual(startup.result, 1)
+            startup.result = None
+            startup.deadline = time.monotonic()+1.
+            startup.pending, startup.pending_kind = Future(), 'mode'
+            startup.request_deadline = time.monotonic()-1.
+            startup.tick()
+            self.assertEqual(startup.result, 1)
+            self.assertFalse(startup.power_sent)
+            self.assertFalse(startup.brake_sent)
+        finally:
+            startup.destroy_node()
+            rclpy.shutdown()
+
     def test_all_devices_before_any_task(self):
         config = (
             Path(__file__).resolve().parents[1]

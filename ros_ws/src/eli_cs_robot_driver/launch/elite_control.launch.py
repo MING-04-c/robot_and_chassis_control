@@ -1,9 +1,11 @@
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterFile
+from launch_ros.parameter_descriptions import ParameterFile, ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, RegisterEventHandler, EmitEvent, LogInfo, GroupAction
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 
@@ -332,7 +334,6 @@ def launch_setup(context, *args, **kwargs):
     nodes_to_start = [
         control_node,
         eli_control_node,
-        components_loader,
         # tool_communication_node,
         controller_stopper_node,
         robot_state_publisher_node,
@@ -341,11 +342,46 @@ def launch_setup(context, *args, **kwargs):
         initial_joint_controller_spawner_started,
     ] + controller_spawners
 
-    return nodes_to_start
+    auto_power = LaunchConfiguration('auto_power_on').perform(context).lower() == 'true'
+    fake_hardware = use_fake_hardware.perform(context).lower() == 'true'
+    if auto_power and not fake_hardware:
+        # 嵌套launch的参数作用域可能在异步上电结束前退出，保留本次驱动参数。
+        driver_configurations = dict(context.launch_configurations)
+        power_startup = Node(
+            package='eli_cs_robot_driver', executable='auto_power_on.py',
+            name='elite_auto_power_on', output='screen',
+            parameters=[{
+                'startup_timeout_sec': ParameterValue(LaunchConfiguration('power_on_timeout'), value_type=float),
+                'command_timeout_sec': ParameterValue(LaunchConfiguration('power_command_timeout'), value_type=float),
+            }],
+        )
+
+        def power_finished(event, launch_context):
+            if launch_context.is_shutdown:
+                return []
+            if event.returncode == 0:
+                return [GroupAction(actions=nodes_to_start, scoped=True,
+                                    launch_configurations=driver_configurations)]
+            return [LogInfo(msg='机器人自动上电/释放抱闸失败，取消 ROS 控制器启动'),
+                    EmitEvent(event=Shutdown(reason='Robot power/brake startup failed'))]
+
+        return [components_loader,
+                RegisterEventHandler(OnProcessExit(target_action=power_startup, on_exit=power_finished)),
+                power_startup]
+    return [components_loader]+nodes_to_start
 
 
 def generate_launch_description():
     declared_arguments = []
+    declared_arguments.extend([
+        DeclareLaunchArgument('auto_power_on', default_value='true', choices=['true', 'false'],
+                             description='Automatically power on and release brakes before real robot controllers start'),
+        DeclareLaunchArgument('power_on_timeout', default_value='240.0',
+                             description='Total dashboard service/state startup timeout in seconds'),
+    ])
+    declared_arguments.append(DeclareLaunchArgument(
+        'power_command_timeout', default_value='120.0',
+        description='Maximum wait for each blocking power_on/brake_release service in seconds'))
     # Elite CS robots specific arguments
     declared_arguments.append(
         DeclareLaunchArgument(

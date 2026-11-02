@@ -9,27 +9,38 @@ from dataclasses import dataclass
 class ControlConfig:
     forward_speed: float = 0.075
     max_forward_speed: float = 0.30
+    drive_direction: str = 'forward'
+    reverse_max_speed: float = 0.04
+    reverse_heading_gain: float = 1.0
+    reverse_steering_sign: float = 1.0
     image_forward_direction: str = 'down'
     vehicle_reference_x_ratio: float = 0.5
     vehicle_reference_y_ratio: float = -0.05
     lookahead_distance_ratio: float = 0.45
+    curve_lookahead_distance_ratio: float = 0.40
     max_near_gap_ratio: float = 0.40
     near_edge_margin_ratio: float = 0.25
     heading_gain: float = 0.35
-    curve_entry_time_sec: float = 0.35
+    curve_entry_time_sec: float = 0.20
     curve_detection_angle_rad: float = 0.12
-    curve_error_deadband: float = 0.18
-    curve_center_gain_factor: float = 0.35
-    curve_heading_gain: float = 0.55
-    curve_max_angular_speed: float = 0.28
-    curve_angular_acceleration: float = 0.30
+    curve_error_deadband: float = 0.30
+    curve_center_gain_factor: float = 0.20
+    curve_heading_gain: float = 0.70
+    curve_max_angular_speed: float = 0.34
+    curve_angular_acceleration: float = 0.50
     max_heading_error_rad: float = 1.2
     steering_gain: float = 0.65
     steering_sign: float = -1.0
     max_angular_speed: float = 0.25
-    error_deadband: float = 0.06
+    error_deadband: float = 0.04
     heading_deadband_rad: float = 0.05
-    steering_filter_time_sec: float = 0.2
+    steering_filter_time_sec: float = 0.16
+    steering_curvature_enter: float = 0.30
+    steering_curvature_exit: float = 0.15
+    straight_center_curvature_enter: float = 0.10
+    straight_center_confirmation_frames: int = 5
+    steering_reverse_frames: int = 3
+    steering_fast_reverse_curvature: float = 1.5
     curve_slowdown: float = 0.4
     min_speed_factor: float = 0.3
     estimated_speed_factor: float = 0.3
@@ -49,25 +60,36 @@ class ControlConfig:
     bridge_speed_factor: float = 1.0
 
     stop_marker_enabled: bool = True
+    forward_ignore_start_marker: bool = True
+    reverse_ignore_start_marker: bool = True
+    reverse_return_to_start: bool = False
+    reverse_start_marker_max_travel: float = 0.01
+    stop_marker_departure_hold_distance: float = 0.25
     stop_marker_target_ratio: float = 0.5
-    stop_marker_position_tolerance_ratio: float = 0.008
+    stop_marker_position_tolerance_ratio: float = 0.03
     stop_marker_slowdown_ratio: float = 0.25
     stop_marker_creep_speed: float = 0.008
-    stop_marker_average_frames: int = 5
+    stop_marker_dropout_grace_sec: float = 0.6
+    stop_marker_dropout_max_distance: float = 0.005
+    stop_marker_average_frames: int = 3
     stop_marker_average_max_age_sec: float = 1.0
-    stop_marker_overshoot_tolerance_ratio: float = 0.02
+    stop_marker_overshoot_tolerance_ratio: float = 0.06
     stop_marker_min_span_ratio: float = 0.12
     stop_marker_min_arm_ratio: float = 0.035
     stop_marker_angle_tolerance_rad: float = 0.26
-    stop_marker_confirmation_frames: int = 3
+    stop_marker_confirmation_frames: int = 2
     stop_marker_continuation_ratio: float = 0.10
     stop_marker_release_ratio: float = 0.08
 
     def validate(self):
+        if self.drive_direction not in ('forward', 'reverse'):
+            raise ValueError('drive_direction must be forward or reverse')
+        if isinstance(self.reverse_steering_sign, bool) or self.reverse_steering_sign not in (-1., 1.):
+            raise ValueError('reverse_steering_sign must be -1 or 1')
         if self.image_forward_direction not in ('up', 'down'):
             raise ValueError('image_forward_direction must be up or down')
         for name, value in vars(self).items():
-            if name == 'image_forward_direction':
+            if name in ('image_forward_direction', 'drive_direction'):
                 continue
             if isinstance(value, bool):
                 continue
@@ -75,6 +97,10 @@ class ControlConfig:
                 raise ValueError(f'{name} must be finite')
         if not 0.0 <= self.forward_speed <= self.max_forward_speed:
             raise ValueError('forward_speed must be between 0 and max_forward_speed (m/s)')
+        if not 0 < self.reverse_max_speed <= self.max_forward_speed or self.reverse_heading_gain <= 0:
+            raise ValueError('reverse speed limit and heading gain must be positive')
+        if not .05 <= self.curve_lookahead_distance_ratio <= 1.:
+            raise ValueError('curve lookahead ratio must be .05..1')
         for name in ('max_forward_speed', 'max_angular_speed',
                      'linear_acceleration', 'angular_acceleration', 'max_heading_error_rad',
                      'curve_max_angular_speed', 'curve_angular_acceleration'):
@@ -92,8 +118,15 @@ class ControlConfig:
                      'curve_error_deadband', 'curve_center_gain_factor'):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f'{name} must be between 0 and 1')
-        if not isinstance(self.stop_marker_enabled, bool):
-            raise ValueError('stop_marker_enabled must be boolean')
+        if not all(isinstance(value, bool) for value in (self.stop_marker_enabled,
+                self.forward_ignore_start_marker, self.reverse_ignore_start_marker, self.reverse_return_to_start)):
+            raise ValueError('stop marker enable/start marker policy must be boolean')
+        if not .001 <= self.reverse_start_marker_max_travel <= .05:
+            raise ValueError('reverse start marker travel must be .001..0.05 m')
+        if (isinstance(self.stop_marker_departure_hold_distance, bool)
+                or not math.isfinite(self.stop_marker_departure_hold_distance)
+                or not .05 <= self.stop_marker_departure_hold_distance <= .5):
+            raise ValueError('departure hold distance must be .05..0.5 m')
         if (type(self.stop_marker_average_frames) is not int
                 or not 3 <= self.stop_marker_average_frames <= 15):
             raise ValueError('stop_marker_average_frames must be integer 3..15')
@@ -115,6 +148,10 @@ class ControlConfig:
                 or not 0.05 <= self.stop_marker_angle_tolerance_rad <= 0.5
                 or not 0.0 <= self.curve_entry_time_sec <= 1.0):
             raise ValueError('invalid stop marker geometry/speed or curve entry time')
+        if not 0. <= self.stop_marker_dropout_grace_sec <= .6:
+            raise ValueError('stop marker dropout grace must be 0..0.6 seconds')
+        if not 0. <= self.stop_marker_dropout_max_distance <= .005:
+            raise ValueError('stop marker dropout distance must be 0..0.005 meters')
         if not 0.02 <= self.curve_detection_angle_rad <= 0.6:
             raise ValueError('curve_detection_angle_rad must be 0.02..0.6')
         if self.curve_error_deadband < self.error_deadband or self.curve_heading_gain < 0:
@@ -125,6 +162,16 @@ class ControlConfig:
             raise ValueError('heading_deadband_rad must be 0..0.2')
         if not 0.0 <= self.steering_filter_time_sec <= 1.0:
             raise ValueError('steering_filter_time_sec must be 0..1')
+        if not 0. <= self.steering_curvature_exit < self.steering_curvature_enter <= 2.:
+            raise ValueError('steering curvature requires 0 <= exit < enter <= 2 (1/m)')
+        if not 0. < self.straight_center_curvature_enter <= self.steering_curvature_enter:
+            raise ValueError('straight center curvature must be positive and <= normal enter threshold')
+        if type(self.straight_center_confirmation_frames) is not int or not 3 <= self.straight_center_confirmation_frames <= 20:
+            raise ValueError('straight center confirmation requires integer 3..20 frames')
+        if type(self.steering_reverse_frames) is not int or not 2 <= self.steering_reverse_frames <= 6:
+            raise ValueError('steering_reverse_frames must be integer 2..6')
+        if not self.steering_curvature_enter < self.steering_fast_reverse_curvature <= 10.:
+            raise ValueError('fast reverse curvature must exceed enter threshold and be <=10')
         if self.lookahead_distance_ratio <= 0.0:
             raise ValueError('lookahead_distance_ratio must be positive')
         if self.max_trusted_gap_ratio <= 0.0:
@@ -185,7 +232,24 @@ def line_command(status, config):
         return 0.0, 0.0, 'invalid_heading'
     if abs(heading) > config.max_heading_error_rad:
         return 0.0, 0.0, 'heading_out_of_range'
-    if curve_strength > 0:
+    reversing = config.drive_direction == 'reverse'
+    if reversing:
+        # 唯一的前置相机不随倒车翻转：用实测近端切线对齐车身，
+        # 不能追逐运动方向相反的远处前瞻点，更不能把两项控制一起反号。
+        heading = status.get('near_heading_rad')
+        if (isinstance(heading, bool) or not isinstance(heading, (int, float))
+                or not math.isfinite(heading) or abs(heading) > config.max_heading_error_rad):
+            return 0.0, 0.0, 'reverse_heading_unavailable'
+    else:
+        near_heading = status.get('near_heading_rad')
+        if near_heading is not None:
+            if (isinstance(near_heading, bool) or not isinstance(near_heading, (int, float))
+                    or not math.isfinite(near_heading) or abs(near_heading) > config.max_heading_error_rad):
+                return 0., 0., 'invalid_near_heading'
+            # 横向项已经纠正了位置偏移；直线方向项用实测切线，
+            # 不再把“指向偏移前瞻点”的位置误差重复算成航向纠偏。
+            heading = near_heading
+    if not reversing and curve_strength > 0:
         path_heading = status.get('path_heading_rad')
         if (isinstance(path_heading, bool) or not isinstance(path_heading, (int, float))
                 or not math.isfinite(path_heading) or abs(path_heading) > config.max_heading_error_rad):
@@ -198,13 +262,45 @@ def line_command(status, config):
     sign = config.steering_sign if config.image_forward_direction == 'up' else -config.steering_sign
     center_gain = config.steering_gain * (1.0 - curve_strength * (1.0 - config.curve_center_gain_factor))
     heading_gain = config.heading_gain + curve_strength * (config.curve_heading_gain - config.heading_gain)
+    if reversing:
+        heading_gain = config.reverse_heading_gain
     yaw_limit = config.max_angular_speed + curve_strength * (
         config.curve_max_angular_speed - config.max_angular_speed)
-    yaw = sign * (center_gain * yaw_error + heading_gain * heading)
+    if reversing:
+        yaw_limit = min(yaw_limit, config.max_angular_speed)
+    # Stanley式分项反馈的图像适配：atan有界纠偏；输入不是米制距离，
+    # 输出直接是底盘角速度，不是原论文的阿克曼转角。
+    center_term = math.atan(center_gain * yaw_error)
+    yaw = sign * ((-center_term if reversing else center_term) + heading_gain * heading)
     yaw = max(-yaw_limit, min(yaw_limit, yaw))
+    if reversing:
+        # 独立的实车倒车方向标定；标准运动模型使用+1，现场反向时配置-1。
+        # 不改变图像安装方向、横线运动方向或横向/朝向分项控制本身。
+        yaw *= config.reverse_steering_sign
     if config.forward_speed == 0.0:
         return 0.0, 0.0, 'speed_zero'
-    return config.forward_speed * factor, yaw, 'tracking'
+    speed = min(config.forward_speed, config.reverse_max_speed) if reversing else config.forward_speed
+    return (-speed if reversing else speed) * factor, yaw, 'tracking'
+
+
+def reverse_visual_command(status, config, lateral_heading_limit=math.radians(6.)):
+    """末段视觉倒车分项反馈：横向标定反号只作用横向项，朝向仍沿用前进相机映射。
+
+    返回 (v,w,state)，单位m/s、rad/s；先复用已有新鲜观测/有效性检查，不追逐车前远点。
+    """
+    v, _, reason = line_command(status, config)
+    if reason != 'tracking' or config.drive_direction != 'reverse':
+        return 0., 0., reason if reason != 'tracking' else 'reverse_direction_required'
+    error, heading = status['error_normalized'], status['near_heading_rad']
+    side = math.copysign(max(0., abs(error)-config.error_deadband), error)
+    heading = math.copysign(max(0., abs(heading)-config.heading_deadband_rad), heading)
+    sign = config.steering_sign if config.image_forward_direction == 'up' else -config.steering_sign
+    # 前置相机观察点不在倒车前方。横向误差只能请求有限的回中偏角，
+    # 不能持续压过朝向反馈，使车头越摆越斜；上下安装映射保持不变。
+    desired_heading = max(-lateral_heading_limit, min(lateral_heading_limit,
+                           config.reverse_steering_sign*math.atan(config.steering_gain*side)/config.reverse_heading_gain))
+    yaw = sign*config.reverse_heading_gain*(heading-desired_heading)
+    return v, max(-config.max_angular_speed, min(config.max_angular_speed, yaw)), reason
 
 
 def slew(previous, target, acceleration, dt):
@@ -223,52 +319,122 @@ def smooth_yaw(previous, target, config, dt, curve_strength=0.0):
     return slew(previous, filtered, acceleration, dt)
 
 
-def tracking_geometry(points, width, height, config):
-    """Choose measured near/forward points relative to a virtual body reference.
+class SteeringDirectionGuard:
+    """对底盘转弯曲率做迟滞和新帧换向确认，不直接控制单轮舵机角度。"""
+    def __init__(self):
+        self.reset()
 
-    Ratios describe image coordinates only. The off-image reference is a tuning
-    model, not a calibrated ground-plane projection of the real chassis centre.
-    Missing line sections are never extrapolated to the invisible chassis.
-    """
-    if (not isinstance(width, (int, float)) or not isinstance(height, (int, float))
-            or not math.isfinite(width) or not math.isfinite(height)
-            or width <= 1 or height <= 1):
-        return None, 'invalid_image_size'
-    if len(points) < 2 or any(not math.isfinite(v) for p in points for v in p):
-        return None, 'insufficient_heading_points'
-    if any(x < 0 or x >= width or y < 0 or y >= height for x, y in points):
-        return None, 'invalid_centerline'
-    forward = -1.0 if config.image_forward_direction == 'up' else 1.0
-    rx = config.vehicle_reference_x_ratio * (width - 1)
-    ry = config.vehicle_reference_y_ratio * (height - 1)
-    ahead = [(x, y) for x, y in points if forward * (y - ry) > 1.0]
-    # 较短缺口通过两端实测线段的几何验证后，作为同一条线续接，不能仅凭单端延长中线。
-    ahead.sort(key=lambda point: forward * (point[1] - ry))
-    trusted = []
-    bridges = []
-    bridged_pixels = 0.0
-    for index, point in enumerate(ahead):
-        gap = forward * (point[1] - trusted[-1][1]) if trusted else 0.0
-        if gap > config.max_trusted_gap_ratio * (height - 1):
-            if (bridged_pixels + gap > config.max_bridge_gap_ratio * (height - 1)
-                    or not bridge_supported(trusted, ahead[index:], width, height, config)):
-                break
-            bridges.append({'from': trusted[-1], 'to': point})
-            bridged_pixels += gap
-        trusted.append(point)
-    ahead = trusted
-    if len(ahead) < 2 or max(y for _, y in ahead) - min(y for _, y in ahead) < 10:
-        return None, 'no_forward_line'
-    if max(y for _, y in ahead) - min(y for _, y in ahead) < config.min_forward_span_ratio * (height - 1):
-        return None, 'insufficient_forward_span'
-    near_x, near_y = min(ahead, key=lambda p: abs(p[1] - ry))
-    visible_reference_y = max(0.0, min(height - 1, ry))
-    ground_start_y = max(0.0, min(height - 1, visible_reference_y
-                                + forward * config.near_edge_margin_ratio * (height - 1)))
-    near_gap = max(0.0, forward * (near_y - ground_start_y))
-    if near_gap > config.max_near_gap_ratio * (height - 1):
-        return None, 'near_line_missing'
-    requested_y = ry + forward * config.lookahead_distance_ratio * (height - 1)
+    def reset(self):
+        self.direction = self.pending_direction = self.pending_frames = 0
+        self.active = False
+        self.sample = None
+        self.curvature = self.raw_curvature = 0.
+        self.state = 'straight'
+        self.center_direction = self.center_frames = 0
+        self.center_ready = False
+
+    def update(self, raw_yaw, config, sample, dt, error_normalized=None, curve_strength=0.):
+        # raw_yaw是在配置速度下算出的需求，不用已经减速的v作分母，
+        # 否则低速接近或视觉减速会放大曲率，要求轮子突然转大角度。
+        nominal = min(config.forward_speed, config.reverse_max_speed) if config.drive_direction == 'reverse' else config.forward_speed
+        nominal = -nominal if config.drive_direction == 'reverse' else nominal
+        if abs(nominal) < 1e-9:
+            self.reset()
+            return 0.
+        self.raw_curvature = raw_yaw/nominal
+        magnitude = abs(self.raw_curvature)
+        direction = 1 if self.raw_curvature > 0 else -1
+        target = 0.
+        new_frame = sample != self.sample
+        self.sample = sample
+        # 小转向只在直线持续偏向同一侧时放行，不整体降低抗摆动门槛。
+        # 只累计新图；进入弯道、回到中心带、失效或复位时撤销回中余量。
+        valid_error = (not isinstance(error_normalized, bool)
+                       and isinstance(error_normalized, (int, float))
+                       and math.isfinite(error_normalized) and abs(error_normalized) <= 1.)
+        eligible = (valid_error and config.drive_direction == 'forward'
+                    and 0. <= curve_strength <= .25
+                    and abs(error_normalized) > config.error_deadband)
+        if not eligible:
+            self.center_direction = self.center_frames = 0
+            self.center_ready = False
+        elif new_frame:
+            side = 1 if error_normalized > 0. else -1
+            if side != self.center_direction:
+                self.center_direction, self.center_frames = side, 0
+                self.center_ready = False
+            if abs(error_normalized) >= 1.5*config.error_deadband:
+                self.center_frames += 1
+                self.center_ready = self.center_frames >= config.straight_center_confirmation_frames
+            elif not self.center_ready:
+                self.center_frames = 0
+        enter = config.straight_center_curvature_enter if self.center_ready else config.steering_curvature_enter
+        exit_threshold = min(config.steering_curvature_exit, enter*.5)
+        if magnitude <= exit_threshold:
+            self.pending_direction = self.pending_frames = 0
+            self.active = False
+            self.state = 'deadband'
+        elif self.direction == 0:
+            if magnitude >= enter:
+                self.direction = direction
+                self.active = True
+                target = self.raw_curvature
+                self.state = 'turning'
+            else:
+                self.state = 'deadband'
+        elif direction == self.direction:
+            self.pending_direction = self.pending_frames = 0
+            if self.active or magnitude >= enter:
+                self.active = True
+                target = self.raw_curvature
+                self.state = 'turning'
+            else:
+                self.state = 'deadband'
+        elif magnitude >= enter:
+            self.active = False
+            if direction != self.pending_direction:
+                self.pending_direction, self.pending_frames = direction, int(new_frame)
+            elif new_frame:
+                self.pending_frames += 1
+            required = (2 if magnitude >= config.steering_fast_reverse_curvature
+                        else config.steering_reverse_frames)
+            self.state = 'confirming_reverse'
+            # 确认期间向直行衰减，不继续维持旧转向；强反向弯也至少要两张新图。
+            if self.pending_frames >= required:
+                self.direction = direction
+                self.active = True
+                self.pending_direction = self.pending_frames = 0
+                target = self.raw_curvature
+                self.state = 'turning'
+        else:
+            self.active = False
+            self.pending_direction = self.pending_frames = 0
+            self.state = 'deadband'
+        tau = config.steering_filter_time_sec
+        alpha = -math.expm1(-max(0., dt)/tau) if tau > 0. else 1.
+        self.curvature += alpha*(target-self.curvature)
+        if target == 0. and abs(self.curvature) < exit_threshold*.5:
+            self.curvature = 0.
+        return self.curvature
+
+
+def coordinated_velocity(previous_v, previous_w, target_v, target_w, config, dt, curve_strength=0.):
+    """统一插值比例满足线/角加速度约束，避免起步/减速时独立滤波改变转弯比例。"""
+    if abs(target_v) < 1e-9:
+        return 0., 0.
+    dv, dw = target_v-previous_v, target_w-previous_w
+    angular_limit = config.angular_acceleration+curve_strength*(
+        config.curve_angular_acceleration-config.angular_acceleration)
+    scale = 1.
+    for delta, limit in ((dv, config.linear_acceleration), (dw, angular_limit)):
+        if abs(delta) > 1e-12:
+            scale = min(scale, limit*max(0., dt)/abs(delta))
+    return previous_v+scale*dv, previous_w+scale*dw
+
+
+def lookahead_target(ahead, bridges, ry, forward, distance_ratio, height, config):
+    """在可信实测段或已验证的缺口内连续取点，不向不可见路径外推。"""
+    requested_y = ry + forward * distance_ratio * (height - 1)
     target_x, target_y = min(ahead, key=lambda p: abs(p[1] - requested_y))
     # 在相邻实测行之间连续取前瞻点，避免目标在两行之间来回跳而导致转向顿挫。
     # 未批准的缺口仍由 trusted 前缀截断；这里不向可见范围以外延长。
@@ -289,6 +455,88 @@ def tracking_geometry(points, width, height, config):
             target_y = requested_y
             target_gap_interpolated = True
             break
+    return target_x, target_y, requested_y, target_gap_interpolated
+
+
+def tracking_geometry(points, width, height, config):
+    """Choose measured near/forward points relative to a virtual body reference.
+
+    Ratios describe image coordinates only. The off-image reference is a tuning
+    model, not a calibrated ground-plane projection of the real chassis centre.
+    Missing line sections are never extrapolated to the invisible chassis.
+    """
+    if (not isinstance(width, (int, float)) or not isinstance(height, (int, float))
+            or not math.isfinite(width) or not math.isfinite(height)
+            or width <= 1 or height <= 1):
+        return None, 'invalid_image_size'
+    if len(points) < 2 or any(not math.isfinite(v) for p in points for v in p):
+        return None, 'insufficient_heading_points'
+    if any(x < 0 or x >= width or y < 0 or y >= height for x, y in points):
+        return None, 'invalid_centerline'
+    forward = -1.0 if config.image_forward_direction == 'up' else 1.0
+    rx = config.vehicle_reference_x_ratio * (width - 1)
+    ry = config.vehicle_reference_y_ratio * (height - 1)
+    visible_reference_y = max(0.0, min(height - 1, ry))
+    ground_start_y = max(0.0, min(height - 1, visible_reference_y
+                                + forward * config.near_edge_margin_ratio * (height - 1)))
+    # 车轮遮挡区只用于显示，不能让其中几颗蓝点成为控制段起点，
+    # 否则全图有几十个实测点，可信前缀仍可能在第一处小缺口被截成1~2点。
+    ahead = [(x, y) for x, y in points if forward * (y - ry) > 1.0
+             and forward*(y-ground_start_y) >= 0.]
+    # 较短缺口通过两端实测线段的几何验证后，作为同一条线续接，不能仅凭单端延长中线。
+    ahead.sort(key=lambda point: forward * (point[1] - ry))
+    minimum_span = max(10., config.min_forward_span_ratio*(height-1),
+                       config.min_valid_row_fraction*(height-1))
+    ignored_fragments = 0
+    # 选第一个自身可用的连续实测段，跳过本来就无法控制的前导碎点。
+    # 不跳过有效近端线段，不把空白补成线，后面的近端距离上限仍生效。
+    start = 0
+    while start < len(ahead):
+        end = start+1
+        while (end < len(ahead) and
+               abs(ahead[end][1]-ahead[end-1][1]) <= config.max_trusted_gap_ratio*(height-1)):
+            end += 1
+        span = abs(ahead[end-1][1]-ahead[start][1])
+        if end-start >= 2 and span >= minimum_span:
+            break
+        if end == len(ahead):
+            break  # 全部只有短线时，保留原来的不足/停车判断。
+        next_end = end+1
+        while (next_end < len(ahead) and
+               abs(ahead[next_end][1]-ahead[next_end-1][1]) <= config.max_trusted_gap_ratio*(height-1)):
+            next_end += 1
+        fit = fit_axis_line(ahead[end:min(next_end, end+10)])
+        if (fit is None or abs(ahead[next_end-1][1]-ahead[end][1]) < minimum_span
+                or abs(ahead[end][1]-ahead[end-1][1]) > config.max_bridge_gap_ratio*(height-1)
+                or any(abs(x-(fit[0]*y+fit[1])) > config.bridge_lateral_tolerance_ratio*(width-1)
+                       for x, y in ahead[start:end])):
+            break  # 不把短近端线跳到另一根偏移的远线；必须与后段的实测走向相容。
+        ignored_fragments += end-start
+        start = end
+    ahead = ahead[start:]
+    trusted = []
+    bridges = []
+    bridged_pixels = 0.0
+    for index, point in enumerate(ahead):
+        gap = forward * (point[1] - trusted[-1][1]) if trusted else 0.0
+        if gap > config.max_trusted_gap_ratio * (height - 1):
+            if (bridged_pixels + gap > config.max_bridge_gap_ratio * (height - 1)
+                    or not bridge_supported(trusted, ahead[index:], width, height, config)):
+                break
+            bridges.append({'from': trusted[-1], 'to': point})
+            bridged_pixels += gap
+        trusted.append(point)
+    ahead = trusted
+    if len(ahead) < 2 or max(y for _, y in ahead) - min(y for _, y in ahead) < 10:
+        return None, 'no_forward_line'
+    if max(y for _, y in ahead) - min(y for _, y in ahead) < config.min_forward_span_ratio * (height - 1):
+        return None, 'insufficient_forward_span'
+    near_x, near_y = min(ahead, key=lambda p: abs(p[1] - ry))
+    near_gap = max(0.0, forward * (near_y - ground_start_y))
+    if near_gap > config.max_near_gap_ratio * (height - 1):
+        return None, 'near_line_missing'
+    target_x, target_y, requested_y, target_gap_interpolated = lookahead_target(
+        ahead, bridges, ry, forward, config.lookahead_distance_ratio, height, config)
     heading = math.atan2(target_x - rx, forward * (target_y - ry))
     # 近端实测切线与近端到前瞻点的走向相比较，区分真弯道与整条直线平移。
     support = [ahead[0]]
@@ -311,7 +559,23 @@ def tracking_geometry(points, width, height, config):
         turn_evidence = max(abs(bend), abs(path_heading))
         curve_strength = min(1.0, max(0.0,
             (turn_evidence - config.curve_detection_angle_rad) / config.curve_detection_angle_rad))
+    near_heading = (math.atan(forward * fit[0]) if fit is not None and len(support) >= 3
+                    and abs(support[-1][1]-support[0][1]) >= max(12., .06*(height-1)) else None)
+    # 用固定预览判别弯道，再连续缩短跟踪前瞻，避免反复切换识别强度。
+    lookahead_ratio = config.lookahead_distance_ratio - curve_strength * max(
+        0., config.lookahead_distance_ratio-config.curve_lookahead_distance_ratio)
+    if config.drive_direction == 'forward' and curve_strength > 0:
+        target_x, target_y, requested_y, target_gap_interpolated = lookahead_target(
+            ahead, bridges, ry, forward, lookahead_ratio, height, config)
+        heading = math.atan2(target_x-rx, forward*(target_y-ry))
+        if fit is not None and forward*(target_y-near_y) > 1.:
+            path_heading = math.atan2(target_x-(fit[1]+fit[0]*near_y), forward*(target_y-near_y))
+        elif near_heading is not None:
+            path_heading = near_heading
     error = (near_x - rx) / ((width - 1) / 2.0)
+    supported_lookahead = forward*(ahead[-1][1]-requested_y) >= 0. and forward*(requested_y-near_y) > 0.
+    # 只按可见近端到前瞻点所需的支撑长度调速，不能把遮挡区的虚拟距离也算成缺线。
+    visible_lookahead = max(minimum_span, forward*(requested_y-near_y))
     return {
         'reference_x': rx, 'reference_y': ry,
         'ground_start_y': ground_start_y, 'near_gap_pixels': near_gap,
@@ -319,11 +583,16 @@ def tracking_geometry(points, width, height, config):
         'target_x': target_x, 'target_y': target_y,
         'trusted_end_x': ahead[-1][0], 'trusted_end_y': ahead[-1][1],
         'bridged_gaps': bridges,
+        'ignored_leading_points': ignored_fragments,
+        'lookahead_supported': supported_lookahead,
+        'measured_points': len(ahead),
         'target_gap_interpolated': target_gap_interpolated,
-        'path_heading_rad': path_heading, 'bend_angle_rad': bend, 'curve_strength': curve_strength,
+        'path_heading_rad': path_heading, 'near_heading_rad': near_heading,
+        'effective_lookahead_ratio': lookahead_ratio if config.drive_direction == 'forward' else None,
+        'bend_angle_rad': bend, 'curve_strength': curve_strength,
         'trusted_span_ratio': abs(ahead[-1][1] - near_y) / (height - 1),
         'trusted_speed_factor': min(1.0, max(config.min_speed_factor,
-            abs(ahead[-1][1] - near_y) / (config.lookahead_distance_ratio * (height - 1))))
+            abs(ahead[-1][1] - near_y) / visible_lookahead))
             * (config.bridge_speed_factor if bridges else 1.0),
         'error_normalized': max(-1.0, min(1.0, error)),
         'heading_error_rad': heading,
@@ -340,6 +609,32 @@ def fit_axis_line(samples):
         return None
     slope = median(slopes)
     return slope, median(x - slope * y for x, y in samples)
+
+
+def straight_image_axis(points, width, height, geometry, config):
+    """从可信实测段拟合直线；返回近端居中误差/轴向角，弯曲或支撑不足返回None。
+
+    使用图像归一化坐标，不把像素当米，也不向相机视野以外推算轨迹。
+    """
+    if geometry is None or geometry['bridged_gaps']:
+        return None
+    low, high = sorted((geometry['near_y'], geometry['trusted_end_y']))
+    samples = sorted(((x, y) for x, y in points if low <= y <= high), key=lambda point: point[1])
+    if len(samples) < 6 or high-low < .20*(height-1):
+        return None
+    # 限制稳健拟合点数，避免在50Hz控制循环中进行大规模两两斜率计算。
+    samples = [samples[round(i*(len(samples)-1)/15)] for i in range(16)] if len(samples) > 16 else samples
+    fit = fit_axis_line(samples)
+    if fit is None:
+        return None
+    slope, intercept = fit
+    residual = max(abs(x-(slope*y+intercept)) for x, y in samples)
+    if residual > .0125*(width-1):
+        return None
+    forward = -1. if config.image_forward_direction == 'up' else 1.
+    return {'error_normalized': (slope*geometry['near_y']+intercept-geometry['reference_x'])/((width-1)/2),
+            'near_heading_rad': math.atan(forward*slope), 'fit_residual_px': residual,
+            'span_px': high-low}
 
 
 def bridge_supported(near, far, width, height, config):

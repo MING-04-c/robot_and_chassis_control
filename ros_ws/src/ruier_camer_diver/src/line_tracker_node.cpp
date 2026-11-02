@@ -166,6 +166,8 @@ private:
     std::ostringstream json;
     json << std::fixed << std::setprecision(4)
          << "{\"state\":\"" << state << "\",\"lost\":" << (lost ? "true" : "false")
+         << ",\"source_stamp_sec\":" << last_header_.stamp.sec
+         << ",\"source_stamp_nanosec\":" << last_header_.stamp.nanosec
          << ",\"valid_rows\":" << (result ? result->valid_rows : 0)
          << ",\"rejected_rows\":" << (result ? result->rejected_rows : 0)
          << ",\"inferred_rows\":" << (result ? result->inferred_rows : 0)

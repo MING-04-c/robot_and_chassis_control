@@ -422,6 +422,128 @@ class LocalControlTest(unittest.TestCase):
         self.wait_for(lambda: self.controller.failed, 3)
         self.assertEqual(len(captures), 1)
 
+    def test_automatic_line_round_trip_switches_direction_and_checkpoints(self):
+        from rcl_interfaces.msg import SetParametersResult
+        follower = Node('line_follow_controller')
+        follower.declare_parameter('drive_direction', 'forward')
+        follower.declare_parameter('reverse_return_to_start', False)
+        self.executor.add_node(follower)
+        self.addCleanup(follower.destroy_node)
+        mux = VelocityMux()
+        self.executor.add_node(mux)
+        self.addCleanup(mux.destroy_node)
+        self.controller.use_velocity_mux = True
+        self.controller.stop_pid_before_follow = False
+        flags = dict(enabled=False, direction='forward', started=0., forward_resumed=False, reverse_resumed=False)
+        events = []
+        publisher = follower.create_publisher(String, '/line_follow/status', 10)
+        def configure(parameters):
+            if flags['enabled']:
+                return SetParametersResult(successful=False, reason='must disable before switching')
+            for parameter in parameters:
+                if parameter.name == 'drive_direction':
+                    flags['direction'] = parameter.value
+                    events.append(parameter.value)
+            return SetParametersResult(successful=True)
+        follower.add_on_set_parameters_callback(configure)
+        def enable(request, response):
+            flags['enabled'] = request.data
+            flags['started'] = time.monotonic()
+            events.append('enable' if request.data else 'disable')
+            response.success = True
+            return response
+        def save(request, response):
+            self.assertFalse(flags['enabled'])
+            events.append('save')
+            response.success = True
+            response.message = json.dumps({'snapshot_file': str(Path(self.temp.name)/'snapshot.json')})
+            return response
+        def feedback():
+            state = 'disabled'
+            if flags['enabled']:
+                done = time.monotonic()-flags['started'] > .25
+                resumed = flags[flags['direction']+'_resumed']
+                state = ('stop_marker_final' if flags['direction'] == 'forward' else 'reverse_route_complete') if done and resumed else 'stop_marker_intermediate' if done else 'tracking'
+            publisher.publish(String(data=json.dumps(dict(state=state))))
+        follower.create_service(SetBool, '/line_follow_controller/enable', enable)
+        follower.create_service(Trigger, '/line_follow_controller/save_route', save)
+        from std_msgs.msg import Empty
+        def resume(message):
+            flags[flags['direction']+'_resumed'] = True
+        follower.create_subscription(Empty, '/line_follow/resume', resume, 10)
+        resume_pub = self.node.create_publisher(Empty, '/line_follow/resume', 10)
+        follower.create_timer(.02, feedback)
+        self.controller.create_subscription(Odometry, '/wheel_odom', self.controller.on_wheel_odom, 10)
+        self.controller.steps = [
+            dict(action='line_follow', drive_direction='forward', until_untrusted=True, require_final_marker=True),
+            dict(action='wait_chassis_stopped', stable_seconds=.1),
+            dict(action='save_line_route'),
+            dict(action='delay', seconds=.2),
+            dict(action='line_follow', drive_direction='reverse', until_untrusted=True, require_final_marker=True,
+                 skip_intermediate_markers=True, return_to_start=True),
+            dict(action='wait_chassis_stopped', stable_seconds=.1)]
+        self.controller.on_start_request(Trigger.Request(), Trigger.Response())
+        self.wait_for(lambda: self.controller.follow_status == 'stop_marker_intermediate', 3.)
+        self.pump(.3)
+        self.assertEqual(self.controller.step_index, 0, 'forward intermediate station did not wait')
+        self.assertFalse(flags['forward_resumed'])
+        self.assertNotIn('save', events)
+        resume_pub.publish(Empty())
+        self.wait_for(lambda: not self.controller.active, 8.)
+        self.assertFalse(self.controller.failed, self.controller.last_failure)
+        self.assertEqual([event for event in events if event != 'disable' and event != 'enable'], ['forward', 'save', 'reverse'])
+        self.assertFalse(flags['enabled'])
+        self.assertTrue(self.controller.route_checkpoint_file.endswith('snapshot.json'))
+
+    def test_recorded_route_completion_finishes_follow_step(self):
+        mux = VelocityMux()
+        self.executor.add_node(mux)
+        self.addCleanup(mux.destroy_node)
+        self.controller.use_velocity_mux = True
+        self.controller.stop_pid_before_follow = False
+        flags = {'following': False, 'state': 'reverse_route_tracking'}
+        publisher = self.node.create_publisher(String, '/line_follow/status', 10)
+        commands = self.node.create_publisher(Twist, '/robot_control/line_follow/cmd_vel', 10)
+        def enable(request, response):
+            flags['following'] = request.data
+            response.success = True
+            return response
+        def feedback():
+            state = flags['state'] if flags['following'] else 'disabled'
+            publisher.publish(String(data=json.dumps({'state': state})))
+            cmd = Twist()
+            cmd.linear.x = -.01 if state in ('reverse_route_tracking', 'reverse_visual_finish_tracking') else 0.
+            commands.publish(cmd)
+        self.node.create_service(SetBool, '/line_follow_controller/enable', enable)
+        self.node.create_timer(.02, feedback)
+        self.controller.steps = [{'action': 'line_follow', 'until_untrusted': True,
+                                  'require_final_marker': True, 'progress_timeout_sec': .4}]
+        self.controller.on_start_request(Trigger.Request(), Trigger.Response())
+        self.wait_for(lambda: flags['following'], 1.5)
+        self.pump(.6)
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.controller.failed)
+        flags['state'] = 'reverse_visual_finish_tracking'
+        self.pump(.6)
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.controller.failed)
+        flags['state'] = 'reverse_visual_finish_aligning'
+        self.pump(.6)
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.controller.failed, 'valid transverse alignment was treated as lost progress')
+        flags['state'] = 'reverse_route_complete'
+        self.wait_for(lambda: not self.controller.active, 2.)
+        self.assertFalse(self.controller.failed)
+        self.assertFalse(flags['following'])
+
+        # 即使使用按时长结束的循迹步骤，终点未居中也不得被计时器冒充完成。
+        flags['state'] = 'reverse_finish_goal_not_centered'
+        self.controller.steps = [{'action': 'line_follow', 'seconds': 0.01}]
+        self.controller.on_start_request(Trigger.Request(), Trigger.Response())
+        self.wait_for(lambda: self.controller.failed, 2.)
+        self.assertFalse(self.controller.active)
+        self.wait_for(lambda: not flags['following'], 1.)
+
     def test_marker_station_wait_pauses_timeout_and_requires_final_marker(self):
         workflow_states = []
         self.node.create_subscription(String, '/task_controller/status',
@@ -442,7 +564,7 @@ class LocalControlTest(unittest.TestCase):
             state = flags['state'] if flags['following'] else 'disabled'
             publisher.publish(String(data=json.dumps({'state': state})))
             cmd = Twist()
-            cmd.linear.x = .01 if state in ('tracking', 'stop_marker_approaching') else 0.
+            cmd.linear.x = .01 if state in ('tracking', 'stop_marker_approaching', 'stop_marker_missing_approaching') else 0.
             commands.publish(cmd)
         self.node.create_service(SetBool, '/line_follow_controller/enable', enable)
         self.node.create_timer(.02, feedback)
@@ -452,6 +574,10 @@ class LocalControlTest(unittest.TestCase):
         self.controller.on_start_request(Trigger.Request(), Trigger.Response())
         self.wait_for(lambda: flags['following'], 1.5)
         self.pump(.2)
+        flags['state'] = 'stop_marker_missing_approaching'
+        self.pump(.5)  # 受限缓行属于进度，不触发普通0.4秒进度超时。
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.controller.failed)
         flags['state'] = 'stop_marker_settling'
         self.pump(.8)  # 停车确认可以超过普通0.4秒进度超时，仍保持零速等待。
         self.assertTrue(self.controller.active)

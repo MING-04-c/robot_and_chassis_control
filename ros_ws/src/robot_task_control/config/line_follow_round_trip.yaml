@@ -1,0 +1,32 @@
+# 正常前进到最终横线；途中站等待继续，倒车步骤执行时才返回出发点。
+workflow:
+  name: line_follow_round_trip
+  auto_start: true
+  steps:
+  - action: line_follow
+    drive_direction: forward
+    until_untrusted: true
+    require_final_marker: true
+    boundary_wait_sec: 5.0
+    progress_timeout_sec: 3.0
+    step_timeout_sec: 900.0
+  - action: wait_chassis_stopped
+    stable_seconds: 1.0
+    step_timeout_sec: 15.0
+  - action: save_line_route
+    step_timeout_sec: 10.0
+  # 可在此处插入既有机械臂动作/采集/TCP步骤；不要关闭底盘驱动或重新启动前进录制。
+  - action: delay
+    seconds: 2.0
+  - action: line_follow
+    drive_direction: reverse
+    skip_intermediate_markers: true
+    return_to_start: true
+    until_untrusted: true
+    require_final_marker: true
+    boundary_wait_sec: 5.0
+    progress_timeout_sec: 3.0
+    step_timeout_sec: 900.0
+  - action: wait_chassis_stopped
+    stable_seconds: 1.0
+    step_timeout_sec: 15.0

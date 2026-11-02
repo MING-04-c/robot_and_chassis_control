@@ -28,7 +28,15 @@ def generate_launch_description():
     camera_share = get_package_share_directory('ruier_camer_diver')
     driver_share = get_package_share_directory('masc_chassis_ros_driver')
     return LaunchDescription([
-        DeclareLaunchArgument('forward_speed', default_value='0.075', description='前进速度，m/s'),
+        DeclareLaunchArgument('drive_direction', default_value='forward', choices=['forward', 'reverse']),
+        DeclareLaunchArgument('route_visual_finish', default_value='true'),
+        DeclareLaunchArgument('route_camera_stop', default_value='true'),
+        DeclareLaunchArgument('route_file', default_value='~/.ros/line_follow/last_route.json'),
+        DeclareLaunchArgument('reverse_mode', default_value='recorded_route', choices=['recorded_route', 'camera']),
+        DeclareLaunchArgument('reverse_steering_sign', default_value='-1.0',
+                              description='倒车转向实车标定：-1翻转，+1保留标准映射；前进不受影响'),
+        DeclareLaunchArgument('forward_speed', default_value='0.075',
+            description='行驶速度绝对值，m/s；reverse输出负速度'),
         DeclareLaunchArgument(
             'image_forward_direction', default_value='down',
             description='前方方向：down 向下（当前车身在上方），up 向上',
@@ -96,6 +104,12 @@ def generate_launch_description():
             name='line_follow_controller', output='screen',
             condition=UnlessCondition(LaunchConfiguration('dry_run')),
             parameters=[LaunchConfiguration('control_params'), {
+                'drive_direction': LaunchConfiguration('drive_direction'),
+                'route_file': LaunchConfiguration('route_file'),
+                'route_visual_finish': ParameterValue(LaunchConfiguration('route_visual_finish'), value_type=bool),
+                'route_camera_stop': ParameterValue(LaunchConfiguration('route_camera_stop'), value_type=bool),
+                'reverse_mode': LaunchConfiguration('reverse_mode'),
+                'reverse_steering_sign': ParameterValue(LaunchConfiguration('reverse_steering_sign'), value_type=float),
                 'forward_speed': ParameterValue(LaunchConfiguration('forward_speed'), value_type=float),
                 'image_forward_direction': LaunchConfiguration('image_forward_direction'),
                 'steering_sign': ParameterValue(LaunchConfiguration('steering_sign'), value_type=float),
@@ -114,6 +128,12 @@ def generate_launch_description():
             name='line_follow_controller', output='screen',
             condition=IfCondition(LaunchConfiguration('dry_run')),
             parameters=[LaunchConfiguration('control_params'), {
+                'drive_direction': LaunchConfiguration('drive_direction'),
+                'route_file': LaunchConfiguration('route_file'),
+                'route_visual_finish': ParameterValue(LaunchConfiguration('route_visual_finish'), value_type=bool),
+                'route_camera_stop': ParameterValue(LaunchConfiguration('route_camera_stop'), value_type=bool),
+                'reverse_mode': LaunchConfiguration('reverse_mode'),
+                'reverse_steering_sign': ParameterValue(LaunchConfiguration('reverse_steering_sign'), value_type=float),
                 'forward_speed': ParameterValue(LaunchConfiguration('forward_speed'), value_type=float),
                 'image_forward_direction': LaunchConfiguration('image_forward_direction'),
                 'steering_sign': ParameterValue(LaunchConfiguration('steering_sign'), value_type=float),

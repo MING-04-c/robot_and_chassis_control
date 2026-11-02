@@ -81,6 +81,8 @@ def main():
              status.get("error_normalized", 0) > 0.1, image)
         pump(lambda: bool(debug) and debug[0].width == 1280 and
              debug[0].height == 1024 and bool(path) and len(path[0].polygon.points) > 0, image)
+        pump(lambda: bool(path) and status.get('source_stamp_sec') == path[0].header.stamp.sec
+             and status.get('source_stamp_nanosec') == path[0].header.stamp.nanosec, image)
         assert client.wait_for_service(timeout_sec=2)
 
         def set_hue(low, high):

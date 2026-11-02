@@ -2,6 +2,18 @@
 
 此包包含Elite CS机器人系列的实际驱动程序。它是Elite_Robots_CS_ROS2_Driver仓库的一部分，依赖于该仓库中的其他包。有关如何安装和启动此驱动程序的信息，请参阅主仓库的README文件。
 
+## 启动时自动上电和释放抱闸
+
+`elite_control.launch.py` 默认 `auto_power_on=true`、`headless_mode=true`。真机按以下顺序启动：dashboard/primary连接 → 查询安全与机器人模式 → 必要时调用 `/dashboard_client/power_on` → 确认待机 `IDLE` → 调用 `/dashboard_client/brake_release` → 确认 `RUNNING` → 启动硬件接口与控制器。已处于 `RUNNING` 时跳过重复命令；假硬件模式不调用真机上电服务。启动辅助进程完成后退出，不常驻。
+
+```bash
+ros2 launch eli_cs_robot_driver elite_control.launch.py
+```
+
+原有 `robot_ip`、`local_ip`、`cs_type` 参数用法不变。默认总超时240秒（`power_on_timeout`），单次上电或释放抱闸服务最多等待120秒（`power_command_timeout`），状态查询回复等待10秒。SDK 的上电服务会等待机器人达到 IDLE/RUNNING 才返回，释放抱闸服务会等待 RUNNING 才返回，因此这两步允许较长等待；按实际状态顺序执行，不靠固定延时猜测完成；服务拒绝、响应超时或安全状态异常会取消后续控制器启动，不自动清除急停、保护停止或安全报警。需要保留原手动方式时，传 `auto_power_on:=false`。
+
+这里只替代软件界面的上电、释放抱闸操作；远程控制、控制柜及示教器相关硬件配置仍按厂家要求处理，物理拔掉示教器后若触发安全停止，不能靠这两个服务绕过。参考[厂家快速使用指南4.1.1节](https://docs.elibot.cn/cs/1ffff/9a93b)。
+
 ## 技术细节
 
 以下图示展示了该驱动程序架构的粗略概览。

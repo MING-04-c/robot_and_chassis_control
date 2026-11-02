@@ -24,7 +24,7 @@ class KeyboardTeleop(Node):
         self.control = KeyboardControl(
             self.declare_parameter('linear_speed', 0.05).value,
             self.declare_parameter('angular_speed', 0.2).value,
-            self.declare_parameter('key_timeout', 0.35).value)
+            self.declare_parameter('key_timeout', 0.6).value)
         self.publisher = self.create_publisher(Twist, topic, 10)
         self.stop_requested = False
 
@@ -61,8 +61,13 @@ def main(args=None):
             f'linear={node.control.linear_speed:.3f} m/s, angular={node.control.angular_speed:.3f} rad/s, '
             f'no movement key for {node.control.timeout:.2f}s -> stop.')
         escape_until = 0.0
+        last_loop = time.monotonic()
+        was_moving = False
         while not node.stop_requested and rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0)
+            now = time.monotonic()
+            if now-last_loop > .1:
+                node.get_logger().warning(f'键盘发送循环延迟 {(now-last_loop)*1000:.0f}ms；底盘指令超时为100ms时可能停车')
+            last_loop = now
             readable, _, _ = select.select([terminal], [], [], 0.02)
             if readable:
                 data = os.read(terminal, 64)
@@ -85,7 +90,18 @@ def main(args=None):
                                 f'Speed: {node.control.linear_speed:.3f} m/s, '
                                 f'{node.control.angular_speed:.3f} rad/s')
             if not node.stop_requested:
-                node.publish(*node.control.command(time.monotonic()))
+                now = time.monotonic()
+                command = node.control.command(now)
+                moving = any(command)
+                if was_moving and not moving:
+                    age = now-node.control.last_motion_key
+                    reason = (f'按键输入超时，距上次移动键 {age:.3f}s'
+                              if age >= node.control.timeout else '收到停车或非移动按键')
+                    node.get_logger().info('键盘发出零速：'+reason)
+                elif moving and not was_moving:
+                    node.get_logger().info('键盘开始连续发送运动指令')
+                was_moving = moving
+                node.publish(*command)
     except Exception as error:
         code = 1
         if node is not None:

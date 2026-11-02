@@ -9,7 +9,7 @@
 | launch 文件 | 用途 | 开始方式 |
 |---|---|---|
 | arm_admittance_only | 仅机械臂导纳 | 就绪后自动 |
-| line_follow_only | 仅底盘循迹 | 就绪后自动；auto_start:=false 仅等待 |
+| line_follow_only | 前进记录、reverse返程；round_trip:=true 按任务顺序自动往返 | 就绪后自动；auto_start:=false 仅等待 |
 | keyboard_teleop | 底盘键盘控制 | 键盘 |
 | line_follow_arm_test | 整体联动：循迹、四点机械臂、末尾拍照发送 | 默认自动；remote_control:=true 等主机开始 |
 | camera_capture_remote | 只采图发送，不加载运动驱动 | 麒麟 start_capture.py |
@@ -62,3 +62,13 @@ test/                   本包回归测试，非任务启动入口
 - [主机通讯实现](../eli_cs_robot_serial/device/industrial_pc/README.md)
 
 首次目录调整后需清除旧安装路径中的同名 launch，避免 ROS2 递归查找出现重复；本次工作区已完成迁移。其他机器更新代码时先备份自行修改过的安装配置，再只清理 `build/robot_task_control`、`install/robot_task_control` 并重新构建该包。本轮另已清理被删除入口及旧示例的安装副本。旧 remote 命令改用 `line_follow_arm_test.launch.py remote_control:=true`；旧 detection_test 是内部检测栈，不再作为常用入口。
+
+记录路线返回复用 `line_follow_only.launch.py`。前进默认记录 `/wheel_odom` 到 `~/.ros/line_follow/last_route.json`，倒车自动选用 `config/line_follow_return.yaml`，到记录起点收到 `reverse_route_complete` 才完成。该回程允许最多900秒，故障/偏离/超时保持停车；前置图像丢线不作为完成条件。保持前进停车时的位置和朝向再启动倒车，详情见循迹包说明。
+
+## 自动循迹往返与返程路线封存
+
+复用 `line_follow_only.launch.py round_trip:=true`，流程配置为 `config/line_follow_round_trip.yaml`。前进途中站等待新继续消息，最终横线结束前进；随后等待底盘连续停稳、自动执行 `save_line_route` 封存路线，再执行中间步骤，最后由 `line_follow` 的 `drive_direction: reverse` 开始返程。倒车步骤设置 `skip_intermediate_markers: true` 自动继续途中站，并设置 `return_to_start: true` 核对已记录出发站；仅在原出发点完成返程。若出发点需要视觉横线确认，应事先设置出发停止横线。
+
+封存副本位于 `~/.ros/line_follow/snapshots/`；`/task_controller/status` 的 `route_checkpoint_file` 和 `/line_follow/status` 的 `route_snapshot_file` 可查看本轮文件。等待机械臂/TCP期间不追加副本，不清零里程计，也不停止底盘驱动。等待期间观测到底盘相对封存位置移动超过2.5cm、转动超过0.05rad或里程计异常时拒绝自动倒车；这些是保护界限，不是定位精度保证。
+
+当前测试在封存后预留2秒 `delay`。实际联动时，在 `save_line_route` 之后、reverse步骤之前插入机械臂或采集/TCP步骤，任务控制器只会在上一步确认完成后推进。测试入口只启动底盘、循迹相机及任务控制器，不会额外启动机械臂或TCP进程。命令及途中站继续方式见工作空间控制命令文档。

@@ -186,6 +186,13 @@ def generate_launch_description():
             ),
             {
                 "enabled": False,
+                "drive_direction": LaunchConfiguration("line_drive_direction"),
+                "route_file": LaunchConfiguration("line_route_file"),
+                "route_visual_finish": ParameterValue(LaunchConfiguration("line_route_visual_finish"), value_type=bool),
+                "route_camera_stop": ParameterValue(LaunchConfiguration("line_route_camera_stop"), value_type=bool),
+                "reverse_mode": LaunchConfiguration("line_reverse_mode"),
+                "reverse_steering_sign": ParameterValue(
+                    LaunchConfiguration("line_reverse_steering_sign"), value_type=float),
                 "show_window": ParameterValue(
                     LaunchConfiguration("line_show_window"), value_type=bool
                 ),
@@ -329,6 +336,12 @@ def generate_launch_description():
             DeclareLaunchArgument("hk_output_dir", default_value="~/robot_data/hk"),
             DeclareLaunchArgument("line_camera_device", default_value="/dev/video0"),
             DeclareLaunchArgument("line_follow_speed", default_value="0.075"),
+            DeclareLaunchArgument("line_route_file", default_value="~/.ros/line_follow/last_route.json"),
+            DeclareLaunchArgument("line_route_visual_finish", default_value="true"),
+            DeclareLaunchArgument("line_route_camera_stop", default_value="true"),
+            DeclareLaunchArgument("line_reverse_mode", default_value="recorded_route", choices=["recorded_route", "camera"]),
+            DeclareLaunchArgument("line_reverse_steering_sign", default_value="-1.0"),
+            DeclareLaunchArgument("line_drive_direction", default_value="forward", choices=["forward", "reverse"]),
             DeclareLaunchArgument("line_stop_marker_target_ratio", default_value="0.5"),
             DeclareLaunchArgument("line_show_window", default_value="false"),
             DeclareLaunchArgument("line_adaptive_exposure", default_value="true"),

@@ -9,7 +9,7 @@ class KeyboardControl:
              'q': (0, 0, 1), 'e': (0, 0, -1),
              'z': (-1, 0, 1), 'c': (-1, 0, -1)}
 
-    def __init__(self, linear_speed=0.05, angular_speed=0.2, key_timeout=0.35):
+    def __init__(self, linear_speed=0.05, angular_speed=0.2, key_timeout=0.6):
         if not all(math.isfinite(v) for v in (linear_speed, angular_speed, key_timeout)):
             raise ValueError('keyboard settings must be finite')
         if not 0.01 <= linear_speed <= 0.3 or not 0.05 <= angular_speed <= 0.8:

@@ -27,7 +27,9 @@ def pure_checks():
                           'q': (0.0, 0.0, 0.2), 'e': (0.0, 0.0, -0.2)}.items():
         control.key(key, 1.0)
         assert control.command(1.1) == expected
-        assert control.command(1.36) == (0.0, 0.0, 0.0)
+        # 首次按下到系统连发约0.5秒，期间不应先停车再启动。
+        assert control.command(1.5) == expected
+        assert control.command(1.61) == (0.0, 0.0, 0.0)
     control.key('w', 2)
     control.key(' ', 2.01)
     assert control.command(2.02) == (0, 0, 0)
@@ -64,7 +66,7 @@ def main():
     with tempfile.TemporaryFile(mode='w+') as log:
         child = subprocess.Popen([
             'ros2', 'launch', 'masc_chassis_user_control', 'keyboard_teleop.launch.py',
-            'start_driver:=false', 'cmd_vel_topic:=/keyboard_test/cmd_vel',
+            'start_driver:=false', 'cmd_vel_topic:=/keyboard_test/cmd_vel', 'linear_speed:=0.05',
         ], stdin=slave, stdout=log, stderr=log, start_new_session=True)
         try:
             wait(lambda: bool(messages))
@@ -72,6 +74,17 @@ def main():
             os.write(master, b'w')
             wait(lambda: messages[-1].linear.x > 0)
             assert messages[-1].linear.x == 0.05
+            # 模拟长按首次连发前约0.5秒的等待，及随后正常连发；中间不能插入零速。
+            mark = len(messages)
+            until = time.monotonic()+.48
+            while time.monotonic() < until:
+                rclpy.spin_once(harness, timeout_sec=.01)
+            for _ in range(5):
+                os.write(master, b'w')
+                until = time.monotonic()+.08
+                while time.monotonic() < until:
+                    rclpy.spin_once(harness, timeout_sec=.01)
+            assert messages[mark:] and all(m.linear.x == .05 for m in messages[mark:])
             wait(lambda: messages[-1].linear.x == 0, 2)
             os.write(master, b'a')
             wait(lambda: messages[-1].linear.y > 0)

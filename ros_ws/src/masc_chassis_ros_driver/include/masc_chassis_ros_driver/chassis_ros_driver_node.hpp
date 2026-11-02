@@ -125,6 +125,7 @@ private:
     int m_bms_feedback_timeout_ms = 2500;
     int m_imu_feedback_timeout_ms = 100;
     int m_rc_feedback_timeout_ms = 250;
+    bool m_command_timeout_reported = false;
     bool m_stamped_control = false;
     bool m_publish_tf = false;
     std::string m_imu_frame_id = "imu_link";

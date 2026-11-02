@@ -8,7 +8,7 @@ os.environ.setdefault("ROS_LOG_DIR", "/tmp/arm-description-launch-test")
 
 import launch_ros.actions
 from launch import LaunchDescription, LaunchService
-from launch.actions import ExecuteProcess, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import ExecuteProcess, IncludeLaunchDescription, OpaqueFunction, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.utilities import evaluate_parameters, normalize_parameters
@@ -22,6 +22,7 @@ shares = {
 shares.pop("eli_cs_robot_serial", None)
 seen = []
 gate_exit_code = 0
+power_exit_code = 0
 original_node = launch_ros.actions.Node
 original_find = FindPackageShare.find
 
@@ -38,6 +39,12 @@ def fake_node(**kwargs):
         seen.append((kwargs.get("executable"), values))
         return []
 
+    if kwargs.get('executable') == 'auto_power_on.py':
+        class FakePowerGate(ExecuteProcess):
+            def execute(self, context):
+                inspect(context)
+                return super().execute(context)
+        return FakePowerGate(cmd=['/bin/true' if power_exit_code == 0 else '/bin/false'])
     if kwargs.get("executable") == "auto_admittance_start.py" and any(
         isinstance(params, dict) and params.get("wait_only") is True
         for params in kwargs.get("parameters", [])
@@ -45,6 +52,8 @@ def fake_node(**kwargs):
         # Exercise the actual parent OnProcessExit wiring, without ROS or hardware.
         class FakeConnectionGate(ExecuteProcess):
             def execute(self, context):
+                if not any(name == 'ros2_control_node' for name, _ in seen):
+                    return [TimerAction(period=.02, actions=[self])]
                 inspect(context)
                 return super().execute(context)
 
@@ -85,6 +94,8 @@ try:
     driver = by_executable["ros2_control_node"]["robot_description"]
     publisher = by_executable["robot_state_publisher"]["robot_description"]
     assert driver == publisher
+    order = [name for name, _ in seen]
+    assert order.index('eli_components_loader') < order.index('auto_power_on.py') < order.index('ros2_control_node')
     hardware = ET.fromstring(driver).find("ros2_control/hardware")
     params = {item.attrib["name"]: item.text for item in hardware.findall("param")}
     assert params["headless_mode"].lower() == "true", params
@@ -268,6 +279,43 @@ try:
         "dataset_capture_node.py" not in tracking
         and "hk_image_transfer" not in tracking
     )
+    for arguments, expected_speed in (({"drive_direction": "reverse"}, .075),
+                                     ({"drive_direction": "reverse", "route_camera_stop": "false", "route_visual_finish": "false"}, .075),
+                                     ({"drive_direction": "reverse", "line_follow_speed": ".03"}, .03),
+                                     ({"drive_direction": "reverse", "reverse_steering_sign": "1.0",
+                                       "route_file": "/tmp/recorded-route-launch.json"}, .075)):
+        seen.clear()
+        service = LaunchService()
+        service.include_launch_description(LaunchDescription([
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+                root / "robot_task_control/launch/line_follow_only.launch.py"
+            )), launch_arguments=arguments.items()),
+        ]))
+        assert service.run() == 0
+        reverse = {executable: values for executable, values in seen}
+        assert reverse["line_follow_node.py"]["drive_direction"] == "reverse"
+        assert reverse["line_follow_node.py"]["reverse_steering_sign"] == float(arguments.get("reverse_steering_sign", -1.))
+        assert reverse["line_follow_node.py"]["forward_speed"] == expected_speed
+        assert reverse["line_follow_node.py"]["image_forward_direction"] == "down"
+        assert reverse["line_follow_node.py"]["reverse_mode"] == "recorded_route"
+        assert reverse["line_follow_node.py"]["route_camera_stop"] == (arguments.get("route_camera_stop", "true") == "true")
+        assert reverse["line_follow_node.py"]["route_visual_finish"] == (arguments.get("route_visual_finish", "true") == "true")
+        assert reverse["line_follow_node.py"]["route_file"] == arguments.get("route_file", "~/.ros/line_follow/last_route.json")
+        assert str(reverse["task_controller"]["workflow_file"]).endswith("line_follow_return.yaml")
+        assert reverse["task_controller"]["auto_start"] is True
+        assert "ros2_control_node" not in reverse and "sensor_node" not in reverse
+    seen.clear()
+    service = LaunchService()
+    service.include_launch_description(LaunchDescription([
+        IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+            root / 'robot_task_control/launch/line_follow_only.launch.py'
+        )), launch_arguments={'round_trip': 'true'}.items())]))
+    assert service.run() == 0
+    round_trip = {executable: values for executable, values in seen}
+    assert round_trip['line_follow_node.py']['drive_direction'] == 'forward'
+    assert str(round_trip['task_controller']['workflow_file']).endswith('line_follow_round_trip.yaml')
+    assert round_trip['task_controller']['auto_start'] is True
+    assert 'ros2_control_node' not in round_trip and 'sensor_node' not in round_trip
     seen.clear()
     service = LaunchService()
     service.include_launch_description(
@@ -371,6 +419,22 @@ try:
     assert "ros2_control_node" in failed
     assert "admittance_pose_controller" not in failed and "move_group" not in failed
     assert "camera_node" not in failed and "task_controller" not in failed
+    for arguments, fail_power in (({'auto_power_on': 'false'}, False),
+                                  ({'use_fake_hardware': 'true'}, False), ({}, True)):
+        power_exit_code = 1 if fail_power else 0
+        seen.clear()
+        service = LaunchService()
+        service.include_launch_description(LaunchDescription([
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+                root/'eli_cs_robot_driver/launch/elite_control.launch.py'
+            )), launch_arguments=arguments.items())]))
+        assert service.run() == 0
+        names = [name for name, _ in seen]
+        if fail_power:
+            assert 'auto_power_on.py' in names and 'ros2_control_node' not in names
+        else:
+            assert 'auto_power_on.py' not in names and 'ros2_control_node' in names
+    power_exit_code = 0
     print(
         "PASS: staged startup order, defaults, reuse, hardware description ownership, and gate failure cancellation"
     )

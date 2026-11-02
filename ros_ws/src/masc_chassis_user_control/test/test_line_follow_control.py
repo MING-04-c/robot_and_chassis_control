@@ -4,6 +4,8 @@
 import math
 import sys
 import unittest
+import tempfile
+import json
 
 import cv2
 import numpy as np
@@ -12,7 +14,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from stop_marker import StopMarkerGate, detect_stop_markers
+from recorded_route import RouteConfig, RouteRecorder, ReverseRouteFollower, ReverseFinishGuard, load_route
 from line_follow_control import ControlConfig, line_command, motion_preview, tracking_geometry, slew, smooth_yaw  # noqa: E402
+from line_follow_control import SteeringDirectionGuard, coordinated_velocity, straight_image_axis, reverse_visual_command
+from reverse_visual import GroundMapping, near_line, strafe_command, aligned as visually_aligned, AlignmentSequencer
 
 
 raw_tracking_geometry = tracking_geometry
@@ -43,22 +48,798 @@ def observation(**updates):
     return value
 
 
+class RecordedRouteTests(unittest.TestCase):
+    def test_alignment_sequencer_hysteresis_stops_boundary_chatter(self):
+        route = RouteConfig()
+        sequence = AlignmentSequencer()
+        feedback = dict(metric=False, error_normalized=.07, near_heading_rad=0.)
+        for i in range(12):
+            phase = sequence.update(feedback, route, i, i*.1)
+        self.assertEqual(phase, 'ready')
+        for i in range(12, 32):
+            feedback['error_normalized'] = .087 if i % 2 else .079
+            self.assertEqual(sequence.update(feedback, route, i, i*.1), 'ready')
+        # 到终点仍用严格容差，迟滞不能把0.087当成最终合格；切换期间等待停稳。
+        feedback['error_normalized'] = .087
+        for i in range(32, 36):
+            self.assertEqual(sequence.update(feedback, route, i, i*.1, terminal=True), 'settling')
+        self.assertEqual(sequence.update(feedback, route, 40, 4., terminal=True, stopped=False), 'settling')
+        self.assertEqual(sequence.update(feedback, route, 41, 4.1, terminal=True), 'lateral')
+        vy, w = strafe_command(feedback, ControlConfig(), route)
+        self.assertGreater(abs(vy), .01)
+        self.assertEqual(w, 0.)
+        feedback['error_normalized'] = -.087
+        self.assertEqual(sequence.update(feedback, route, 42, 4.2, terminal=True), 'settling')
+        for now in (4.3, 4.4, 4.5):
+            self.assertEqual(sequence.update(feedback, route, 42, now, terminal=True), 'settling')
+        self.assertEqual(sequence.axis_direction, 1, 'same frame falsely confirmed reverse steering')
+        sequence.update(feedback, route, 43, 4.6, terminal=True)
+        sequence.update(feedback, route, 44, 4.7, terminal=True)
+        self.assertEqual(sequence.update(feedback, route, 45, 5.1, terminal=True, stopped=False), 'settling')
+        self.assertEqual(sequence.update(feedback, route, 46, 5.2, terminal=True), 'lateral')
+
+    def test_reverse_local_mask_axis_excludes_stop_bar_and_supports_ground_mapping(self):
+        config, route = ControlConfig(), RouteConfig()
+        mask = np.zeros((480, 640), np.uint8)
+        cv2.line(mask, (340, 20), (340, 460), 255, 16)
+        cv2.line(mask, (240, 160), (440, 160), 255, 16)
+        points = [(340. if not 150 <= y <= 170 else 300., float(y)) for y in range(20, 461, 6)]
+        feedback = near_line(points, mask, config)
+        self.assertIsNotNone(feedback)
+        self.assertLess(abs(feedback['near_heading_rad']), .001)
+        self.assertGreater(feedback['removed_wide_rows'], 0)
+        self.assertFalse(feedback['metric'])
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory)/'ground.json'
+            data = dict(frame_id='base_link', units='m', image_size=[640, 480],
+                        image_points_px=[[200, 100], [440, 100], [440, 400], [200, 400]],
+                        ground_points_m=[[.1, -.24], [.1, .24], [.7, .24], [.7, -.24]])
+            filename.write_text(json.dumps(data))
+            mapping = GroundMapping(filename)
+            feedback = near_line(points, mask, config, mapping)
+            self.assertAlmostEqual(feedback['lateral_error_m'], .04, places=5)
+            self.assertFalse(visually_aligned(feedback, route))
+            vy, w = strafe_command(feedback, config, route)
+            self.assertGreater(vy, 0.)
+            self.assertLess(abs(w), 1e-6)
+            changed = np.zeros((480, 800), np.uint8)
+            changed[:, 332:349] = 255
+            with self.assertRaises(ValueError):
+                near_line(points, changed, config, mapping)
+            data['ground_points_m'] = [[0., 0.]]*4
+            filename.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                GroundMapping(filename)
+
+    def test_holonomic_reverse_controls_axes_independently_and_converges(self):
+        config, route = ControlConfig(), RouteConfig()
+        feedback = dict(metric=False, error_normalized=.4, near_heading_rad=0.)
+        self.assertGreater(strafe_command(feedback, config, route)[0], 0.)
+        self.assertEqual(strafe_command(feedback, config, route)[1], 0.)
+        self.assertEqual(strafe_command(dict(feedback, error_normalized=0., near_heading_rad=.2), config, route)[0], 0.)
+        # 地面坐标局部运动学；车后方向只影响vx，横移纠偏符号不应倒置。
+        for vx in (-.03, 0.):
+            lateral, heading = .08, .18
+            sequencer = AlignmentSequencer()
+            for i in range(2500):
+                data = dict(metric=True, lateral_error_m=lateral, near_heading_rad=heading)
+                phase = sequencer.update(data, route, i//5, i*.02, terminal=i >= 2000)
+                vy, w = strafe_command(data, config, route)
+                vy = vy if phase == 'lateral' else 0.
+                w = w if phase == 'heading' else 0.
+                moving_vx = vx if phase == 'ready' and i < 2000 else 0.
+                self.assertFalse(vy and w, 'two steering modes active simultaneously')
+                lateral += (-vy+moving_vx*math.sin(heading))*.02
+                heading -= w*.02
+            self.assertLess(abs(lateral), route.visual_goal_lateral_m+.001)
+            self.assertLess(abs(heading), route.finish_goal_heading+.001)
+
+    def test_atomic_recording_validates_and_preserves_exact_endpoint(self):
+        config = RouteConfig()
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory)/'route.json'
+            recorder = RouteRecorder(config, 'odom', 'base_link')
+            for i in range(34):
+                recorder.add((i*.01, 0., 0.))
+            recorder.save(filename)
+            with self.assertRaises(ValueError):
+                load_route(filename)  # 行驶中的周期备份不能当作已停稳的返回路线。
+            recorder.finished = True
+            recorder.save(filename)
+            route = load_route(filename)
+            self.assertEqual(route['points'][-1], [.33, 0., 0.])
+            self.assertLess(len(route['points']), 34)
+            self.assertFalse(list(Path(directory).glob('.route.json*')))
+            # 新任务未走起来时先撤销旧记录，不能把旧路线误当作本次。
+            RouteRecorder(config, 'odom', 'base_link').save(filename)
+            with self.assertRaises(ValueError):
+                load_route(filename)
+            filename.write_text(json.dumps(dict(route, points=[[0, 0, 0], [1, 0, 0]])))
+            with self.assertRaises(ValueError):
+                load_route(filename)
+            filename.write_text('{partial')
+            with self.assertRaises(ValueError):
+                load_route(filename)
+
+    def test_reverse_pure_pursuit_converges_straight_curve_and_s_curve(self):
+        config = RouteConfig()
+        paths = [([(i*.01, 0., 0.) for i in range(101)]),
+                 ([(math.sin(i*.01), 1-math.cos(i*.01), i*.01) for i in range(101)]),
+                 ([(i*.01, .1*math.sin(math.pi*i*.01),
+                    math.atan(.1*math.pi*math.cos(math.pi*i*.01))) for i in range(201)])]
+        for points, speed in ((p, v) for p in paths for v in (.025, .05, .075, .08)):
+            follower = ReverseRouteFollower({'points': points}, points[-1], config)
+            x, y, yaw = points[-1]
+            max_error = 0.
+            for _ in range(6000):
+                v, w, state = follower.command((x, y, yaw), speed)
+                max_error = max(max_error, follower.diagnostics['tracking_error_m'])
+                self.assertLessEqual(abs(w), abs(v)*config.max_curvature+1e-9)
+                if state != 'reverse_route_tracking':
+                    break
+                self.assertLess(v, 0.)
+                x += v*math.cos(yaw)*.02
+                y += v*math.sin(yaw)*.02
+                yaw += w*.02
+            self.assertEqual(state, 'reverse_route_complete')
+            self.assertLessEqual(math.dist((x, y), points[0][:2]), config.goal_tolerance)
+            self.assertLess(max_error, .03)
+            self.assertEqual(follower.command((x+1., y, yaw), .025), (0., 0., 'reverse_route_complete'))
+
+    def test_return_speed_limit_and_approach_are_independent_of_lookahead(self):
+        points = [(i*.01, 0., 0.) for i in range(101)]
+        for lookahead in (.15, .30):
+            config = replace(RouteConfig(), lookahead=lookahead)
+            follower = ReverseRouteFollower({'points': points}, points[-1], config)
+            for x, requested, expected in ((1., .05, -.05), (.5, .2, -.08),
+                                            (.15, .05, -.05), (.05, .05, -.025),
+                                            (.04, .003, -.003), (.04, 0., 0.)):
+                # 连续里程计步进；大幅瞬移应被防跳段保护拒绝，不能用来测速度。
+                while follower.previous[0]-x > .011:
+                    follower.command((follower.previous[0]-.01, 0., 0.), requested)
+                v, w, state = follower.command((x, 0., 0.), requested)
+                self.assertEqual(state, 'reverse_route_tracking')
+                self.assertAlmostEqual(v, expected)
+                self.assertAlmostEqual(w, 0.)
+            self.assertEqual(follower.command((.015, 0., 0.), .05),
+                             (0., 0., 'reverse_route_complete'))
+        for name in ('max_speed', 'approach_distance'):
+            for invalid in (0., math.nan, math.inf, -1., True):
+                with self.assertRaises(ValueError):
+                    replace(RouteConfig(), **{name: invalid}).validate()
+
+    def test_route_retains_optional_station_events_for_return_audit(self):
+        recorder = RouteRecorder(RouteConfig(), 'odom', 'base_link')
+        recorder.add((0., 0., 0.))
+        recorder.add((.2, 0., 0.))
+        recorder.record_station(dict(id=1, action='ignored_departure', kind='intermediate'))
+        recorder.record_station(dict(id=2, action='arrived', kind='final'))
+        recorder.finished = True
+        with tempfile.TemporaryDirectory() as directory:
+            filename = str(Path(directory)/'route.json')
+            recorder.save(filename)
+            self.assertEqual([event['id'] for event in load_route(filename)['station_events']], [1, 2])
+            data = json.loads(Path(filename).read_text())
+            data.pop('station_events')
+            Path(filename).write_text(json.dumps(data))
+            self.assertTrue(load_route(filename)['valid'])
+
+    def test_remaining_straight_segment_rejects_bends_and_accepts_final_leg(self):
+        config = RouteConfig()
+        straight = ReverseRouteFollower({'points': [(i*.01, 0., 0.) for i in range(101)]},
+                                         (1., 0., 0.), config)
+        self.assertTrue(straight.remaining_is_straight())
+        points = [(i*.01, 0., 0.) for i in range(51)]
+        points += [(.5, i*.01, 0.) for i in range(1, 51)]
+        bend = ReverseRouteFollower({'points': points}, (.5, .5, 0.), config)
+        self.assertFalse(bend.remaining_is_straight())
+        bend.progress = .6
+        self.assertTrue(bend.remaining_is_straight())
+        for name in ('finish_center_gain', 'finish_heading_gain', 'finish_center_tolerance', 'finish_straight_distance'):
+            with self.assertRaises(ValueError):
+                replace(config, **{name: math.nan}).validate()
+        with self.assertRaises(ValueError):
+            replace(config, finish_straight_distance=.2).validate()
+
+    def test_mild_curve_feedforward_and_curved_corridor(self):
+        config = RouteConfig()
+        radius = 1.5
+        points = [(radius*math.sin(i*.01/radius), radius*(1-math.cos(i*.01/radius)), i*.01/radius)
+                  for i in range(101)]
+        tracker = ReverseRouteFollower({'points': points}, points[-1], config)
+        tracker.progress = tracker.arc[-1]-.6
+        self.assertTrue(tracker.remaining_is_gentle())
+        self.assertAlmostEqual(tracker.reference_curvature(), 1/radius, delta=.03)
+        pose = (*tracker.at(tracker.progress), 0.)
+        tracker.diagnostics['remaining_m'] = .6
+        guard = ReverseFinishGuard(tracker, pose, config)
+        self.assertIsNone(guard.check(pose), 'valid curved path was rejected by final tangent fence')
+        self.assertLess(guard.diagnostics['lateral_error_m'], .001)
+        for progress in (.5, .6, .7, .8, .9, tracker.arc[-1]):
+            tracker.progress = progress
+            self.assertIsNone(guard.check((*tracker.at(progress), 0.)))
+        self.assertEqual(tracker.reference_curvature(), 0.)
+        corner = [(i*.01, 0., 0.) for i in range(51)]+[(.5, i*.01, 0.) for i in range(1, 51)]
+        sharp = ReverseRouteFollower({'points': corner}, corner[-1], config)
+        self.assertFalse(sharp.remaining_is_gentle())
+
+    def test_visual_finish_search_limit_and_latched_fault(self):
+        config = RouteConfig()
+        self.assertTrue(config.finish_alignment_ok(.07, math.radians(5.)))
+        self.assertFalse(config.finish_alignment_ok(.513, 0.))
+        self.assertFalse(config.finish_alignment_ok(0., math.radians(7.)))
+        self.assertFalse(config.finish_alignment_ok(math.nan, 0.))
+        self.assertGreater(config.finish_exit_lateral, .513)
+        points = [(i*.01, 0., 0.) for i in range(101)]
+        tracker = ReverseRouteFollower({'points': points}, points[-1], config)
+        for index in range(100, 27, -1):
+            tracker.command((index*.01, 0., 0.), .05)
+        guard = ReverseFinishGuard(tracker, (.28, 0., 0.), config)
+        previous_command = {'linear_x_mps': -.03, 'angular_z_radps': .02}
+        guard.diagnostics.update(last_tracking_command=previous_command, control_terms_valid=True)
+        self.assertIsNone(guard.check((0., 0., 0.)))
+        self.assertFalse(guard.diagnostics['control_terms_valid'])
+        self.assertEqual(guard.diagnostics['last_tracking_command'], previous_command)
+        self.assertIsNone(guard.check((-.099, 0., 0.)))
+        self.assertEqual(guard.check((-.101, 0., 0.)), 'reverse_finish_search_limit')
+        self.assertEqual(guard.check((0., 0., 0.)), 'reverse_finish_search_limit')
+        guard = ReverseFinishGuard(tracker, (.28, 0., 0.), config)
+        self.assertEqual(guard.check((-.08, .08, 0.)), 'reverse_finish_search_limit')
+        guard = ReverseFinishGuard(tracker, (.28, 0., 0.), config)
+        self.assertEqual(guard.check((.28, .151, 0.)), 'reverse_finish_deviation')
+        guard = ReverseFinishGuard(tracker, (.28, 0., 0.), config)
+        for _ in range(30):
+            guard.check((.27, 0., 0.))
+            guard.check((.28, 0., 0.))
+        self.assertEqual(guard.fault, 'reverse_finish_search_limit')
+        guard.arrived = True
+        self.assertEqual(guard.check((1., 1., 0.)), 'reverse_route_complete')
+        for name in ('finish_speed', 'finish_distance', 'finish_extra_distance', 'finish_exit_lateral'):
+            for invalid in (-1., math.nan, math.inf, True):
+                with self.assertRaises(ValueError):
+                    replace(config, **{name: invalid}).validate()
+        self.assertEqual(config.finish_exit_lateral, .75)
+        for invalid in (.49, .96):
+            with self.assertRaises(ValueError):
+                replace(config, finish_exit_lateral=invalid).validate()
+        with self.assertRaises(ValueError):
+            replace(config, finish_extra_distance=.101).validate()
+
+    def test_alignment_after_odom_restart_and_closed_path_does_not_finish_early(self):
+        config = RouteConfig()
+        points = [(5.+i*.01, 3., 0.) for i in range(101)]
+        follower = ReverseRouteFollower({'points': points}, (0., 0., math.pi/2), config)
+        self.assertAlmostEqual(follower.points[-1][0], 0.)
+        self.assertAlmostEqual(follower.points[-1][1], -1.)
+        v, w, state = follower.command((0., 0., math.pi/2), .025)
+        self.assertEqual(state, 'reverse_route_tracking')
+        self.assertAlmostEqual(w, 0.)
+        self.assertLess(v, 0.)
+        points = [(math.sin(i*math.pi/100), 1-math.cos(i*math.pi/100), i*math.pi/100)
+                  for i in range(201)]
+        follower = ReverseRouteFollower({'points': points}, points[-1], config)
+        self.assertEqual(follower.command(points[-1], .025)[2], 'reverse_route_tracking')
+        for _ in range(20):
+            follower.command(points[-1], .025)
+        self.assertLess(follower.progress, .05)  # 原地及闭合线交叉不能跳到路线终点。
+
+    def test_deviation_wrong_heading_and_invalid_route_parameters_stop(self):
+        config = RouteConfig()
+        points = [(i*.01, 0., 0.) for i in range(101)]
+        follower = ReverseRouteFollower({'points': points}, points[-1], config)
+        self.assertEqual(follower.command((1., .3, 0.), .025), (0., 0., 'reverse_route_deviation'))
+        follower = ReverseRouteFollower({'points': points}, points[-1], config)
+        self.assertEqual(follower.command((1., 0., math.pi), .025), (0., 0., 'reverse_target_not_behind'))
+        for values in ({'lookahead': 0.}, {'max_curvature': 10.}, {'odom_timeout': float('nan')}):
+            with self.assertRaises(ValueError):
+                replace(config, **values).validate()
+
+
 class ControlTests(unittest.TestCase):
+    def test_small_heading_noise_does_not_reverse_wheel_demand(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        guard = SteeringDirectionGuard()
+        for frame in range(60):
+            heading = .09 if frame % 2 else -.09
+            _, yaw, reason = line_command(observation(heading_error_rad=heading,
+                                                     near_heading_rad=heading), config)
+            self.assertEqual(reason, 'tracking')
+            self.assertEqual(guard.update(yaw, config, frame, .05), 0.)
+        # 确实需要转弯时，不会被小噪声死区挡住。
+        self.assertGreater(guard.update(.2, config, 61, .05), 0.)
+
+    def test_sustained_straight_offset_allows_gentle_centering(self):
+        config = replace(ControlConfig(forward_ignore_start_marker=False), steering_filter_time_sec=0.)
+        for side in (-1., 1.):
+            guard = SteeringDirectionGuard()
+            error = side*.065  # 约21px；原始转向低于普通防摆动门槛。
+            _, yaw, _ = line_command(observation(error_normalized=error, near_heading_rad=0.), config)
+            self.assertLess(abs(yaw/config.forward_speed), config.steering_curvature_enter)
+            for frame in range(config.straight_center_confirmation_frames-1):
+                self.assertEqual(guard.update(yaw, config, frame, .05,
+                                              error_normalized=error), 0.)
+            for _ in range(20):
+                self.assertEqual(guard.update(yaw, config, frame, .02,
+                                              error_normalized=error), 0.)
+            value = guard.update(yaw, config, frame+1, .05, error_normalized=error)
+            self.assertGreater(side*value, 0.)
+            self.assertTrue(guard.center_ready)
+            # 回到直线允许带时撤销回中状态；同样需求在弯道不降低抗摆动门槛。
+            guard.update(0., config, frame+2, .05, error_normalized=side*.03)
+            self.assertFalse(guard.center_ready)
+            for frame in range(20):
+                self.assertEqual(guard.update(yaw, config, frame+100, .05,
+                                              error_normalized=error, curve_strength=.8), 0.)
+            self.assertFalse(guard.center_ready)
+
+    def test_alternating_side_noise_never_enables_centering(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        guard = SteeringDirectionGuard()
+        for frame in range(60):
+            error = .065 if frame % 2 else -.065
+            _, yaw, _ = line_command(observation(error_normalized=error, near_heading_rad=0.), config)
+            self.assertEqual(guard.update(yaw, config, frame, .05, error_normalized=error), 0.)
+            self.assertFalse(guard.center_ready)
+        for bad in ({'straight_center_curvature_enter': 0.},
+                    {'straight_center_curvature_enter': .4},
+                    {'straight_center_confirmation_frames': True},
+                    {'straight_center_confirmation_frames': 2}):
+            with self.assertRaises(ValueError):
+                replace(config, **bad).validate()
+
+    def test_reverse_confirmation_counts_new_images_and_survives_zero_gap(self):
+        config = replace(ControlConfig(forward_ignore_start_marker=False), steering_filter_time_sec=0.)
+        guard = SteeringDirectionGuard()
+        scale = config.forward_speed
+        self.assertEqual(guard.update(scale*.8, config, 0, .02), .8)
+        guard.update(0., config, 1, .02)
+        self.assertEqual(guard.update(-scale*.8, config, 2, .02), 0.)
+        for _ in range(20):
+            self.assertEqual(guard.update(-scale*.8, config, 2, .02), 0.)
+        self.assertEqual(guard.pending_frames, 1)
+        self.assertEqual(guard.update(-scale*.8, config, 3, .02), 0.)
+        self.assertAlmostEqual(guard.update(-scale*.8, config, 4, .02), -.8)
+        # 大幅反向弯在两张新图后响应，不受弱纠偏的三帧延迟。
+        self.assertEqual(guard.update(scale*2., config, 5, .02), 0.)
+        self.assertAlmostEqual(guard.update(scale*2., config, 6, .02), 2.)
+
+    def test_weak_alternating_turn_with_zero_does_not_switch_direction(self):
+        config = replace(ControlConfig(forward_ignore_start_marker=False), steering_filter_time_sec=0.)
+        guard = SteeringDirectionGuard()
+        guard.update(.06, config, 0, .05)
+        for frame in range(1, 30):
+            target = -.06 if frame % 2 else 0.
+            self.assertGreaterEqual(guard.update(target, config, frame, .05), 0.)
+        for updates in ({'steering_curvature_enter': .1}, {'steering_reverse_frames': True},
+                        {'steering_reverse_frames': 1}, {'steering_fast_reverse_curvature': .2}):
+            with self.assertRaises(ValueError):
+                replace(config, **updates).validate()
+
+    def test_coordinated_acceleration_preserves_turn_ratio_in_both_directions(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        for sign in (-1., 1.):
+            v = w = 0.
+            for target in (.075, .025, .008):
+                for _ in range(80):
+                    old_v, old_w = v, w
+                    v, w = coordinated_velocity(v, w, sign*target, sign*target*2., config, .02)
+                    self.assertAlmostEqual(w/v, 2.)
+                    self.assertLessEqual(abs(v-old_v), config.linear_acceleration*.02+1e-10)
+                    self.assertLessEqual(abs(w-old_w), config.angular_acceleration*.02+1e-10)
+            self.assertEqual(coordinated_velocity(v, w, 0., 1., config, .02), (0., 0.))
+
+    def test_straight_position_error_is_not_counted_again_as_heading(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        status = observation(error_normalized=.3, heading_error_rad=.4)
+        old = line_command(status, config)[1]
+        new = line_command(dict(status, near_heading_rad=0.), config)[1]
+        self.assertAlmostEqual(new, math.atan(config.steering_gain*(.3-config.error_deadband)))
+        self.assertLess(abs(new), abs(old))
+
+    def test_adaptive_preview_is_continuous_and_keeps_straight_preview(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        straight, _ = raw_tracking_geometry([(320, y) for y in range(120, 470, 6)], 640, 480, config)
+        self.assertEqual(straight['effective_lookahead_ratio'], config.lookahead_distance_ratio)
+        previous = straight['effective_lookahead_ratio']
+        for slope in np.linspace(.01, .45, 45):
+            geometry, reason = raw_tracking_geometry(
+                [(320+slope*(y-120), y) for y in range(120, 470, 6)], 640, 480, config)
+            self.assertIsNone(reason)
+            ratio = geometry['effective_lookahead_ratio']
+            self.assertGreaterEqual(ratio, config.curve_lookahead_distance_ratio)
+            self.assertLessEqual(ratio, previous+1e-9)
+            self.assertLess(abs(ratio-previous), .02)
+            previous = ratio
+        self.assertAlmostEqual(previous, config.curve_lookahead_distance_ratio)
+
+    def test_final_visual_axis_uses_measured_straight_line_and_rejects_curve(self):
+        config = replace(ControlConfig(), drive_direction='reverse')
+        for direction in ('up', 'down'):
+            config = replace(config, image_forward_direction=direction,
+                             vehicle_reference_y_ratio=1.05 if direction == 'up' else -.05)
+            points = [(330+.1*(y-240), y) for y in range(20, 460, 6)]
+            geometry, reason = raw_tracking_geometry(points, 640, 480, config)
+            self.assertIsNone(reason)
+            axis = straight_image_axis(points, 640, 480, geometry, config)
+            self.assertIsNotNone(axis)
+            self.assertAlmostEqual(axis['near_heading_rad'], math.atan(.1)*(1 if direction == 'down' else -1))
+            self.assertLess(axis['fit_residual_px'], .1)
+            self.assertIsNone(straight_image_axis(points, 640, 480,
+                dict(geometry, bridged_gaps=[{}]), config))
+        config = replace(config, image_forward_direction='down', vehicle_reference_y_ratio=-.05)
+        points = [(320+.003*(y-200)**2, y) for y in range(110, 460, 6)]
+        geometry, reason = raw_tracking_geometry(points, 640, 480, config)
+        self.assertIsNone(reason)
+        self.assertIsNone(straight_image_axis(points, 640, 480, geometry, config))
+
+    def test_final_visual_centering_improves_offset_in_short_reverse_model(self):
+        route = RouteConfig()
+        config = replace(ControlConfig(), drive_direction='reverse', forward_speed=route.finish_speed,
+                         reverse_max_speed=route.finish_speed, steering_gain=route.finish_center_gain,
+                         reverse_heading_gain=route.finish_heading_gain,
+                         error_deadband=route.finish_center_tolerance, heading_deadband_rad=.02,
+                         max_angular_speed=.06, curve_max_angular_speed=.06)
+        lateral, yaw, v, w, curvature = .08, .05, 0., 0., 0.
+        # 简化相机投影及车体模型，仅验证反馈趋势，不是实车精度结论。
+        for _ in range(1000):
+            status = observation(error_normalized=(lateral-.15*yaw)/.3,
+                                 heading_error_rad=-yaw, near_heading_rad=-yaw, curve_strength=0.)
+            target_v, target_w, reason = line_command(status, config)
+            self.assertEqual(reason, 'tracking')
+            target = max(-route.max_curvature, min(route.max_curvature, target_w/target_v))
+            curvature += .02/(.25+.02)*(target-curvature)
+            v, w = coordinated_velocity(v, w, target_v, target_v*curvature, config, .02)
+            lateral -= v*math.sin(yaw)*.02
+            yaw += w*.02
+            self.assertLessEqual(abs(w), .06+1e-9)
+        self.assertLess(abs(lateral), .025)
+        self.assertLess(abs(yaw), .08)
+
+    def test_front_camera_reverse_separates_heading_from_lateral_correction(self):
+        for direction in ('up', 'down'):
+            forward = replace(ControlConfig(forward_ignore_start_marker=False), image_forward_direction=direction)
+            reverse = replace(forward, drive_direction='reverse')
+            side = observation(error_normalized=.4, near_heading_rad=0.)
+            vf, wf, _ = line_command(side, forward)
+            vr, wr, reason = line_command(side, reverse)
+            self.assertGreater(vf, 0.)
+            self.assertLess(vr, 0.)
+            self.assertLessEqual(abs(vr), reverse.reverse_max_speed)
+            self.assertEqual(reason, 'tracking')
+            self.assertAlmostEqual(wr, -wf)
+            aligned = observation(heading_error_rad=.2, near_heading_rad=.2)
+            self.assertGreater(line_command(aligned, forward)[1]*line_command(aligned, reverse)[1], 0.)
+            self.assertEqual(line_command(observation(), reverse)[:2], (0., 0.))
+            for key, value in (('lost', True), ('valid_row_fraction', 0.), ('processing_over_budget', True)):
+                self.assertEqual(line_command(dict(side, **{key: value}), reverse)[:2], (0., 0.))
+
+    def test_logged_final_reverse_offset_and_heading_correct_together(self):
+        route = RouteConfig()
+        legacy = replace(ControlConfig(), drive_direction='reverse', reverse_steering_sign=-1.)
+        control = replace(legacy, forward_speed=.03, reverse_max_speed=.03,
+                          reverse_steering_sign=route.finish_lateral_sign,
+                          steering_gain=route.finish_center_gain, reverse_heading_gain=route.finish_heading_gain,
+                          error_deadband=route.finish_center_tolerance, heading_deadband_rad=.02,
+                          max_angular_speed=.06)
+        # 现场记录：线偏左且朝向正偏，两项应同向纠正，不能继续输出负角速度。
+        for error, heading_deg, reference in ((-.136, 6.3, .125), (-.199, 8.1, .247), (-.295, 11.7, -.105)):
+            data = observation(error_normalized=error, near_heading_rad=math.radians(heading_deg))
+            v, w, reason = reverse_visual_command(data, control)
+            self.assertEqual(reason, 'tracking')
+            self.assertLess(v, 0.)
+            self.assertGreater(w, 0.)
+            curvature = max(-route.max_curvature, min(route.max_curvature, reference+w/v))
+            self.assertGreater(v*curvature, 0.)
+        self.assertEqual(legacy.reverse_steering_sign, -1.)
+        for invalid in (0., 2., True, math.nan, '1'):
+            with self.assertRaises(ValueError):
+                replace(route, finish_lateral_sign=invalid).validate()
+
+    def test_visual_reverse_calibration_does_not_invert_heading_feedback(self):
+        # 现场日志：负偏移持续放大时，不能因横向项更大而在车头已斜向另一侧后继续正转。
+        cfg = replace(ControlConfig(), drive_direction='reverse', reverse_heading_gain=.8,
+                      reverse_max_speed=.03, error_deadband=.02, heading_deadband_rad=.02,
+                      reverse_steering_sign=1., max_angular_speed=.06)
+        for error, angle in ((-.590, -11.8), (-.696, -20.5)):
+            data = observation(error_normalized=error, near_heading_rad=math.radians(angle))
+            self.assertLess(reverse_visual_command(data, cfg)[1], 0.)
+        for direction in ('up', 'down'):
+            cfg = replace(ControlConfig(), drive_direction='reverse', image_forward_direction=direction)
+            for heading in (-.2, .2):
+                data = observation(near_heading_rad=heading, heading_error_rad=heading)
+                first = reverse_visual_command(data, replace(cfg, reverse_steering_sign=1.))[1]
+                second = reverse_visual_command(data, replace(cfg, reverse_steering_sign=-1.))[1]
+                self.assertEqual(first, second)
+                forward = line_command(data, replace(cfg, drive_direction='forward'))[1]
+                self.assertGreater(first*forward, 0.)
+            for side in (-.2, .2):
+                data = observation(error_normalized=side, near_heading_rad=0.)
+                first = reverse_visual_command(data, replace(cfg, reverse_steering_sign=1.))[1]
+                second = reverse_visual_command(data, replace(cfg, reverse_steering_sign=-1.))[1]
+                self.assertAlmostEqual(first, -second)
+            data = observation(lost=True, near_heading_rad=0.)
+            self.assertEqual(reverse_visual_command(data, cfg)[:2], (0., 0.))
+
+    def test_visual_reverse_mild_curve_and_independent_lateral_calibration_converge(self):
+        # 简化车体与图像投影；检验反馈分项符号和小弯趋势，不承诺实车精度。
+        route = RouteConfig()
+        for calibration in (-1., 1.):
+            cfg = replace(ControlConfig(), drive_direction='reverse', forward_speed=.03,
+                          reverse_max_speed=.03, reverse_steering_sign=calibration,
+                          steering_gain=.65, reverse_heading_gain=.8, error_deadband=.02,
+                          heading_deadband_rad=.02, max_angular_speed=.06)
+            lateral, yaw_error, v, w, curvature = .06, .08, 0., 0., 0.
+            reference = .6
+            for _ in range(1500):
+                data = observation(error_normalized=calibration*(lateral-.15*yaw_error)/.3,
+                                   near_heading_rad=-yaw_error, heading_error_rad=-yaw_error)
+                target_v, correction, reason = reverse_visual_command(data, cfg)
+                self.assertEqual(reason, 'tracking')
+                target = max(-2., min(2., reference+correction/target_v))
+                curvature += .02/(.25+.02)*(target-curvature)
+                v, w = coordinated_velocity(v, w, target_v, target_v*curvature, cfg, .02)
+                lateral -= v*math.sin(yaw_error)*.02
+                yaw_error += (w-reference*v)*.02
+                self.assertLessEqual(abs(w), .06+1e-8)
+            self.assertLess(abs(lateral), .025)
+            self.assertLess(abs(yaw_error), .08)
+
+    def test_reverse_device_sign_changes_yaw_only(self):
+        # 标准车身运动律与实车方向标定分开验证，不能用输出翻转证明实车收敛。
+        for image_direction in ('up', 'down'):
+            for side, heading in ((.2, 0.), (0., .2), (-.2, -.1)):
+                data = observation(error_normalized=side, near_heading_rad=heading)
+                for direction in ('forward', 'reverse'):
+                    standard = replace(ControlConfig(forward_ignore_start_marker=False), image_forward_direction=image_direction,
+                                       drive_direction=direction, reverse_steering_sign=1.)
+                    corrected = replace(standard, reverse_steering_sign=-1.)
+                    v, w, reason = line_command(data, standard)
+                    cv, cw, cr = line_command(data, corrected)
+                    self.assertEqual((v, reason), (cv, cr))
+                    self.assertAlmostEqual(cw, -w if direction == 'reverse' else w)
+        for bad in (0., 2., True, 'minus'):
+            with self.assertRaises(ValueError):
+                replace(ControlConfig(forward_ignore_start_marker=False), reverse_steering_sign=bad).validate()
+
+    def test_front_camera_reverse_straight_kinematics_converges(self):
+        # 简化平面模型：半图宽对应0.3m，前置观测点领先0.15m；只检验符号和稳定趋势。
+        # 这不是相机实测投影，也不代表已验证实车倒车精度。
+        for drive in ('forward', 'reverse'):
+            config = replace(ControlConfig(forward_ignore_start_marker=False), drive_direction=drive, forward_speed=.025)
+            lateral, yaw, previous_w = .08, .05, 0.
+            previous_v = 0.
+            guard = SteeringDirectionGuard()
+            for index in range(4000):
+                heading = -yaw
+                error = (lateral-.15*yaw)/.3
+                v, wanted, reason = line_command(observation(error_normalized=error,
+                    heading_error_rad=heading, near_heading_rad=heading), config)
+                self.assertEqual(reason, 'tracking')
+                curvature = guard.update(wanted, config, int(index*.02/.05), .02,
+                                         error_normalized=error)
+                previous_v, previous_w = coordinated_velocity(previous_v, previous_w,
+                    v, curvature*v, config, .02)
+                lateral -= previous_v*math.sin(yaw)*.02
+                yaw += previous_w*.02
+            self.assertLess(abs(lateral), .025, drive)
+            self.assertLess(abs(yaw), .08, drive)
+
+    def test_reverse_can_leave_initial_station_and_stop_at_next(self):
+        for image_direction in ('up', 'down'):
+            config = replace(ControlConfig(forward_ignore_start_marker=False), drive_direction='reverse',
+                             image_forward_direction=image_direction)
+            sign = -1. if image_direction == 'down' else 1.
+            gate = StopMarkerGate()
+            def bar(error):
+                return {'x': 320., 'y': 480*(.5+sign*error), 'kind': 'intermediate'}
+            gate.observe([bar(-.01)], 480, config, now=0.)
+            self.assertTrue(gate.startup_ignored)
+            self.assertEqual(gate.limit(-.025, config), (-.025, 'searching'))
+            # 两帧漏检后回来仍是出发横线，不能立即重新停车。
+            for i in range(1, 4):
+                gate.observe([], 480, config, now=i*.05)
+            gate.observe([bar(-.02)], 480, config, now=.2)
+            self.assertEqual(gate.limit(-.025, config), (-.025, 'searching'))
+            for frame in range(3):
+                gate.observe([bar(-.10)], 480, config, now=.3+frame*.02)
+                self.assertTrue(gate.startup_ignored)
+                self.assertEqual(gate.limit(-.025, config), (-.025, 'searching'))
+            gate.observe([bar(-.16)], 480, config, now=.4)
+            self.assertTrue(gate.startup_ignored)
+            gate.observe([bar(-.49)], 480, config, now=.41)
+            self.assertFalse(gate.startup_ignored)
+            # 解除后重复出现的这根已离站横线也不应再触发停车。
+            gate.observe([bar(-.16)], 480, config, now=.42)
+            self.assertEqual(gate.limit(-.025, config), (-.025, 'searching'))
+            self.assertEqual(gate.station_id, 0)
+            # 新站接近及到位仍照常停车计数。
+            for index, error in enumerate((.15, .1, .05, .02, 0.)):
+                for frame in range(7):
+                    gate.observe([bar(error)], 480, config, now=.5+index*.2+frame*.02)
+            self.assertEqual(gate.limit(-.025, config), (0., 'stopped_intermediate'))
+            self.assertEqual(gate.station_id, 1)
+            self.assertTrue(gate.resume(config))
+            self.assertTrue(gate.startup_checked)  # 途中继续不会重新开启出发横线忽略窗口。
+
+    def test_departure_dropout_keeps_identity_and_station_counts(self):
+        config = replace(ControlConfig(), drive_direction='reverse')
+        gate = StopMarkerGate()
+        def bar(y):
+            return {'x': 320., 'y': float(y), 'kind': 'intermediate'}
+        gate.observe([bar(240)], 480, config, now=0.)
+        gate.record_motion(-.05, 1., config)  # 现场仅退约5cm，出发线反复漏检。
+        for index in range(20):
+            gate.observe([] if index%2 else [bar(270)], 480, config, now=.1+index*.05)
+            self.assertEqual(gate.limit(-.05, config)[1], 'searching')
+        self.assertEqual(gate.ledger.counts['encountered'], 1)
+        self.assertEqual(gate.ledger.counts['ignored'], 1)
+        self.assertEqual(gate.ledger.counts['arrived'], 0)
+        gate.observe([bar(330)], 480, config, now=1.2)
+        for _ in range(5):
+            gate.observe([bar(330)], 480, config, now=1.3)
+        self.assertEqual(gate.ledger.counts['passed'], 1)
+        gate.observe([bar(475)], 480, config, now=1.4)
+        for y in (150, 180, 210, 240):
+            for _ in range(5):
+                gate.observe([bar(y)], 480, config, now=1.5)
+        self.assertEqual(gate.ledger.counts['encountered'], 2)
+        self.assertEqual(gate.ledger.counts['arrived'], 1)
+        self.assertTrue(gate.resume(config))
+        self.assertEqual(gate.ledger.counts['resumed'], 1)
+        self.assertEqual(gate.ledger.counts['ignored'], 1)
+        gate.record_motion(-.05, .2, config)
+        gate.observe([bar(330)], 480, config, now=1.6)
+        self.assertEqual(gate.ledger.counts['passed'], 2)
+        snapshot = gate.snapshot(config)
+        self.assertEqual([row['id'] for row in snapshot['station_history']], [1, 2])
+        self.assertEqual([e['action'] for e in gate.ledger.pending].count('ignored_departure'), 1)
+        held = StopMarkerGate()
+        held.observe([bar(240)], 480, config, now=0.)
+        held.record_odometry_distance(0.)
+        held.record_motion(-.05, 6., config)
+        held.observe([], 480, config, now=.5)
+        self.assertTrue(held.startup_ignored, 'commanded distance released a physically stationary departure')
+        held.record_odometry_distance(.26)
+        held.observe([], 480, config, now=.6)
+        self.assertFalse(held.startup_ignored)
+        self.assertEqual(held.ledger.counts['passed'], 0)
+        self.assertEqual(held.ledger.counts['uncertain'], 1)
+        for invalid in (0., math.nan, True, .6):
+            with self.assertRaises(ValueError):
+                replace(config, stop_marker_departure_hold_distance=invalid).validate()
+
+    def test_logged_reverse_start_overshoot_is_departure_after_wait(self):
+        for direction in ('down', 'up'):
+            config = replace(ControlConfig(forward_ignore_start_marker=False), drive_direction='reverse',
+                             image_forward_direction=direction, stop_marker_target_ratio=.46)
+            sign = -1. if direction == 'down' else 1.
+            gate = StopMarkerGate()
+            for frame in range(50):
+                gate.observe([], 480, config, now=frame*.05)
+                gate.record_motion(0., .05, config)
+            self.assertFalse(gate.startup_checked)
+            for index, pixel_error in enumerate((-46.51, -36.76, -36.51, -46.36)):
+                now = 3.+index
+                gate.observe([{'x': 320., 'y': .46*480+sign*pixel_error,
+                               'kind': 'intermediate'}], 480, config, now=now)
+                self.assertEqual(gate.limit(-.025, config), (-.025, 'searching'))
+                gate.record_motion(-.005, .1, config)
+                gate.observe([], 480, config, now=now+.7)
+                self.assertTrue(gate.startup_ignored)
+                self.assertEqual(gate.limit(-.025, config), (-.025, 'searching'))
+            self.assertEqual(gate.station_id, 0)
+        for budget in (0., .051):
+            with self.assertRaises(ValueError):
+                replace(ControlConfig(forward_ignore_start_marker=False), reverse_start_marker_max_travel=budget).validate()
+
+    def test_forward_start_bar_is_ignored_but_next_station_is_not(self):
+        for direction in ('up', 'down'):
+            config = replace(ControlConfig(), image_forward_direction=direction)
+            self.assertTrue(config.forward_ignore_start_marker)
+            sign = -1 if direction == 'up' else 1
+            gate = StopMarkerGate()
+            def observe(error, count=1):
+                for _ in range(count):
+                    gate.observe([{'x': 320., 'y': 240.+sign*error, 'kind': 'intermediate'}], 480, config)
+            observe(8.7, 6)  # 现场日志：启动时就压在+8.7px出发横线。
+            self.assertTrue(gate.startup_ignored)
+            self.assertEqual(gate.limit(.075, config), (.075, 'searching'))
+            for error in (-10., -35., -60., -80., -235.):
+                observe(error)
+            self.assertFalse(gate.startup_ignored)
+            for error in (100., 75., 50., 25., 10., 0.):
+                observe(error, 4)
+            self.assertTrue(gate.arrived)
+            self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
+            gate = StopMarkerGate()
+            observe(124.2, 4)  # 现场日志：启动时前方124像素，也属于出发线。
+            self.assertTrue(gate.startup_ignored)
+            self.assertEqual(gate.limit(.075, config), (.075, 'searching'))
+            for error in (100., 75., 50., 25., 10., 0., -25., -50., -80., -235.):
+                observe(error, 4)
+            self.assertFalse(gate.arrived)
+            self.assertFalse(gate.startup_ignored)
+            for error in (120., 95., 65., 35., 10., 0.):
+                observe(error, 4)
+            self.assertTrue(gate.arrived)  # 后续新横线仍正常停车。
+            for initial_error in (-220., 220.):
+                gate = StopMarkerGate()
+                observe(initial_error)
+                self.assertTrue(gate.startup_checked)
+                self.assertEqual(gate.limit(.075, config), (.075, 'searching'))  # 覆盖图像上、下边缘。
+            gate = StopMarkerGate()
+            gate.record_motion(.075, .2, config)  # 已走15mm，不能把后来遇到的横线当出发线。
+            observe(8.7, 6)
+            self.assertTrue(gate.arrived)
+        with self.assertRaises(ValueError):
+            replace(ControlConfig(), forward_ignore_start_marker='true').validate()
+
+    def test_start_marker_policy_does_not_skip_normal_arrival(self):
+        marker = {'x': 320., 'y': 240., 'kind': 'intermediate'}
+        reverse = replace(ControlConfig(forward_ignore_start_marker=False), drive_direction='reverse')
+        for config in (ControlConfig(forward_ignore_start_marker=False), replace(reverse, reverse_ignore_start_marker=False)):
+            gate = StopMarkerGate()
+            for i in range(7):
+                gate.observe([marker], 480, config, now=i*.05)
+            self.assertEqual(gate.limit(.025, config), (0., 'stopped_intermediate'))
+        gate = StopMarkerGate()
+        for i in range(reverse.stop_marker_average_frames):
+            gate.observe([], 480, reverse, now=i*.05)
+        gate.record_motion(-.025, .4, reverse)  # 离站识别已超过10mm指令行程。
+        for i in range(7):
+            gate.observe([marker], 480, reverse, now=.3+i*.05)
+        self.assertEqual(gate.limit(-.025, reverse), (0., 'stopped_intermediate'))
+        # 首次看到时在容差外，后续进入容差的站点不能当出发站略过。
+        gate = StopMarkerGate()
+        gate.observe([dict(marker, y=220.)], 480, reverse, now=0.)
+        for i in range(7):
+            gate.observe([marker], 480, reverse, now=.05+i*.05)
+        self.assertEqual(gate.limit(-.025, reverse), (0., 'stopped_intermediate'))
+        # 漏检期间已经走出限定距离才取消去重，不能原地等半秒就重新锁停。
+        gate = StopMarkerGate()
+        gate.observe([marker], 480, reverse, now=0.)
+        gate.record_motion(-.025, reverse.stop_marker_departure_hold_distance/.025+.1, reverse)
+        gate.observe([], 480, reverse, now=.6)
+        self.assertFalse(gate.startup_ignored)
+        for i in range(7):
+            gate.observe([marker], 480, reverse, now=.7+i*.05)
+        self.assertEqual(gate.limit(-.025, reverse), (0., 'stopped_intermediate'))
+        with self.assertRaises(ValueError):
+            replace(reverse, reverse_ignore_start_marker='true').validate()
+
+    def test_reverse_bar_approach_sign_and_station_resume(self):
+        for image_direction in ('up', 'down'):
+            config = replace(ControlConfig(forward_ignore_start_marker=False), drive_direction='reverse', image_forward_direction=image_direction)
+            sign = -1. if image_direction == 'down' else 1.
+            gate = StopMarkerGate()
+            for error in (.15, .10, .05, .02, 0.):
+                for _ in range(7):
+                    gate.observe([{'x': 320., 'y': 480*(.5+sign*error), 'kind': 'intermediate'}], 480, config)
+                speed, state = gate.limit(-.025, config)
+                if error > config.stop_marker_position_tolerance_ratio:
+                    self.assertLess(speed, 0.)
+                    self.assertEqual(state, 'approaching')
+            self.assertEqual((speed, state), (0., 'stopped_intermediate'))
+            self.assertTrue(gate.resume(config))
+            gate.observe([{'x': 320., 'y': 240., 'kind': 'intermediate'}], 480, config)
+            self.assertEqual(gate.limit(-.025, config), (-.025, 'searching'))
+
     def test_lookahead_does_not_jump_with_scan_row_phase(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         targets = []
         for phase in range(6):
             points = [(320+.3*(y-200), y) for y in range(120+phase, 470, 6)]
             geometry, reason = raw_tracking_geometry(points, 640, 480, config)
             self.assertIsNone(reason)
             targets.append((geometry['target_x'], geometry['target_y']))
-            self.assertAlmostEqual(geometry['target_y'], .4*479)
+            self.assertAlmostEqual(geometry['target_y'],
+                (config.vehicle_reference_y_ratio+geometry['effective_lookahead_ratio'])*479)
             self.assertFalse(geometry['target_gap_interpolated'])
         for target in targets[1:]:
             self.assertAlmostEqual(target[0], targets[0][0])
 
     def test_bend_continuity_margin_keeps_supported_turn_and_rejects_large_gap(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         near = [(300 + .4*(y-260), y) for y in range(150, 222, 6)]
         far = [(300 - .4*(y-260), y) for y in range(300, 450, 6)]
         # 约44度转角，两端切线在缺口内相交，不应截断成近端短线。
@@ -79,7 +860,7 @@ class ControlTests(unittest.TestCase):
         self.assertIsNone(raw_tracking_geometry([], 640, 480, config)[0])
 
     def test_noisy_gap_endpoint_does_not_override_supported_direction(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         near = [(320, y) for y in range(120, 220, 6)]
         far = [(320, y) for y in range(320, 470, 6)]
         near[-1] = (340, near[-1][1])
@@ -90,7 +871,7 @@ class ControlTests(unittest.TestCase):
         self.assertLessEqual(geometry['trusted_speed_factor'], config.bridge_speed_factor)
 
     def test_intersecting_extensions_join_only_inside_gap(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         near = [(320 + 0.28 * (y - 216), y) for y in range(120, 220, 6)]
         far = [(320 - 0.28 * (y - 320), y) for y in range(320, 470, 6)]
         result, reason = raw_tracking_geometry(near + far, 640, 480, config)
@@ -108,7 +889,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(len(mirrored['bridged_gaps']), 1)
 
     def test_short_gap_requires_both_aligned_ends_and_joins(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         near = [(320, y) for y in range(120, 220, 6)]
         far = [(320, y) for y in range(260, 470, 6)]
         geometry, reason = raw_tracking_geometry(near + far, 640, 480, config)
@@ -174,8 +955,75 @@ class ControlTests(unittest.TestCase):
             near + far, 640, 480, replace(config, bridge_speed_factor=0.5))
         self.assertEqual(limited['trusted_speed_factor'], 0.5)
 
+    def test_occluded_leading_fragments_do_not_hide_supported_path(self):
+        for direction in ('down', 'up'):
+            config = replace(ControlConfig(forward_ignore_start_marker=False), image_forward_direction=direction,
+                             vehicle_reference_y_ratio=-.05 if direction == 'down' else 1.05)
+            points = [(100, 6), (500, 54), (320, 120), (320, 126)]
+            points += [(320, y) for y in range(180, 470, 6)]
+            if direction == 'up':
+                points = [(x, 479-y) for x, y in points]
+            geometry, reason = raw_tracking_geometry(points, 640, 480, config)
+            self.assertIsNone(reason)
+            self.assertEqual(geometry['ignored_leading_points'], 2)
+            self.assertTrue(geometry['lookahead_supported'])
+            self.assertEqual(geometry['trusted_speed_factor'], 1.)
+        # 偏移到另一根线或超长空白不能按碎点跳过。
+        for start_x, far_start in ((100, 180), (320, 330)):
+            points = [(start_x, 120), (start_x, 126)]
+            points += [(320, y) for y in range(far_start, 470, 6)]
+            self.assertIsNotNone(raw_tracking_geometry(points, 640, 480, ControlConfig(forward_ignore_start_marker=False))[1])
+
+    def test_marker_dropout_creep_is_bounded_and_only_far_from_arrival(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        for speed in (.075, -.025):
+            gate = StopMarkerGate()
+            for i in range(7):
+                gate.observe([{'x': 320., 'y': 400., 'kind': 'intermediate'}],
+                             480, config, now=i*.01)
+            gate.observe([], 480, config, now=.08)
+            value, state = gate.limit(speed, config, now=.1)
+            self.assertEqual(state, 'missing_approaching')
+            self.assertAlmostEqual(value, math.copysign(config.stop_marker_creep_speed, speed))
+            self.assertEqual(gate.limit(speed, config, now=.68), (0., 'missing'))
+            self.assertEqual(gate.limit(speed, replace(config, stop_marker_dropout_grace_sec=0.),
+                                        now=.1), (0., 'missing'))
+        for y in (260., 240.):
+            gate = StopMarkerGate()
+            for i in range(7):
+                gate.observe([{'x': 320., 'y': y, 'kind': 'intermediate'}],
+                             480, config, now=i*.01)
+            gate.observe([], 480, config, now=.08)
+            self.assertEqual(gate.limit(.075, config, now=.1)[0], 0.)
+        for grace in (-.01, .61):
+            with self.assertRaises(ValueError):
+                replace(config, stop_marker_dropout_grace_sec=grace).validate()
+
+    def test_stop_bar_half_second_dropout_keeps_bounded_creep(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        gate = StopMarkerGate()
+        marker = {'x': 320., 'y': 340., 'kind': 'intermediate'}
+        for now in (0., .1, .2):
+            gate.observe([marker], 480, config, now=now)
+        for now in (.3, .4, .5, .6, .7):
+            gate.observe([], 480, config, now=now)
+            speed, state = gate.limit(.075, config, now=now)
+            self.assertEqual(state, 'missing_approaching')
+            self.assertEqual(speed, config.stop_marker_creep_speed)
+            gate.record_motion(speed, .1, config)
+        self.assertLessEqual(gate.dropout_commanded_distance, .005)
+        self.assertEqual(gate.limit(.075, config, now=.81), (0., 'missing'))
+        gate.observe([marker], 480, config, now=.82)
+        self.assertEqual(gate.dropout_commanded_distance, 0.)
+        gate.observe([], 480, config, now=.83)
+        gate.record_motion(.008, .7, config)
+        self.assertEqual(gate.limit(.075, config, now=.84), (0., 'missing'))
+        for value in (-.001, .006, math.inf, math.nan):
+            with self.assertRaises(ValueError):
+                replace(config, stop_marker_dropout_max_distance=value).validate()
+
     def test_short_near_segment_can_advance_without_a_far_segment(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         geometry, reason = raw_tracking_geometry(
             [(320, y) for y in range(120, 156, 6)], 640, 480, config)
         self.assertIsNone(reason)
@@ -191,14 +1039,14 @@ class ControlTests(unittest.TestCase):
             'insufficient_forward_span')
 
     def test_trusted_prefix_never_jumps_gap_and_extends_with_new_frames(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         near = [(320, y) for y in range(120, 270, 6)]
         distant = [(500, y) for y in range(350, 470, 6)]
         geometry, reason = raw_tracking_geometry(near + distant, 640, 480, config)
         self.assertIsNone(reason)
         self.assertEqual(geometry['trusted_end_y'], near[-1][1])
         self.assertLessEqual(geometry['target_y'], near[-1][1])
-        self.assertLess(geometry['trusted_speed_factor'], 1)
+        self.assertEqual(geometry['trusted_speed_factor'], 1)  # 前瞻点已在实测近段内，不因更远处断线降速。
         up = replace(config, image_forward_direction='up', vehicle_reference_y_ratio=1.05)
         mirrored, reason = raw_tracking_geometry(
             [(x, 479 - y) for x, y in near + distant], 640, 480, up)
@@ -209,14 +1057,14 @@ class ControlTests(unittest.TestCase):
         newer, reason = raw_tracking_geometry(extended, 640, 480, config)
         self.assertIsNone(reason)
         self.assertGreater(newer['trusted_end_y'], geometry['trusted_end_y'])
-        self.assertGreater(newer['trusted_speed_factor'], geometry['trusted_speed_factor'])
+        self.assertGreaterEqual(newer['trusted_speed_factor'], geometry['trusted_speed_factor'])
         # 近段不足时，即使远处还有长线，也必须停下。
         short = [(320, y) for y in range(120, 144, 6)]
         self.assertEqual(raw_tracking_geometry(short + distant, 640, 480, config)[1],
                          'insufficient_forward_span')
 
     def test_stop_cross_final_t_and_turn_are_distinguished(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         for kind in ('intermediate', 'final', 'bend', 'plain'):
             with self.subTest(kind=kind):
                 mask = np.zeros((480, 640), np.uint8)
@@ -244,7 +1092,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(markers[0]['kind'], 'unknown')
 
     def test_marker_rotation_multiple_stations_and_overshoot_hold(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         points = [(320+.3*(y-240), y) for y in range(24, 460, 6)]
         mask = np.zeros((480, 640), np.uint8)
         cv2.polylines(mask, [np.array(points, np.int32)], False, 255, 16)
@@ -265,12 +1113,12 @@ class ControlTests(unittest.TestCase):
                 gate.observe([{'x': 320., 'y': float(y), 'kind': 'final'}], 480, config)
             gate.limit(.075, config)
         for _ in range(7):
-            gate.observe([{'x': 320., 'y': 230., 'kind': 'final'}], 480, config)
-        self.assertEqual(gate.limit(.075, config), (0., 'overshoot'))
+            gate.observe([{'x': 320., 'y': 205., 'kind': 'final'}], 480, config)
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_final'))
         self.assertFalse(gate.resume(config))
 
     def test_station_stays_stopped_until_new_resume_and_does_not_retrigger(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         gate = StopMarkerGate()
         def observe(y, kind='intermediate', count=7):
             for _ in range(count):
@@ -303,7 +1151,9 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(gate.station_id, 2)
 
     def test_station_mean_filters_jitter_and_uses_tighter_tolerance(self):
-        config = ControlConfig()
+        # 显式精细配置仍受支持；现场默认采用更宽容差和三帧平均。
+        config = replace(ControlConfig(forward_ignore_start_marker=False), stop_marker_position_tolerance_ratio=.008,
+                         stop_marker_overshoot_tolerance_ratio=.02, stop_marker_average_frames=5)
         gate = StopMarkerGate()
         def observe(error, count=1):
             for _ in range(count):
@@ -315,15 +1165,14 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(gate.limit(.075, config)[0], 0.)
         observe(-8, 7)  # 轻微越线在9.6像素内，按到达处理，不倒车。
         self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
-        observe(4, 7)  # 未到的一侧仍保持3.84像素容差。
-        self.assertGreater(gate.limit(.075, config)[0], 0.)
+        observe(4, 7)  # 已经到站，后续位置抖动不能使小车重新行走。
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
         observe(-10, 7)
-        self.assertEqual(gate.limit(.075, config), (0., 'overshoot'))
-        self.assertFalse(gate.resume(config))
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
         self.assertEqual(gate.station_id, 1)
 
     def test_stopped_bar_position_uses_fixed_axis_but_still_detects_real_motion(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         points = [(320+.3*(y-240), y) for y in range(24, 460, 6)]
         mask = np.zeros((480, 640), np.uint8)
         cv2.polylines(mask, [np.array(points, np.int32)], False, 255, 18)
@@ -341,18 +1190,46 @@ class ControlTests(unittest.TestCase):
         self.assertLess(markers[0]['y']-reference['y'], -6)
 
     def test_station_does_not_resume_using_marker_position_before_loss(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         gate = StopMarkerGate()
         marker = {'x': 320., 'y': 240., 'kind': 'intermediate'}
         for _ in range(7):
             gate.observe([marker], 480, config)
         self.assertEqual(gate.state(config), 'stopped_intermediate')
         gate.observe([], 480, config)
-        self.assertEqual(gate.limit(.075, config), (0., 'missing'))
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
+        self.assertTrue(gate.missing)
         self.assertFalse(gate.resume(config))
 
+    def test_arrival_accepts_logged_overshoot_with_intermittent_missing_frames(self):
+        # 日志中约 -12/-17/-21px 的抖动属于轻微越线；漏帧不能一直清空到位确认。
+        for direction in ('down', 'up'):
+            config = replace(ControlConfig(forward_ignore_start_marker=False), image_forward_direction=direction,
+                             stop_marker_target_ratio=.46)
+            forward = 1. if direction == 'down' else -1.
+            gate = StopMarkerGate()
+            for index, error in enumerate((12., -12., -17., -21.)):
+                now = index*.15
+                gate.observe([{'x': 320., 'y': .46*480+forward*error,
+                               'kind': 'intermediate'}], 480, config, now=now)
+                if index < 3:
+                    gate.observe([], 480, config, now=now+.05)
+                    self.assertEqual(gate.limit(.075, config), (0., 'missing'))
+                    self.assertFalse(gate.resume(config))
+            self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
+            self.assertEqual(gate.station_id, 1)
+            # 已到站则锁定；样本过期只影响当前观测，不撤销停车。
+            gate.observe([], 480, config, now=2.)
+            self.assertEqual(gate.state(config), 'stopped_intermediate')
+            self.assertFalse(gate.resume(config))
+            gate.observe([{'x': 320., 'y': .46*480, 'kind': 'intermediate'}],
+                         480, config, now=2.05)
+            self.assertTrue(gate.position_confirmed)
+
     def test_mean_position_controls_forward_and_accepts_slight_overshoot(self):
-        config = ControlConfig()
+        # 显式精细配置仍受支持；现场默认采用更宽容差和三帧平均。
+        config = replace(ControlConfig(forward_ignore_start_marker=False), stop_marker_position_tolerance_ratio=.008,
+                         stop_marker_overshoot_tolerance_ratio=.02, stop_marker_average_frames=5)
         gate = StopMarkerGate()
         def observe(y, count=7):
             for _ in range(count):
@@ -364,9 +1241,10 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
         self.assertEqual(gate.station_id, 1)
         observe(246)
-        self.assertGreater(gate.limit(.075, config)[0], 0.)  # 不再被历史停车标志锁住。
+        self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
         observe(230.4)  # 负向容差边界：恰好越过图高2%。
         self.assertEqual(gate.limit(.075, config), (0., 'stopped_intermediate'))
+        gate.reset()  # 到达前真正越过容差仍报告overshoot。
         observe(230)
         self.assertEqual(gate.limit(.075, config), (0., 'overshoot'))
         self.assertFalse(gate.resume(config))
@@ -376,13 +1254,18 @@ class ControlTests(unittest.TestCase):
                 replace(config, **bad).validate()
 
     def test_five_frame_mean_decides_stop_instead_of_single_frame(self):
-        config = ControlConfig()
+        # 显式精细配置仍受支持；现场默认采用更宽容差和三帧平均。
+        config = replace(ControlConfig(forward_ignore_start_marker=False), stop_marker_position_tolerance_ratio=.008,
+                         stop_marker_overshoot_tolerance_ratio=.02, stop_marker_average_frames=5)
         gate = StopMarkerGate()
         values = []
-        for error in (6, 6, -3, 6, 6):
+        for index, error in enumerate((6, 6, -3, 6, 6)):
             values.append(error)
             gate.observe([{'x': 320., 'y': 240.+error, 'kind': 'intermediate'}], 480, config)
-            self.assertGreater(gate.limit(.075, config)[0], 0.)
+            if index < 2:
+                self.assertGreater(gate.limit(.075, config)[0], 0.)
+            else:
+                self.assertEqual(gate.limit(.075, config)[0], 0.)
             self.assertFalse(gate.position_confirmed)
         self.assertAlmostEqual(gate.snapshot(config)['error_ratio']*480, 4.2)
         for error in (-3, 6, -3, 6, -3, 6, -3):
@@ -396,7 +1279,7 @@ class ControlTests(unittest.TestCase):
     def test_mean_stop_converges_from_either_side_in_both_image_directions(self):
         # 合成像素运动只用于验证反馈符号和收敛，不是实际相机的米制标定。
         for direction in ('down', 'up'):
-            config = replace(ControlConfig(), image_forward_direction=direction, stop_marker_target_ratio=.46)
+            config = replace(ControlConfig(forward_ignore_start_marker=False), image_forward_direction=direction, stop_marker_target_ratio=.46)
             forward = 1. if direction == 'down' else -1.
             for initial_error in (12., -8.):
                 gate, error = StopMarkerGate(), initial_error
@@ -411,19 +1294,68 @@ class ControlTests(unittest.TestCase):
                         break
                 self.assertEqual(state, 'stopped_intermediate', (direction, initial_error, error))
                 self.assertEqual(speed, 0.)
-                self.assertGreaterEqual(error, -.02*480)
-                self.assertLessEqual(error, .008*480)
+                self.assertGreaterEqual(error, -config.stop_marker_overshoot_tolerance_ratio*480)
+                self.assertLessEqual(error, config.stop_marker_position_tolerance_ratio*480)
                 self.assertEqual(gate.station_id, 1)
 
-    def test_average_discards_old_samples_and_missing_frames_do_not_count_as_zero(self):
-        config = ControlConfig()
+    def test_selected_stop_bar_cannot_be_replaced_by_a_later_bar(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
         gate = StopMarkerGate()
-        marker = {'x': 320., 'y': 246., 'kind': 'unknown'}
+        first = {'x': 320., 'y': 340., 'kind': 'intermediate'}
+        later = {'x': 320., 'y': 420., 'kind': 'intermediate'}
+        for now in (0., .05, .10):
+            gate.observe([first], 480, config, now=now)
+        gate.observe([later], 480, config, now=.72)
+        self.assertEqual(gate.marker['y'], first['y'])
+        self.assertEqual(gate.limit(.075, config, now=.72), (0., 'missing'))
+        self.assertFalse(gate.arrived)
+        # 原目标重新出现且位置连续，允许继续接近；没有误判为到站。
+        gate.observe([dict(first, y=332.)], 480, config, now=.75)
+        self.assertEqual(gate.marker['y'], 332.)
+        self.assertGreater(gate.limit(.075, config, now=.75)[0], 0.)
+
+    def test_fresh_stop_position_halts_before_average_catches_up(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        for direction in ('up', 'down'):
+            cfg = replace(config, image_forward_direction=direction)
+            sign = -1 if direction == 'up' else 1
+            gate = StopMarkerGate()
+            for error in (40., 30., 20.):
+                gate.observe([{'x': 320., 'y': 240.+sign*error, 'kind': 'intermediate'}], 480, cfg)
+            gate.observe([{'x': 320., 'y': 240.+sign*10., 'kind': 'intermediate'}], 480, cfg)
+            self.assertGreater(gate.error, cfg.stop_marker_position_tolerance_ratio)
+            self.assertEqual(gate.limit(.075, cfg), (0., 'settling'))
+            self.assertFalse(gate.arrived)
+            for _ in range(5):
+                gate.observe([{'x': 320., 'y': 240.+sign*10., 'kind': 'intermediate'}], 480, cfg)
+            self.assertEqual(gate.limit(.075, cfg), (0., 'stopped_intermediate'))
+            self.assertTrue(gate.arrived)
+
+    def test_stop_confirmation_does_not_toggle_on_one_outside_frame(self):
+        cfg = ControlConfig(forward_ignore_start_marker=False)
+        gate = StopMarkerGate()
+        def observe(error):
+            gate.observe([{'x': 320., 'y': 240.+error, 'kind': 'intermediate'}], 480, cfg)
+        for error in (40., 30., 20., 10.):
+            observe(error)
+        self.assertEqual(gate.limit(.075, cfg), (0., 'settling'))
+        observe(25.)
+        self.assertEqual(gate.limit(.075, cfg), (0., 'settling'))
+        observe(25.)
+        self.assertEqual(gate.limit(.075, cfg), (0., 'settling'))
+        observe(25.)
+        self.assertGreater(gate.limit(.075, cfg)[0], 0.)
+        self.assertFalse(gate.arrived)
+
+    def test_average_discards_old_samples_and_missing_frames_do_not_count_as_zero(self):
+        config = ControlConfig(forward_ignore_start_marker=False)
+        gate = StopMarkerGate()
+        marker = {'x': 320., 'y': 270., 'kind': 'unknown'}
         for _ in range(5):
             gate.observe([marker], 480, config, now=0.)
         gate.observe([], 480, config, now=.1)
         self.assertEqual(gate.limit(.075, config), (0., 'missing'))
-        self.assertAlmostEqual(gate.error*480, 6.)
+        self.assertAlmostEqual(gate.error*480, 30.)
         gate.observe([marker], 480, config, now=2.)
         self.assertEqual(len(gate.samples), 1)
         self.assertFalse(gate.position_confirmed)
@@ -437,7 +1369,7 @@ class ControlTests(unittest.TestCase):
         self.config = ControlConfig(forward_speed=0.05, image_forward_direction='up', require_bottom_connected=True, steering_sign=-1.0, vehicle_reference_y_ratio=1.05)
 
     def test_small_noise_and_continuous_deadband(self):
-        for error, heading in ((0.02, 0.02), (-0.02, -0.02), (0.05, 0.04), (-0.05, -0.04)):
+        for error, heading in ((0.02, 0.02), (-0.02, -0.02), (0.03, 0.04), (-0.03, -0.04)):
             self.assertEqual(line_command(observation(
                 error_normalized=error, heading_error_rad=heading), self.config)[1], 0.0)
         # A just-visible error produces a tiny correction, not a step at the threshold.
@@ -446,7 +1378,7 @@ class ControlTests(unittest.TestCase):
         self.assertGreater(abs(line_command(observation(error_normalized=0.4), self.config)[1]), 0.1)
 
     def test_curve_geometry_does_not_confuse_straight_offset_with_bend(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         for points in ([(400, y) for y in range(120, 270, 6)],
                        [(240, y) for y in range(120, 270, 6)]):
             geometry, reason = raw_tracking_geometry(points, 640, 480, config)
@@ -476,6 +1408,8 @@ class ControlTests(unittest.TestCase):
         centered = line_command(dict(status, error_normalized=0.0), config)
         offset = line_command(dict(status, error_normalized=-0.1), config)
         self.assertEqual(centered, offset)  # 弯道容差内不追回中心，也不因此减速。
+        wide_offset = line_command(dict(status, error_normalized=-0.25), config)
+        self.assertEqual(centered, wide_offset)  # 放宽弯道余量，不牺牲正常前进速度。
         for strength in (0.0, 0.5, 1.0):
             result = line_command(dict(status, error_normalized=1.0,
                 heading_error_rad=1.0, path_heading_rad=1.0, curve_strength=strength), config)
@@ -542,7 +1476,7 @@ class ControlTests(unittest.TestCase):
         points = [(450, 100), (400, 200), (300, 300), (200, 420)]
         geometry, reason = tracking_geometry(points, 640, 480, self.config)
         self.assertIsNone(reason)
-        self.assertEqual(geometry['near_x'], 200)
+        self.assertEqual(geometry['near_x'], 255)  # 轮子遮挡区不参与近端选点。
         self.assertLess(geometry['target_y'], geometry['reference_y'])
         self.assertLess(geometry['error_normalized'], 0)
         # Far detector error is positive; near measured line is left. Correct
@@ -588,10 +1522,12 @@ class ControlTests(unittest.TestCase):
         horizontal = [(150, 400), (300, 400), (450, 400)]
         self.assertEqual(tracking_geometry(horizontal, 640, 480, self.config)[1], 'no_forward_line')
         shallow = [(150, 400), (300, 410), (450, 420)]
+        self.assertEqual(tracking_geometry(shallow, 640, 480, self.config)[1], 'no_forward_line')
+        shallow = [(150, 330), (300, 340), (450, 350)]
         self.assertEqual(tracking_geometry(shallow, 640, 480, self.config)[1], 'insufficient_forward_span')
 
     def test_motion_arrow_matches_forward_and_turn(self):
-        down = ControlConfig()
+        down = ControlConfig(forward_ignore_start_marker=False)
         straight = motion_preview(0.03, 0.0, down)
         self.assertAlmostEqual(straight[-1][0], 0)
         self.assertGreater(straight[-1][1], 0)
@@ -607,7 +1543,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(line_command(status, old), line_command(status, down))
 
     def test_top_wheel_margin_allows_current_near_line(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         visible = [(450, 144), (380, 240), (280, 340), (160, 459)]
         geometry, reason = tracking_geometry(visible, 640, 480, config)
         self.assertIsNone(reason)
@@ -616,7 +1552,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(tracking_geometry(distant, 640, 480, config)[1], 'near_line_missing')
 
     def test_near_ground_start_excludes_wheel_region(self):
-        config = ControlConfig()
+        config = ControlConfig(forward_ignore_start_marker=False)
         current = [(321, 200), (260, 240), (180, 320), (63, 389)]
         geometry, reason = tracking_geometry(current, 640, 480, config)
         self.assertIsNone(reason)
