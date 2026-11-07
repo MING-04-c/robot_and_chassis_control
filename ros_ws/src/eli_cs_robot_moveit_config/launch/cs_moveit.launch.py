@@ -280,7 +280,12 @@ def launch_setup(context, *args, **kwargs):
         output="screen",
     )
 
-    nodes_to_start = [move_group_node, rviz_node, servo_node]
+    ground_node = Node(package="eli_cs_robot_moveit_config", executable="ground_scene.py",
+        output="screen", parameters=[{"use_sim_time": use_sim_time,
+            "base_frame": prefix.perform(context).strip('"')+"base_link", "ground_height": 0.08,
+            "fixed_mount_links": [prefix.perform(context).strip('"')+"base_link",
+                                  prefix.perform(context).strip('"')+"base_link_inertia"]}])
+    nodes_to_start = [move_group_node, ground_node, rviz_node, servo_node]
 
     return nodes_to_start
 

@@ -14,6 +14,31 @@ ros2 launch eli_cs_robot_driver elite_control.launch.py
 
 这里只替代软件界面的上电、释放抱闸操作；远程控制、控制柜及示教器相关硬件配置仍按厂家要求处理，物理拔掉示教器后若触发安全停止，不能靠这两个服务绕过。参考[厂家快速使用指南4.1.1节](https://docs.elibot.cn/cs/1ffff/9a93b)。
 
+## 保护停止后的确认恢复
+
+真机 `elite_control.launch.py` 默认启动公共 `protective_stop_guard.py`，所有包含该驱动入口的任务共用它，不另开重复实例。仿真不启动此节点。它以 1Hz 查询 Dashboard，并接收安全状态变化；报警时锁住运动输出、暂停工作流、清除导纳旧目标、取消 MoveIt 执行。外控恢复不会自动重新激活先前停用的运动控制器。
+
+报警后保留原 launch，不要退出任务进程，否则内存中的步骤进度会丢失。确认障碍/外力已经移除、现场可以恢复后执行一次：
+
+```bash
+ros2 service call /protective_stop_guard/confirm_recovery std_srvs/srv/Trigger '{}'
+```
+
+这个调用代表操作者确认现场安全，会等待本轮恢复的最终结果。顺序是：暂停任务及旧输出 → 停止外控程序 → 停用运动控制器并取消残留 action → 查询安全状态 → 必要时只发送一次保护停止解锁 → 核验安全状态、抱闸和 RUNNING → 重发外控脚本 → 核验轨迹控制器 → 重新准备已保存的机械臂步骤。单次服务查询默认10秒、释放抱闸最多120秒；失败即停止本轮恢复，不自动重复解锁，也不执行 restart_safety。
+
+确认恢复前需要连续停稳1秒、新鲜关节状态；有导纳节点时，还要求新鲜的去零偏合力小于5N（启动参数 `recovery_force_limit_n`）。这只是恢复前置检查，不能作为无碰撞证明。急停、FAULT、VIOLATION 等状态不由此服务解除。
+
+单点 `arm_move` 会保留已经解析的绝对目标，从恢复后的实际状态重新准备，避免相对位移被再次叠加。独立柔顺任务已完成且处于保持状态时，只在当前实际姿态重新进入柔顺，不返回报警前姿态。检测接触阶段会被取消；循迹、多路点 `arm_poses`、拍照/发送等步骤不自动重放，需检查后重新启动对应任务。没有工作流节点时，只恢复驱动，运动输出保持关闭。
+
+查看进度或取消正在执行的恢复：
+
+```bash
+ros2 topic echo /protective_stop_guard/status
+ros2 service call /protective_stop_guard/cancel_recovery std_srvs/srv/Trigger '{}'
+```
+
+只关闭调用命令的终端不会取消已经被服务器接受的恢复，应使用 `cancel_recovery`。恢复锁保存在 `~/.ros/robot_control/protective_stop_guard.json`；任务步骤及已解析目标的诊断摘要保存在 `~/.ros/robot_control/workflow_safety_checkpoint.json`。后者不用于进程重启后的自动续跑。该节点是应用层恢复协调器，不替代机器人的安全控制系统。
+
 ## 技术细节
 
 以下图示展示了该驱动程序架构的粗略概览。

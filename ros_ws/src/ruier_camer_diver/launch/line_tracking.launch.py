@@ -19,6 +19,7 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_params", default_value=os.path.join(share, "config", "camera.yaml")),
         DeclareLaunchArgument("tracker_params", default_value=os.path.join(share, "config", "line_tracker.yaml")),
         DeclareLaunchArgument("show_window", default_value="true", description="Local desktop OpenCV window"),
+        DeclareLaunchArgument("max_processing_fps", default_value="0.0"),
         DeclareLaunchArgument("demo", default_value="false", description="Synthetic images, not a real camera"),
         Node(
             package="ruier_camer_diver", executable="camera_node", name="camera_node",
@@ -35,6 +36,7 @@ def generate_launch_description():
             namespace=namespace,
             parameters=[LaunchConfiguration("tracker_params"), {
                 "show_window": ParameterValue(LaunchConfiguration("show_window"), value_type=bool),
+                "max_processing_fps": ParameterValue(LaunchConfiguration("max_processing_fps"), value_type=float),
             }], output="screen",
         ),
     ])

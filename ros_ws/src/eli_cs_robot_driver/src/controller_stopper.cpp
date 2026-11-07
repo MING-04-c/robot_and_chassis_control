@@ -15,6 +15,39 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
         "io_and_status_controller/robot_task_running", 1,
         std::bind(&ControllerStopper::robotRunningCallback, this, std::placeholders::_1));
 
+    // 安全报警恢复后也不能由 robot_task_running 的跳变自动续发旧轨迹。
+    safety_sub_ = node->create_subscription<eli_common_interface::msg::SafetyMode>(
+        "io_and_status_controller/safety_mode", 10,
+        [this](const eli_common_interface::msg::SafetyMode::SharedPtr msg) {
+            safety_mode_ = msg->mode;
+            if (safety_mode_ >= 3 && safety_mode_ <= 14 && !safety_latched_) {
+                safety_latched_ = true;
+                findAndStopControllers();
+            }
+        });
+    inhibit_sub_ = node->create_subscription<std_msgs::msg::Bool>(
+        "/robot_control/safety_inhibit", rclcpp::QoS(1).reliable().transient_local(),
+        [this](const std_msgs::msg::Bool::SharedPtr msg) {
+            if (msg->data && !safety_latched_) {
+                safety_latched_ = true;
+                findAndStopControllers();
+            }
+        });
+    recovery_service_ = node->create_service<std_srvs::srv::Trigger>(
+        "~/release_safety_latch",
+        [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+               std_srvs::srv::Trigger::Response::SharedPtr response) {
+            if ((safety_mode_ != 1 && safety_mode_ != 2) || !robot_running_) {
+                response->success = false;
+                response->message = "Safety mode or external control is not ready";
+                return;
+            }
+            safety_latched_ = false;
+            // 只解除自动重启锁；由恢复器核验并重新激活指定控制器。
+            response->success = true;
+            response->message = "Safety latch released; motion controllers remain inactive until checked recovery";
+        });
+
     // Controller manager service to switch controllers
     controller_manager_srv_ = node_->create_client<controller_manager_msgs::srv::SwitchController>(
         "controller_manager/"
@@ -167,7 +200,11 @@ void ControllerStopper::robotRunningCallback(const std_msgs::msg::Bool::ConstSha
     if (msg->data && !robot_running_) {
         RCLCPP_INFO(node_->get_logger(), "robot_task_running changed false -> true");
         RCLCPP_DEBUG(rclcpp::get_logger("Controller stopper"), "Starting controllers");
-        startControllers();
+        if (!safety_latched_) {
+            startControllers();
+        } else {
+            RCLCPP_WARN(node_->get_logger(), "Safety recovery latched: motion controllers stay inactive");
+        }
     } else if (!msg->data && robot_running_) {
         RCLCPP_WARN(node_->get_logger(),
                     "robot_task_running changed true -> false; stopping motion controllers. "

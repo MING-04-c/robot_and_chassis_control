@@ -19,6 +19,7 @@ import zipfile
 import capture_transfer as rgbd
 import capture_storage as storage
 from industrial_pc_hk_receiver import receive_frame
+from industrial_pc_protocol import validate_detection_result
 from robot_tcp_common import configuration, parser, status
 
 
@@ -39,7 +40,8 @@ class RobotListener:
         self.output.mkdir(parents=True, exist_ok=True)
         self.stop = threading.Event()
         self.lock = threading.Lock()
-        self.channels = {name: {'state': 'starting', 'count': 0} for name in ('hk', 'rgbd', 'control')}
+        self.channels = {name: {'state': 'starting', 'count': 0} for name in ('hk', 'rgbd', 'control', 'detection')}
+        self.channels['detection']['state'] = 'waiting_result'
         self.robot_status = None
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -166,6 +168,26 @@ class RobotListener:
                 self.update('rgbd', 'connected', peer=peer[0])
                 self.receive_depth_connection(connection)
 
+    def save_detection_results(self, robot_status):
+        """轮询可补收多条结果；ID去重并原子保存，监听重启也不会重复生成文件。"""
+        directory = self.output/'detection_results'
+        for value in (robot_status or {}).get('detection_results', []):
+            result = validate_detection_result(value)
+            directory.mkdir(exist_ok=True)
+            identity = result['result_id']
+            destination = directory/(hashlib.sha256(identity.encode()).hexdigest()+'.json')
+            if destination.exists():
+                if json.loads(destination.read_text()) != result:
+                    raise ValueError('同一检测结果ID的内容发生变化')
+                continue
+            atomic_json(destination, result)
+            reading = result.get('measurement')
+            self.saved('detection', destination, point_id=result['point_id'],
+                       value=reading['value'] if reading else None, success=result['success'])
+            print('[测厚] 点=%s 回位完成=%s 成功=%s 最新读数=%s' % (
+                result['point_id'], result['returned_home'], result['success'],
+                ('%s %s' % (reading['value'], reading['unit'])) if reading else '未取得'), flush=True)
+
     def snapshot(self):
         with self.lock:
             return {'updated_at': datetime.now(timezone.utc).isoformat(),
@@ -187,8 +209,22 @@ class RobotListener:
                     with self.lock:
                         self.robot_status = response.get('robot_status')
                         self.channels['control']['count'] += 1
+                    self.save_detection_results(response.get('robot_status'))
+                    current = response.get('robot_status') or {}
+                    for name in ('normal', 'abnormal'):
+                        packet = current.get(name+'_status')
+                        if isinstance(packet, dict):
+                            folder = self.output/'status'
+                            folder.mkdir(exist_ok=True)
+                            atomic_json(folder/(name+'.json'), packet)
+                    for fault in (current.get('abnormal_status') or {}).get('active_faults', []):
+                        print('[异常状态] %s 来源=%s 原始码=%s %s' % (
+                            fault['error_code'], fault['source'], fault.get('native_error_code'), fault['message']), flush=True)
                     self.update('control', 'connected', error=None)
                 except (OSError, EOFError, ValueError) as error:
+                    # TCP已失联，旧状态不能继续显示成当前电量/充电状态。
+                    with self.lock:
+                        self.robot_status = None
                     self.update('control', 'reconnecting', error=str(error))
                 snapshot = self.snapshot()
                 atomic_json(self.output/'.listener_status.json', snapshot)
@@ -202,6 +238,12 @@ class RobotListener:
                 detail += ' start_service=%s' % ((snapshot['robot_status'] or {}).get('start_service_ready', False))
                 detail += ' capture_service=%s' % ((snapshot['robot_status'] or {}).get('capture_service_ready', False))
                 detail += ' active=%s 循迹=%s' % (task_data.get('active', '-'), task_data.get('follow_state', '-'))
+                power = (snapshot['robot_status'] or {}).get('chassis_power') or {}
+                battery = power.get('battery_percent')
+                charging = power.get('charging')
+                detail += ' 电量=%s 充电=%s' % (
+                    ('%s%%' % battery) if battery is not None else '未知',
+                    '未知' if charging is None else ('充电中' if charging else '未充电'))
                 if task_data.get('failed'):
                     detail += ' 任务失败='+str(task_data.get('failure_reason', ''))
                 errors = '; '.join('%s: %s' % (key, value['error'])

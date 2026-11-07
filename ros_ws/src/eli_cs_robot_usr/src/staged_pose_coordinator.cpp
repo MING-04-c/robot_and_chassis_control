@@ -23,6 +23,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2/LinearMath/Quaternion.h>
@@ -77,6 +78,20 @@ public:
     final_publisher_ = create_publisher<geometry_msgs::msg::PoseArray>(
       "/admittance_controller/target_poses", rclcpp::QoS(10).reliable());
 
+    safety_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/robot_control/safety_inhibit", rclcpp::QoS(1).reliable().transient_local(),
+      [this](const std_msgs::msg::Bool::SharedPtr message) {
+        if (message->data && !safety_inhibited_) {
+          ++safety_epoch_;
+          executing_ = false;
+          if (transition_timer_) { transition_timer_->cancel(); }
+          if (handoff_timer_) { handoff_timer_->cancel(); }
+          final_target_.poses.clear();
+          approach_target_.poses.clear();
+        }
+        safety_inhibited_ = message->data;
+      });
+
     target_subscription_ = create_subscription<geometry_msgs::msg::PoseArray>(
       "~/target_poses", rclcpp::QoS(10).reliable(),
       [this](const geometry_msgs::msg::PoseArray::ConstSharedPtr message) {
@@ -114,6 +129,7 @@ public:
 private:
   void receive_target(const geometry_msgs::msg::PoseArray & message)
   {
+    if (safety_inhibited_) { return; }
     if (message.poses.empty()) {
       RCLCPP_ERROR(get_logger(), "Received an empty target PoseArray");
       return;
@@ -200,7 +216,8 @@ private:
     request->data = false;
     admittance_enable_client_->async_send_request(
       request,
-      [this](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+      [this, epoch = safety_epoch_](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+        if (safety_inhibited_ || epoch != safety_epoch_) { return; }
         const auto response = future.get();
         if (!response->success) {
           RCLCPP_ERROR(get_logger(), "Could not disable admittance: %s", response->message.c_str());
@@ -252,8 +269,9 @@ private:
 
     switch_controller_client_->async_send_request(
       request,
-      [this, activate, deactivate, on_success = std::move(on_success)](
+      [this, epoch = safety_epoch_, activate, deactivate, on_success = std::move(on_success)](
         rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedFuture future) {
+        if (safety_inhibited_ || epoch != safety_epoch_) { return; }
         const auto response = future.get();
         if (!response->ok) {
           RCLCPP_ERROR(
@@ -326,6 +344,7 @@ private:
 
   void request_moveit_execution()
   {
+    if (safety_inhibited_) { return; }
     if (transition_timer_) {
       transition_timer_->cancel();
     }
@@ -342,7 +361,8 @@ private:
     auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
     execute_client_->async_send_request(
       request,
-      [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      [this, epoch = safety_epoch_](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+        if (safety_inhibited_ || epoch != safety_epoch_) { return; }
         const auto response = future.get();
         if (!response->success) {
           RCLCPP_ERROR(get_logger(), "Approach motion failed: %s", response->message.c_str());
@@ -389,6 +409,7 @@ private:
 
   void enable_admittance_then_publish_final()
   {
+    if (safety_inhibited_) { return; }
     if (!admittance_enable_client_->service_is_ready()) {
       RCLCPP_ERROR(get_logger(), "Service /admittance_controller/enable is unavailable after MoveIt motion");
       executing_ = false;
@@ -399,7 +420,8 @@ private:
     request->data = true;
     admittance_enable_client_->async_send_request(
       request,
-      [this](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+      [this, epoch = safety_epoch_](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+        if (safety_inhibited_ || epoch != safety_epoch_) { return; }
         const auto response = future.get();
         if (!response->success) {
           RCLCPP_ERROR(get_logger(), "Could not enable admittance: %s", response->message.c_str());
@@ -425,6 +447,9 @@ private:
   std::string admittance_node_name_;
   std::string moveit_target_topic_;
   std::string moveit_execute_service_;
+  bool safety_inhibited_{false};
+  unsigned safety_epoch_{0};
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr safety_subscription_;
   bool executing_{false};
   geometry_msgs::msg::PoseArray approach_target_;
   geometry_msgs::msg::PoseArray final_target_;

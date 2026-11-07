@@ -18,6 +18,7 @@ from recorded_route import RouteConfig, RouteRecorder, ReverseRouteFollower, Rev
 from line_follow_control import ControlConfig, line_command, motion_preview, tracking_geometry, slew, smooth_yaw  # noqa: E402
 from line_follow_control import SteeringDirectionGuard, coordinated_velocity, straight_image_axis, reverse_visual_command
 from reverse_visual import GroundMapping, near_line, strafe_command, aligned as visually_aligned, AlignmentSequencer
+from start_alignment import StartLineAligner
 
 
 raw_tracking_geometry = tracking_geometry
@@ -46,6 +47,672 @@ def observation(**updates):
     }
     value.update(updates)
     return value
+
+
+class ParallelSlopeTests(unittest.TestCase):
+    def test_vectorized_slope_matches_original_pairs(self):
+        from statistics import median
+        from stop_marker import _median_pair_slope
+        rng = np.random.default_rng(42)
+        for size in (0, 1, 3, 20, 70):
+            points = rng.integers(-50, 100, (size, 2)).astype(float).tolist()
+            for axis in (0, 1):
+                for span in (3, 12):
+                    pairs = [(a[1-axis]-b[1-axis])/(a[axis]-b[axis])
+                             for i, a in enumerate(points) for b in points[i+1:]
+                             if abs(a[axis]-b[axis]) >= span]
+                    actual = _median_pair_slope(points, axis, span)
+                    if pairs:
+                        self.assertAlmostEqual(actual, median(pairs))
+                    else:
+                        self.assertIsNone(actual)
+
+
+class StandardReplayTests(unittest.TestCase):
+    def test_forward_arc_sign_and_pose_integration(self):
+        from recorded_route import StandardRouteFollower
+        for sign in (-1, 1):
+            document = dict(points=[[math.sin(i*.02), sign*(1-math.cos(i*.02)), sign*i*.02]
+                                   for i in range(51)])
+            tracker = StandardRouteFollower(document, (0.,0.,0.), RouteConfig())
+            pose = [0.,0.,0.]
+            v,w,state = tracker.command(pose,.05)
+            self.assertGreater(v,0.)
+            self.assertGreater(sign*w,0.)
+            for _ in range(800):
+                v,w,state=tracker.command(pose,.05)
+                pose[0]+=v*math.cos(pose[2])*.05
+                pose[1]+=v*math.sin(pose[2])*.05
+                pose[2]+=w*.05
+                if state == 'standard_route_complete':
+                    break
+            self.assertEqual(state,'standard_route_complete')
+            self.assertLess(math.dist(pose[:2],document['points'][-1][:2]),.025)
+
+    def test_anchor_rotation_deviation_and_wrong_direction(self):
+        from recorded_route import StandardRouteFollower
+        document=dict(points=[[i*.01,0.,0.] for i in range(101)])
+        tracker=StandardRouteFollower(document,(2.,3.,math.pi/2),RouteConfig())
+        self.assertAlmostEqual(tracker.tracker.points[-1][0],2.)
+        self.assertAlmostEqual(tracker.tracker.points[-1][1],4.)
+        self.assertGreater(tracker.command((2.,3.,math.pi/2),.05)[0],0.)
+        self.assertEqual(tracker.command((2.2,3.,math.pi/2),.05)[2], 'standard_route_deviation')
+        bad=dict(points=[[0.,0.,0.],[-.1,0.,0.],[-.2,0.,0.]])
+        self.assertEqual(StandardRouteFollower(bad,(0.,0.,0.),RouteConfig()).command((0.,0.,0.),.05)[2],
+                         'standard_target_not_ahead')
+
+    def test_recording_keeps_pose_telemetry_and_parameters(self):
+        recorder=RouteRecorder(replace(RouteConfig(),sample_distance=.01),'odom','base_link')
+        recorder.context={'speed':.03}
+        for i in range(21):
+            recorder.add((i*.01,0.,0.),stamp=10.+i*.3,velocity=(.03,0.,0.))
+        recorder.finished=True
+        data=recorder.document()
+        self.assertEqual(len(data['points']),len(data['point_samples']))
+        self.assertEqual(data['point_samples'][-1]['velocity'],[.03,0.,0.])
+        self.assertEqual(data['recording_config']['speed'],.03)
+
+
+class StartLineAlignmentTests(unittest.TestCase):
+    @staticmethod
+    def ready_aligner(config, mapping=None, **kwargs):
+        aligner = StartLineAligner(config, mapping, **kwargs)
+        aligner.command(-1., (0., 0., 0.), stopped=True)
+        aligner.command(0., (0., 0., 0.), stopped=True)
+        return aligner
+
+    @staticmethod
+    def frames(aligner, start, y=60., x=50., slope=0., source_time=None):
+        for index in range(5):
+            now = start+index*.03
+            aligner.observe([dict(x=x, y=y, main_slope=slope)], 101, 101,
+                            int(now*1e9), now, source_time=source_time)
+        return now
+
+    def test_filtered_image_error_direction_and_duplicate_frame(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = self.ready_aligner(config, confirmation_frames=3, filter_frames=5)
+        ys = (60., 61., 72., 60., 61.)
+        for stamp, y in enumerate(ys, 1):
+            self.assertTrue(aligner.observe([dict(x=50., y=y, main_slope=0.)], 101, 101,
+                                            stamp, stamp*.1))
+        self.assertAlmostEqual(aligner.position_error, .11)
+        self.assertFalse(aligner.observe([dict(x=50., y=50., main_slope=0.)], 101, 101,
+                                         5, .7), 'same source image must not add another sample')
+        self.assertEqual(aligner.command(.7, (0., 0., 0.), line_ready=True, stopped=True),
+                         'start_alignment_waiting_for_stable_image')
+        self.assertAlmostEqual(aligner.position_error, .11)
+
+        up_config = replace(config, image_forward_direction='up')
+        up = self.ready_aligner(up_config)
+        self.assertTrue(up.observe([dict(x=50., y=30., main_slope=0.)], 101, 101, 1, .1))
+        self.assertAlmostEqual(up.position_error, .2)
+
+    def test_calibrated_front_back_and_tangent_are_metric(self):
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory)/'mapping.json'
+            filename.write_text(json.dumps({
+                'frame_id': 'base_link', 'units': 'm', 'image_size': [101, 101],
+                'image_points_px': [[0, 0], [100, 0], [0, 100], [100, 100]],
+                'ground_points_m': [[0, .5], [0, -.5], [1, .5], [1, -.5]],
+            }))
+            mapping = GroundMapping(filename)
+            aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'), mapping,
+                                         lateral_tolerance_m=.025)
+            self.assertTrue(aligner.observe([dict(x=50., y=70., main_slope=.1)],
+                                            101, 101, 1, .1))
+            self.assertTrue(aligner.metric)
+            self.assertAlmostEqual(aligner.position_error_m, .2, places=3)
+            self.assertAlmostEqual(aligner.lateral_error, .02, places=3)
+            self.assertLess(aligner.heading_error, 0.)
+            self.assertEqual(aligner.snapshot()['geometry_mode'], 'ground_meters')
+            # Once heading has been corrected, a fresh stationary window may
+            # plan longitudinal motion with the tighter default yaw tolerance.
+            aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'), mapping,
+                                         lateral_tolerance_m=.025)
+            for stamp in range(1, 6):
+                aligner.observe([dict(x=50., y=70., main_slope=0.)], 101, 101,
+                                stamp, stamp*.1)
+            self.assertEqual(aligner.command(.5, (0., 0., 0.), stopped=True),
+                             'start_alignment_moving_forward')
+            self.assertAlmostEqual(aligner.step_distance, .015)
+            self.assertIsNone(aligner.image_response_per_m)
+
+            mismatched = self.ready_aligner(ControlConfig(image_forward_direction='down'), mapping)
+            self.assertFalse(mismatched.observe([dict(x=50., y=70., main_slope=0.)],
+                                                100, 101, 1, .1))
+            self.assertTrue(mismatched.fault.startswith('start_alignment_failed_'))
+            self.assertEqual(mismatched.command(.2, (0., 0., 0.)), mismatched.fault)
+
+            behind = self.ready_aligner(ControlConfig(image_forward_direction='down'), mapping)
+            behind.observe([dict(x=50., y=30., main_slope=0.)], 101, 101, 2, .2)
+            self.assertAlmostEqual(behind.position_error_m, -.2, places=3)
+            self.assertEqual(behind.command(.2, (0., 0., 0.), line_ready=True),
+                             'start_alignment_waiting_for_stop')
+            metric_yaw = self.ready_aligner(ControlConfig(image_forward_direction='down'), mapping)
+            now = self.frames(metric_yaw, .1, y=50., slope=.3)
+            self.assertEqual(metric_yaw.command(now, (0., 0., 0.), stopped=True),
+                             'start_alignment_moving_yaw')
+            self.assertLess(metric_yaw.velocity()[2], 0., 'metric heading is already in base_link')
+            metric_side = self.ready_aligner(ControlConfig(image_forward_direction='down'), mapping)
+            now = self.frames(metric_side, .1, x=40., y=50.)
+            self.assertEqual(metric_side.command(now, (0., 0., 0.), stopped=True),
+                             'start_alignment_moving_lateral')
+            self.assertGreater(metric_side.velocity()[1], 0., 'positive ground Y requires left strafe')
+
+    def test_command_is_bounded_and_alignment_requires_stable_fresh_frames(self):
+        from line_follow_control import start_alignment_command
+        config = ControlConfig(start_alignment_speed=.02, start_alignment_max_angular_speed=.08)
+        marker = dict(x=90., y=80., main_slope=1.)
+        v, w, state = start_alignment_command(marker, 101, 101, config, position_error=.2,
+            position_tolerance=.01, lateral_error=.8, heading_error=.8)
+        self.assertEqual(state, 'start_alignment_approaching')
+        self.assertLessEqual(v, .02)
+        self.assertLessEqual(abs(w), .08)
+        v, _, state = start_alignment_command(marker, 101, 101, config, position_error=-.12,
+            position_tolerance=.01, overshoot_tolerance=.04)
+        self.assertEqual(state, 'start_alignment_reverse')
+        self.assertGreaterEqual(v, -config.reverse_max_speed)
+
+        aligner = self.ready_aligner(config, confirmation_frames=3, filter_frames=3)
+        for stamp in range(1, 4):
+            aligner.observe([dict(x=50., y=50., main_slope=0.)], 101, 101,
+                            stamp, stamp*.1)
+        self.assertTrue(aligner.visual_ready)
+        self.assertEqual(aligner.command(.4, (0., 0., 0.), stopped=True),
+                         'start_alignment_complete')
+
+    def test_stop_observe_move_and_discard_delayed_frames(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = StartLineAligner(config)
+        aligner.reset(0., (0., 0., 0.))
+        aligner.command(0., (0., 0., 0.), stopped=True)
+        self.assertFalse(aligner.observe([dict(x=50., y=60.)], 101, 101, 1, .3))
+        aligner.command(.61, (0., 0., 0.), stopped=True)
+        self.assertFalse(aligner.observe([dict(x=50., y=60.)], 101, 101, 2, .62,
+                                         source_time=.2), 'pipeline result captured before settling')
+        now = self.frames(aligner, .7)
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_moving_forward')
+        self.assertAlmostEqual(aligner.step_distance, .005)
+        self.assertGreater(aligner.velocity()[0], 0.)
+        self.assertFalse(aligner.observe([dict(x=50., y=40.)], 101, 101,
+                                         int(1e9), 1.), 'moving image cannot reverse the step')
+        self.assertGreater(aligner.velocity()[0], 0.)
+        self.assertEqual(aligner.command(1.1, (.005, 0., 0.), stopped=False),
+                         'start_alignment_waiting_for_stop')
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        aligner.command(1.2, (.005, 0., 0.), stopped=True)
+        aligner.command(1.81, (.005, 0., 0.), stopped=True)
+        self.assertFalse(aligner.observe([dict(x=50., y=50.)], 101, 101,
+                                         int(1.82e9), 1.82, source_time=1.1))
+        now = self.frames(aligner, 1.9, y=50.)
+        self.assertEqual(aligner.command(now, (.005, 0., 0.), stopped=True),
+                         'start_alignment_complete')
+        self.assertEqual(aligner.step_count, 1)
+
+    def test_local_image_response_estimates_bounded_second_step(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        now = self.frames(aligner, .1)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        aligner.command(.6, (.005, 0., 0.), stopped=False)
+        aligner.command(.7, (.005, 0., 0.), stopped=True)
+        aligner.command(1.31, (.005, 0., 0.), stopped=True)
+        now = self.frames(aligner, 1.4, y=59.)
+        aligner.command(now, (.005, 0., 0.), stopped=True)
+        self.assertAlmostEqual(aligner.image_response_per_m, 2.)
+        self.assertAlmostEqual(aligner.step_distance, .015)
+        self.assertFalse(aligner.snapshot()['metric'])
+
+    def stopped_response(self, aligner, start, pose, y):
+        aligner.command(start, pose, stopped=False)
+        aligner.command(start+.1, pose, stopped=True)
+        aligner.command(start+.71, pose, stopped=True)
+        now = self.frames(aligner, start+.8, y=y)
+        aligner.command(now, pose, stopped=True)
+
+    def test_actual_odometry_distance_estimate_shrinks_near_target_both_directions(self):
+        for direction in (1., -1.):
+            aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+            now = self.frames(aligner, .1, y=50.+direction*3.)
+            aligner.command(now, (0., 0., 0.), stopped=True)
+            self.assertAlmostEqual(aligner.step_distance, direction*.005)
+            # Actual stop includes run-on beyond the requested 5 mm.
+            self.stopped_response(aligner, .6, (direction*.006, 0., 0.), 50.+direction*1.6)
+            response = .014/.006
+            self.assertAlmostEqual(aligner.image_response_per_m, response)
+            self.assertAlmostEqual(aligner.snapshot()['estimated_remaining_m'], direction*.016/response)
+            self.assertAlmostEqual(aligner.step_distance, direction*.8*(.016-.0075)/response)
+            self.assertLess(abs(aligner.step_distance), .005)
+            self.assertEqual(aligner.distance_estimate_source, 'local_response_tentative')
+
+    def test_bad_response_discards_old_scale_and_returns_to_probe(self):
+        for final_y, expected_reason in ((59., 'image_change_below_noise'),
+                                         (60., 'wrong_or_invalid_response'),
+                                         (52., 'inconsistent_response')):
+            aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+            now = self.frames(aligner, .1)
+            aligner.command(now, (0., 0., 0.), stopped=True)
+            self.stopped_response(aligner, .6, (.005, 0., 0.), 59.)
+            self.stopped_response(aligner, 2., (.020, 0., 0.), final_y)
+            self.assertIsNone(aligner.image_response_per_m)
+            self.assertEqual(aligner.response_reason, expected_reason)
+            self.assertEqual(aligner.distance_estimate_source, 'probe_no_reliable_scale')
+            self.assertIsNone(aligner.snapshot()['estimated_remaining_m'])
+            expected_probe = .002 if abs(final_y-50.) <= 3. else .005
+            self.assertAlmostEqual(aligner.step_distance, expected_probe)
+
+    def test_response_rejects_cross_axis_motion_yaw_and_pixel_noise(self):
+        for pose, y, reason in (((.005, .004, 0.), 59., 'motion_contaminated'),
+                                ((.005, 0., .03), 59., 'motion_contaminated'),
+                                ((.005, 0., 0.), 59.8, 'image_change_below_noise')):
+            aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+            now = self.frames(aligner, .1)
+            aligner.command(now, (0., 0., 0.), stopped=True)
+            self.stopped_response(aligner, .6, pose, y)
+            self.assertIsNone(aligner.image_response_per_m)
+            self.assertEqual(aligner.response_reason, reason)
+
+    def test_consistent_response_history_and_near_target_probe(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        now = self.frames(aligner, .1)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        self.stopped_response(aligner, .6, (.005, 0., 0.), 59.)
+        self.stopped_response(aligner, 2., (.020, 0., 0.), 56.)
+        self.assertAlmostEqual(aligner.image_response_per_m, 2.)
+        self.assertEqual(aligner.snapshot()['response_sample_counts']['longitudinal'], 2)
+        self.assertEqual(aligner.distance_estimate_source, 'local_response_confirmed')
+        self.assertLessEqual(aligner.step_distance, aligner.config.start_alignment_step_distance)
+        near = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        now = self.frames(near, .1, y=51.6)
+        near.command(now, (0., 0., 0.), stopped=True)
+        self.assertAlmostEqual(near.step_distance, .002)
+        self.assertIsNone(near.estimated_remaining_m)
+
+    def test_lateral_near_target_probe_has_independent_minimum_and_braking_profile(self):
+        for direction in (-1., 1.):
+            config = ControlConfig(image_forward_direction='down')
+            aligner = self.ready_aligner(config)
+            # Reproduce the ~9.8% lateral error from the physical failure log.
+            now = self.frames(aligner, .1, x=50.+4.9*direction, y=50.)
+            aligner.command(now, (0., 0., 0.), stopped=True)
+            self.assertAlmostEqual(aligner.step_lateral_m, direction*.005)
+            v, initial, w = aligner.velocity()
+            self.assertEqual((v, w), (0., 0.))
+            expected = math.sqrt(2.*config.linear_acceleration*(.005-.001))
+            self.assertAlmostEqual(initial, direction*expected)
+            self.assertLessEqual(abs(initial), config.start_alignment_lateral_speed)
+            aligner.command(now+.1, (0., direction*.002, 0.), stopped=False)
+            self.assertAlmostEqual(aligner.velocity()[1], direction*config.start_alignment_min_lateral_speed)
+            self.assertGreater(abs(initial), abs(aligner.velocity()[1]))
+            aligner.command(now+.2, (0., direction*.005, 0.), stopped=False)
+            self.assertEqual(aligner.velocity(), (0., 0., 0.))
+            self.assertAlmostEqual(aligner.snapshot()['step_actual_m'], direction*.005)
+            aligner.command(now+.3, (0., direction*.006, 0.), stopped=False)
+            self.assertAlmostEqual(aligner.snapshot()['step_actual_m'], direction*.006)
+            self.assertEqual(aligner.velocity(), (0., 0., 0.))
+
+    def test_forward_and_reverse_braking_floor_stops_at_arrival(self):
+        for direction in (-1., 1.):
+            aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+            now = self.frames(aligner, .1, y=50.+10.*direction)
+            aligner.command(now, (0., 0., 0.), stopped=True)
+            initial = abs(aligner.velocity()[0])
+            aligner.command(now+.1, (direction*.0038, 0., 0.), stopped=False)
+            self.assertAlmostEqual(aligner.velocity()[0], direction*aligner.config.start_alignment_min_linear_speed)
+            self.assertLess(abs(aligner.velocity()[0]), initial)
+            self.assertEqual(aligner.velocity()[1:], (0., 0.))
+            aligner.command(now+.2, (direction*.006, 0., 0.), stopped=False)
+            self.assertEqual(aligner.velocity(), (0., 0., 0.))
+
+    def test_lateral_floor_does_not_fake_progress_or_escalate_on_stall(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        now = self.frames(aligner, .1, x=54.9, y=50.)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        initial = aligner.velocity()
+        for offset in (.1, 1., 3.9):
+            aligner.command(now+offset, (0., 0., 0.), stopped=True)
+            self.assertEqual(aligner.phase, 'moving')
+            self.assertEqual(aligner.velocity(), initial)
+            self.assertEqual(aligner.snapshot()['step_actual_m'], 0.)
+        self.assertEqual(aligner.command(now+4.01, (0., 0., 0.), stopped=True),
+                         'start_alignment_failed_step_timeout')
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+
+    def test_lateral_step_and_configuration_allow_nominal_minimum_speed_braking(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = self.ready_aligner(config)
+        aligner.lateral_response_per_m = 10.
+        aligner.response_samples['lateral'] = [10., 10.]
+        now = self.frames(aligner, .1, x=51.1, y=50.)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        minimum = .001+config.start_alignment_min_lateral_speed**2/(2.*config.linear_acceleration)
+        self.assertAlmostEqual(aligner.step_lateral_m, minimum)
+        self.assertGreater(minimum, aligner.POSITION_STEP_TOLERANCE_M)
+        self.assertLessEqual(minimum, config.start_alignment_step_distance)
+        for changes in ({'start_alignment_min_lateral_speed': .01},
+                        {'start_alignment_min_lateral_speed': .04},
+                        {'start_alignment_step_distance': .003},
+                        {'start_alignment_lateral_speed': .06, 'start_alignment_min_lateral_speed': .06}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replace(config, **changes).validate()
+
+    def test_unstable_and_duplicate_images_never_start_motion(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        for index in range(20):
+            now = .01+index*.02
+            aligner.observe([dict(x=50., y=60.+3*(index%2))], 101, 101, index+1, now)
+            aligner.command(now, (0., 0., 0.), stopped=True)
+            self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        self.assertEqual(aligner.step_count, 0)
+        self.assertFalse(aligner.observe([dict(x=50., y=50.)], 101, 101, 20, .45))
+        aligner.command(2., (0., 0., 0.), stopped=True)
+        self.assertFalse(aligner.visual_ready)
+        self.assertEqual(len(aligner.samples), 0)
+
+    def test_rolling_or_input_loss_invalidates_stationary_confirmation(self):
+        aligner = self.ready_aligner(ControlConfig())
+        now = self.frames(aligner, .1, y=50.)
+        self.assertTrue(aligner.visual_ready)
+        aligner.command(now, (0., 0., 0.), stopped=False)
+        self.assertFalse(aligner.visual_ready)
+        aligner.command(.4, (0., 0., 0.), stopped=True)
+        self.assertNotEqual(aligner.state, 'start_alignment_complete')
+        aligner.command(1.1, (0., 0., 0.), stopped=True)
+        now = self.frames(aligner, 1.2, y=50.)
+        aligner.command(now, (0., 0., 0.), stopped=True, odom_fresh=False)
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        self.assertFalse(aligner.visual_ready)
+
+    def test_extra_confirmations_do_not_trigger_a_zero_correction_failure(self):
+        aligner = self.ready_aligner(ControlConfig(), confirmation_frames=8)
+        now = self.frames(aligner, .1, y=50.)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        self.assertIsNone(aligner.fault)
+        self.assertEqual(aligner.step_count, 0)
+        for index in range(3):
+            now = .3+index*.03
+            aligner.observe([dict(x=50., y=50.)], 101, 101, int(now*1e9), now)
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_complete')
+
+    def test_no_reverse_permission_and_invalid_step_parameters(self):
+        config = ControlConfig(image_forward_direction='down', start_alignment_reverse_correction=False)
+        aligner = self.ready_aligner(config)
+        now = self.frames(aligner, .1, y=40.)
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_failed_correction_unavailable')
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        for name, value in (('start_alignment_settle_sec', .01),
+                            ('start_alignment_step_distance', .1)):
+            with self.assertRaises(ValueError):
+                replace(config, **{name: value}).validate()
+
+    def test_step_stall_total_distance_and_reverse_limits_remain_latched(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = self.ready_aligner(config)
+        now = self.frames(aligner, .1)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        self.assertEqual(aligner.command(4.3, (0., 0., 0.), stopped=True),
+                         'start_alignment_failed_step_timeout')
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        self.assertEqual(aligner.command(4.4, (.005, 0., 0.), stopped=True),
+                         'start_alignment_failed_step_timeout')
+        for pose, reason in (((.31, 0., 0.), 'distance'), ((-.11, 0., 0.), 'reverse')):
+            aligner = StartLineAligner(config)
+            aligner.reset(0., (0., 0., 0.))
+            self.assertEqual(aligner.command(.1, pose), 'start_alignment_failed_'+reason+'_limit')
+        aligner = StartLineAligner(config)
+        aligner.reset(0.)
+        self.assertEqual(aligner.command(46., (0., 0., 0.)), 'start_alignment_failed_timeout')
+
+    def test_reverse_and_yaw_steps_use_odometry_not_new_visual_commands(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = self.ready_aligner(config)
+        now = self.frames(aligner, .1, y=40.)
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_moving_reverse')
+        self.assertLess(aligner.velocity()[0], 0.)
+        aligner.command(.6, (-.005, 0., 0.), stopped=False)
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        aligner = self.ready_aligner(config)
+        now = self.frames(aligner, .1, y=50., slope=.3)
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_moving_yaw')
+        self.assertEqual(aligner.velocity()[0], 0.)
+        self.assertGreater(abs(aligner.velocity()[2]), 0.)
+        self.assertLessEqual(abs(aligner.step_angle), .04)
+        aligner.command(.6, (0., 0., aligner.step_angle), stopped=False)
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+
+    def test_opposing_lateral_heading_errors_cannot_cancel(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = self.ready_aligner(config)
+        heading = -math.atan(config.start_alignment_lateral_gain*.08)/config.heading_gain
+        now = self.frames(aligner, .1, x=54., y=50., slope=math.tan(heading))
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_moving_yaw')
+        v, vy, w = aligner.velocity()
+        self.assertEqual((v, vy), (0., 0.))
+        self.assertGreater(abs(w), .01)
+        self.assertIsNone(aligner.fault)
+        self.assertGreater(abs(aligner.step_angle), aligner.ANGLE_STEP_TOLERANCE_RAD)
+
+    def test_logged_four_degree_departure_is_not_alignment_success(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        now = self.frames(aligner, .1, x=50., y=50., slope=math.tan(.07278785))
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_moving_yaw')
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        now = self.frames(aligner, .1, x=52.5, y=50.)
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_moving_lateral')
+
+    def test_heading_then_lateral_then_longitudinal_with_stopped_observations(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = self.ready_aligner(config)
+        now = self.frames(aligner, .1, x=60., y=60., slope=.3)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        self.assertEqual(aligner.step_axis, 'heading')
+        v, vy, w = aligner.velocity()
+        self.assertEqual((v, vy), (0., 0.))
+        self.assertGreaterEqual(abs(w), config.start_alignment_min_angular_speed)
+        self.assertGreater(abs(aligner.step_angle), aligner.ANGLE_STEP_TOLERANCE_RAD)
+        yaw = aligner.step_angle
+        pose = (0., 0., yaw)
+        aligner.command(.6, pose, stopped=False)
+        aligner.command(.7, pose, stopped=True)
+        aligner.command(1.31, pose, stopped=True)
+        now = self.frames(aligner, 1.4, x=60., y=60.)
+        aligner.command(now, pose, stopped=True)
+        self.assertEqual(aligner.step_axis, 'lateral')
+        self.assertEqual(aligner.velocity()[::2], (0., 0.))
+        side = aligner.step_lateral_m
+        pose = (-math.sin(yaw)*side, math.cos(yaw)*side, yaw)
+        aligner.command(1.8, pose, stopped=False)
+        aligner.command(1.9, pose, stopped=True)
+        aligner.command(2.51, pose, stopped=True)
+        now = self.frames(aligner, 2.6, x=50., y=60.)
+        aligner.command(now, pose, stopped=True)
+        self.assertEqual(aligner.step_axis, 'longitudinal')
+        self.assertEqual(aligner.velocity()[1:], (0., 0.))
+        self.assertGreater(aligner.velocity()[0], 0.)
+
+    def test_short_camera_dropout_preserves_dwell_and_requires_new_capture(self):
+        aligner = self.ready_aligner(ControlConfig())
+        now = self.frames(aligner, .1, y=50.)
+        self.assertTrue(aligner.visual_ready)
+        started, cutoff = aligner.stopped_since, aligner.accept_after
+        aligner.command(.25, (0., 0., 0.), stopped=True, line_ready=False)
+        self.assertEqual((aligner.stopped_since, aligner.accept_after), (started, cutoff))
+        self.assertEqual(len(aligner.samples), 5)
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        self.assertEqual(aligner.command(.3, (0., 0., 0.), stopped=True),
+                         'start_alignment_waiting_for_marker')
+        self.assertFalse(aligner.observe([dict(x=50., y=50.)], 101, 101,
+                                         int(.31e9), .31, source_time=.24))
+        self.assertTrue(aligner.observe([dict(x=50., y=50.)], 101, 101,
+                                        int(.32e9), .32, source_time=.32))
+        self.assertEqual(aligner.command(.33, (0., 0., 0.), stopped=True),
+                         'start_alignment_complete')
+
+    def test_interrupted_motion_requires_full_stop_and_new_observation(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        now = self.frames(aligner, .1)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        self.assertGreater(aligner.velocity()[0], 0.)
+        aligner.command(.3, (.002, 0., 0.), stopped=False, line_ready=False)
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        self.assertEqual(len(aligner.samples), 0)
+        aligner.command(.4, (.002, 0., 0.), stopped=True, line_ready=False)
+        cutoff = aligner.accept_after
+        aligner.command(.8, (.002, 0., 0.), stopped=True, line_ready=False)
+        self.assertEqual(aligner.accept_after, cutoff)
+        aligner.command(1.01, (.002, 0., 0.), stopped=True)
+        self.assertFalse(aligner.observe([dict(x=50., y=50.)], 101, 101,
+                                         int(1.02e9), 1.02, source_time=.9))
+        self.assertEqual(aligner.step_count, 1)
+
+    def test_lateral_direction_and_local_response_use_body_y_axis(self):
+        for direction, steering, expected in (('down', -1., 1.), ('up', -1., -1.),
+                                               ('down', 1., -1.)):
+            with self.subTest(direction=direction, steering=steering):
+                config = ControlConfig(image_forward_direction=direction, steering_sign=steering)
+                aligner = self.ready_aligner(config)
+                now = self.frames(aligner, .1, x=60., y=50.)
+                aligner.command(now, (0., 0., 0.), stopped=True)
+                self.assertGreater(expected*aligner.velocity()[1], 0.)
+                side = aligner.step_lateral_m
+                aligner.command(.6, (0., side, 0.), stopped=False)
+                aligner.command(.7, (0., side, 0.), stopped=True)
+                aligner.command(1.31, (0., side, 0.), stopped=True)
+                now = self.frames(aligner, 1.4, x=59., y=50.)
+                aligner.command(now, (0., side, 0.), stopped=True)
+                self.assertAlmostEqual(aligner.lateral_response_per_m, 4.)
+                self.assertIsNone(aligner.image_response_per_m)
+
+    def test_minimum_yaw_target_exceeds_arrival_tolerance(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down',
+                                                   start_alignment_heading_tolerance_rad=.02))
+        now = self.frames(aligner, .1, y=50., slope=math.tan(.0201))
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        self.assertGreater(abs(aligner.step_angle), aligner.ANGLE_STEP_TOLERANCE_RAD)
+        self.assertGreater(abs(aligner.velocity()[2]), .01)
+        aligner.command(now+.01, (0., 0., 0.), stopped=True)
+        self.assertEqual(aligner.phase, 'moving', 'unchanged odometry is not completion')
+
+    def test_missing_marker_cannot_commit_previous_ready_samples(self):
+        aligner = self.ready_aligner(ControlConfig())
+        self.frames(aligner, .1, y=50.)
+        self.assertTrue(aligner.visual_ready)
+        self.assertFalse(aligner.observe([], 101, 101, int(.25e9), .25))
+        self.assertEqual(aligner.command(.26, (0., 0., 0.), stopped=True),
+                         'start_alignment_waiting_for_marker')
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+
+    def test_expired_partial_window_and_zero_speed_cannot_move(self):
+        aligner = self.ready_aligner(ControlConfig())
+        self.frames(aligner, .1, y=50.)
+        self.assertTrue(aligner.visual_ready)
+        self.assertNotEqual(aligner.command(1.67, (0., 0., 0.), stopped=True),
+                            'start_alignment_complete')
+        self.assertGreater(len(aligner.samples), 0)
+        self.assertLess(len(aligner.samples), aligner.filter_frames)
+        self.assertFalse(aligner.visual_ready)
+        for x, slope in ((50., .3), (60., 0.)):
+            aligner = self.ready_aligner(ControlConfig(forward_speed=0.))
+            self.frames(aligner, .1, x=x, y=50., slope=slope)
+            aligner.command(.3, (0., 0., 0.), stopped=True)
+            self.assertEqual(aligner.velocity(), (0., 0., 0.))
+            self.assertEqual(aligner.step_count, 0)
+
+
+class ChargingDockTests(unittest.TestCase):
+    @staticmethod
+    def feedback(error=0., heading=0., metric=False):
+        return dict(error_normalized=error, lateral_error_m=error,
+                    near_heading_rad=heading, metric=metric)
+
+    def test_terminal_creep_avoids_driver_park_deadband_and_respects_speed_limits(self):
+        from charging_dock import ChargingDock
+        for marker_arrived, marker_error, direction in (
+                (False, None, -1), (False, .2, -1), (True, 0., -1), (False, -.2, 1)):
+            for speed_limit in (.03, .0115):
+                config = replace(ControlConfig(), forward_speed=speed_limit)
+                config.validate()
+                dock = ChargingDock(RouteConfig())
+                for frame in range(80):
+                    v, vy, w, state = dock.command((0., 0., 0.), self.feedback(), frame,
+                        frame*.1, config, True, marker_arrived, marker_error)
+                    if state == 'reverse_visual_finish_tracking':
+                        self.assertGreater(abs(v), .01, '会被驱动视为零速而驻车')
+                        self.assertLessEqual(abs(v), speed_limit)
+                        self.assertGreater(v*direction, 0.)
+                        self.assertEqual((vy, w), (0., 0.))
+                self.assertEqual(state, 'reverse_visual_finish_tracking')
+        for speed in (0., .009):
+            dock = ChargingDock(RouteConfig())
+            result = dock.command((0., 0., 0.), self.feedback(), 1, 0.,
+                replace(ControlConfig(), forward_speed=speed), True, False, .1)
+            self.assertEqual(result[:3], (0., 0., 0.))
+            self.assertEqual(result[3], 'speed_zero' if speed == 0. else
+                             'charging_dock_speed_below_motion_threshold')
+        for speed in (.008, .01, .031):
+            with self.assertRaises(ValueError):
+                replace(ControlConfig(), stop_marker_creep_speed=speed).validate()
+
+    def test_align_before_motion_then_search_only_ten_cm(self):
+        from charging_dock import ChargingDock
+        dock, config = ChargingDock(RouteConfig()), ControlConfig()
+        for frame in range(12):
+            v, vy, w, state = dock.command((0., 0., 0.), self.feedback(.08, .2), frame,
+                frame*.1, config, True, False, None)
+            self.assertEqual(v, 0., '未摆正就后退')
+            self.assertEqual(vy, 0., '朝向未摆正就横移')
+        for frame in range(12, 24):
+            result = dock.command((0., 0., 0.), self.feedback(), frame,
+                                  frame*.1, config, True, False, None)
+        self.assertLess(result[0], 0.)
+        self.assertEqual(result[1:3], (0., 0.), '对齐后必须直线后退')
+        result = dock.command((0., 0., 0.), self.feedback(), 24, 2.4, config, True, True, 0.)
+        self.assertNotEqual(result[3], 'reverse_route_complete', '横线不能冒充已充电')
+        result = dock.command((-.101, 0., 0.), self.feedback(), 25, 2.5, config, True, True, 0.)
+        self.assertEqual(result, (0., 0., 0., 'charging_dock_search_limit'))
+        self.assertEqual(dock.command((0., 0., 0.), self.feedback(), 26, 2.6,
+                         config, True, True, 0.)[3], 'charging_dock_search_limit', '故障必须锁定')
+
+    def test_small_offset_is_corrected_and_forward_reposition_is_bounded(self):
+        from charging_dock import ChargingDock
+        dock, config = ChargingDock(RouteConfig()), ControlConfig()
+        results = [dock.command((0., 0., 0.), self.feedback(.05), i, i*.1,
+                               config, True, False, None) for i in range(20)]
+        self.assertTrue(any(abs(result[1]) > 0. for result in results), '小偏差不能卡在ready零速')
+        dock = ChargingDock(RouteConfig())
+        for i in range(20):
+            result = dock.command((0., 0., 0.), self.feedback(), i, i*.1,
+                                  config, True, False, -.2)
+        self.assertGreater(result[0], 0.)
+        result = dock.command((.051, 0., 0.), self.feedback(), 20, 2., config, True, False, -.2)
+        self.assertEqual(result, (0., 0., 0., 'charging_dock_forward_limit'))
+
+    def test_deviation_missing_line_timeout_and_unique_frames(self):
+        from charging_dock import ChargingDock
+        config = ControlConfig()
+        for feedback in (self.feedback(.101, metric=True), self.feedback(.36), self.feedback(heading=.7)):
+            dock = ChargingDock(RouteConfig())
+            self.assertEqual(dock.command((0., 0., 0.), feedback, 1, 0., config, True, False, None)[3],
+                             'charging_dock_alignment_out_of_range')
+        dock = ChargingDock(RouteConfig())
+        self.assertEqual(dock.command((0., 0., 0.), None, 1, 0., config, True, False, None)[3],
+                         'charging_dock_line_unavailable')
+        dock = ChargingDock(RouteConfig())
+        for i in range(12):
+            self.assertEqual(dock.command((0., 0., 0.), self.feedback(), 1, i*.1,
+                             config, True, False, None)[0], 0., '同一帧不能重复累计到位')
+        dock = ChargingDock(RouteConfig())
+        dock.command((0., 0., 0.), self.feedback(), 1, 0., config, True, True, 0.)
+        self.assertEqual(dock.command((0., 0., 0.), self.feedback(), 2, 31.,
+                         config, True, True, 0.)[3], 'charging_dock_charge_not_detected')
 
 
 class RecordedRouteTests(unittest.TestCase):
@@ -162,7 +829,7 @@ class RecordedRouteTests(unittest.TestCase):
                 load_route(filename)
 
     def test_reverse_pure_pursuit_converges_straight_curve_and_s_curve(self):
-        config = RouteConfig()
+        config = replace(RouteConfig(), lookahead=.26)
         paths = [([(i*.01, 0., 0.) for i in range(101)]),
                  ([(math.sin(i*.01), 1-math.cos(i*.01), i*.01) for i in range(101)]),
                  ([(i*.01, .1*math.sin(math.pi*i*.01),
@@ -185,6 +852,66 @@ class RecordedRouteTests(unittest.TestCase):
             self.assertLessEqual(math.dist((x, y), points[0][:2]), config.goal_tolerance)
             self.assertLess(max_error, .03)
             self.assertEqual(follower.command((x+1., y, yaw), .025), (0., 0., 'reverse_route_complete'))
+
+    def test_logged_reverse_offset_can_enter_alignment_but_cannot_finish(self):
+        route = RouteConfig()
+        route.validate()
+        feedback = dict(error_normalized=-.567, near_heading_rad=math.radians(-11.9))
+        self.assertTrue(route.visual_entry_ok(feedback))
+        self.assertFalse(route.finish_alignment_ok(feedback['error_normalized'], feedback['near_heading_rad']))
+        self.assertFalse(route.visual_entry_ok(dict(feedback, error_normalized=-.76)))
+        self.assertFalse(route.visual_entry_ok(dict(feedback, near_heading_rad=math.radians(46))))
+        self.assertFalse(route.visual_entry_ok(dict(feedback, error_normalized=float('nan'))))
+        with self.assertRaises(ValueError):
+            replace(route, finish_entry_lateral=route.finish_exit_lateral).validate()
+        vy, _ = strafe_command(feedback, ControlConfig(), route)
+        self.assertLess(vy, -.01)
+
+    def test_recorded_tight_bend_requires_matching_return_curvature(self):
+        # 实车故障对应约20cm半径弯道；原2/m限制不能跟随去程已走过的5/m路径。
+        radius = .2
+        points = [(i*.01, 0., 0.) for i in range(81)]
+        points += [(.8+radius*math.sin(t), -radius*(1-math.cos(t)), -t)
+                   for t in (i*math.pi/200 for i in range(1, 101))]
+        points += [(1., -.2-i*.01, -math.pi/2) for i in range(1, 81)]
+        for cap, expected in ((2., 'reverse_target_not_behind'), (5., 'reverse_route_complete')):
+            config = replace(RouteConfig(), lookahead=.26, max_curvature=cap)
+            config.validate()
+            tracker = ReverseRouteFollower({'points': points}, points[-1], config)
+            x, y, yaw = points[-1]
+            v = w = peak_error = 0.
+            limited = False
+            for _ in range(6000):
+                target_v, target_w, state = tracker.command((x, y, yaw), .03)
+                peak_error = max(peak_error, tracker.diagnostics['tracking_error_m'])
+                limited |= tracker.diagnostics.get('curvature_limited', False)
+                if state != 'reverse_route_tracking':
+                    break
+                v, w = coordinated_velocity(v, w, target_v, target_w, ControlConfig(), .02)
+                self.assertLessEqual(abs(w), cap*abs(v)+1e-9)
+                x += v*math.cos(yaw)*.02
+                y += v*math.sin(yaw)*.02
+                yaw += w*.02
+            self.assertEqual(state, expected)
+            if cap == 2.:
+                self.assertTrue(limited)
+                self.assertGreater(tracker.diagnostics['remaining_m'], .5)
+            else:
+                self.assertLess(peak_error, .03)
+
+    def test_reverse_longer_lookahead_reduces_transient_correction(self):
+        # 同一横向偏差与同一倒车速度，放长前瞻应减小瞬间转向，不能靠减速实现。
+        points = [(i*.01, 0., 0.) for i in range(101)]
+        commands = []
+        for distance in (.20, .26):
+            config = replace(RouteConfig(), lookahead=distance)
+            tracker = ReverseRouteFollower({'points': points}, points[-1], config)
+            v, w, state = tracker.command((1., .01, .01), .05)
+            self.assertEqual(state, 'reverse_route_tracking')
+            self.assertEqual(v, -.05)
+            commands.append(w)
+        self.assertEqual(math.copysign(1., commands[0]), math.copysign(1., commands[1]))
+        self.assertLess(abs(commands[1]), abs(commands[0]))
 
     def test_return_speed_limit_and_approach_are_independent_of_lookahead(self):
         points = [(i*.01, 0., 0.) for i in range(101)]
@@ -352,7 +1079,7 @@ class ControlTests(unittest.TestCase):
         config = replace(ControlConfig(forward_ignore_start_marker=False), steering_filter_time_sec=0.)
         for side in (-1., 1.):
             guard = SteeringDirectionGuard()
-            error = side*.065  # 约21px；原始转向低于普通防摆动门槛。
+            error = side*.055  # 日志持续约18px偏移；原始转向低于普通防摆动门槛。
             _, yaw, _ = line_command(observation(error_normalized=error, near_heading_rad=0.), config)
             self.assertLess(abs(yaw/config.forward_speed), config.steering_curvature_enter)
             for frame in range(config.straight_center_confirmation_frames-1):
@@ -440,10 +1167,15 @@ class ControlTests(unittest.TestCase):
         config = ControlConfig(forward_ignore_start_marker=False)
         straight, _ = raw_tracking_geometry([(320, y) for y in range(120, 470, 6)], 640, 480, config)
         self.assertEqual(straight['effective_lookahead_ratio'], config.lookahead_distance_ratio)
-        previous = straight['effective_lookahead_ratio']
         for slope in np.linspace(.01, .45, 45):
             geometry, reason = raw_tracking_geometry(
                 [(320+slope*(y-120), y) for y in range(120, 470, 6)], 640, 480, config)
+            self.assertIsNone(reason)
+            self.assertAlmostEqual(geometry['effective_lookahead_ratio'], config.lookahead_distance_ratio)
+        previous = straight['effective_lookahead_ratio']
+        for bend in np.linspace(.0001, .012, 120):
+            geometry, reason = raw_tracking_geometry(
+                [(320+bend*(y-120)**2, y) for y in range(120, 270, 6)], 640, 480, config)
             self.assertIsNone(reason)
             ratio = geometry['effective_lookahead_ratio']
             self.assertGreaterEqual(ratio, config.curve_lookahead_distance_ratio)
@@ -1007,9 +1739,12 @@ class ControlTests(unittest.TestCase):
             gate.observe([marker], 480, config, now=now)
         for now in (.3, .4, .5, .6, .7):
             gate.observe([], 480, config, now=now)
-            speed, state = gate.limit(.075, config, now=now)
-            self.assertEqual(state, 'missing_approaching')
-            self.assertEqual(speed, config.stop_marker_creep_speed)
+            speed, state = gate.limit(.075, config, now=now, dt=.1)
+            if now <= .6:
+                self.assertEqual(state, 'missing_approaching')
+                self.assertEqual(speed, config.stop_marker_creep_speed)
+            else:
+                self.assertEqual((speed, state), (0., 'missing'))
             gate.record_motion(speed, .1, config)
         self.assertLessEqual(gate.dropout_commanded_distance, .005)
         self.assertEqual(gate.limit(.075, config, now=.81), (0., 'missing'))
@@ -1386,7 +2121,14 @@ class ControlTests(unittest.TestCase):
             self.assertAlmostEqual(geometry['curve_strength'], 0.0)
         tilted, _ = raw_tracking_geometry(
             [(319.5 + 0.5 * (y - 120), y) for y in range(120, 270, 6)], 640, 480, config)
-        self.assertGreater(tilted['curve_strength'], 0.9)  # 出弯后的倾斜直线也要尽快对准。
+        self.assertAlmostEqual(tilted['curve_strength'], 0.)
+        self.assertAlmostEqual(tilted['near_heading_rad'], math.atan(.5))
+        # 斜直线保留朝向修正，但不能进入大横向死区、压低回中力度。
+        centered = line_command(observation(**{k: tilted[k] for k in (
+            'error_normalized', 'heading_error_rad', 'near_heading_rad',
+            'path_heading_rad', 'curve_strength')}), config)
+        self.assertEqual(centered[2], 'tracking')
+        self.assertGreater(centered[1], 0.)
         points = [(319.5 + 0.012 * (y - 120) ** 2, y) for y in range(120, 270, 6)]
         curved, reason = raw_tracking_geometry(points, 640, 480, config)
         self.assertIsNone(reason)
@@ -1601,6 +2343,48 @@ class ControlTests(unittest.TestCase):
     def test_acceleration_limit(self):
         self.assertAlmostEqual(slew(0.0, 0.1, 0.15, 0.02), 0.003)
         self.assertAlmostEqual(slew(0.01, -0.1, 1.0, 0.02), -0.01)
+
+
+class DockDepartureTests(unittest.TestCase):
+    def test_clear_requires_three_distinct_frames(self):
+        from dock_departure import DockDeparture
+        gate = DockDeparture()
+        gate.advance(0., (0., 0.), True)
+        gate.observe(False, 1)
+        gate.observe(False, 1)
+        self.assertEqual(gate.clear_frames, 1)
+        gate.observe(True, 2)
+        gate.observe(False, 3)
+        gate.observe(False, 4)
+        self.assertEqual(gate.state, 'active')
+        gate.observe(False, 5)
+        self.assertEqual(gate.state, 'complete')
+        gate.advance(10., (.1, 0.), True)
+        self.assertEqual(gate.state, 'complete')
+
+    def test_distance_counts_actual_path_and_latches(self):
+        from dock_departure import DockDeparture
+        gate = DockDeparture()
+        gate.advance(0., (0., 0.), True)
+        gate.advance(1., (.16, 0.), True)
+        gate.advance(2., (0., 0.), True)
+        self.assertEqual(gate.fault, 'dock_departure_distance_exceeded')
+        for stamp in range(3):
+            gate.observe(False, stamp)
+        self.assertIsNotNone(gate.fault)
+
+    def test_timeout_includes_pauses(self):
+        from dock_departure import DockDeparture
+        gate = DockDeparture()
+        gate.advance(0., (0., 0.), True)
+        gate.advance(25., (0., 0.), True)
+        self.assertEqual(gate.fault, 'dock_departure_timeout')
+
+    def test_ordinary_start_does_not_arm(self):
+        from dock_departure import DockDeparture
+        gate = DockDeparture()
+        gate.advance(0., (0., 0.), False)
+        self.assertEqual(gate.state, 'idle')
 
 
 if __name__ == '__main__':

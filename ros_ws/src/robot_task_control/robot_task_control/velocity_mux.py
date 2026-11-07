@@ -18,13 +18,16 @@ class VelocityMux(Node):
         self.source = "pid"
         self.command = None
         self.received = None
-        self.publisher = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.input_timed_out = False
+        self.last_tick = monotonic()
+        self.last_delay_log = float('-inf')
+        self.publisher = self.create_publisher(Twist, "/cmd_vel", 1)
         for source in ("pid", "line_follow"):
             self.create_subscription(
                 Twist,
                 f"/robot_control/{source}/cmd_vel",
                 lambda message, source=source: self.on_command(source, message),
-                10,
+                1,
             )
         self.create_service(SetBool, "~/line_follow_mode", self.on_mode)
         self.create_service(SetBool, "~/enable", self.on_enable)
@@ -32,12 +35,16 @@ class VelocityMux(Node):
 
     def reset(self):
         self.command = self.received = None
+        self.input_timed_out = False
         self.publisher.publish(Twist())
 
     def on_command(self, source, message):
         if self.enabled and source == self.source:
             self.command = message
             self.received = monotonic()
+            if self.input_timed_out:
+                self.get_logger().info(f'速度选择器输入恢复：source={self.source}')
+                self.input_timed_out = False
 
     def on_mode(self, request, response):
         self.source = "line_follow" if request.data else "pid"
@@ -54,11 +61,24 @@ class VelocityMux(Node):
         return response
 
     def tick(self):
+        now = monotonic()
+        gap = now-self.last_tick
+        self.last_tick = now
+        if gap > self.timeout and now-self.last_delay_log > 5.:
+            self.last_delay_log = now
+            self.get_logger().warning(
+                f'速度选择器调度延迟 {gap*1000:.0f}ms；底盘可能因速度指令超时停车')
+        if (self.enabled and self.received is not None
+                and now-self.received > self.timeout and not self.input_timed_out):
+            self.input_timed_out = True
+            self.get_logger().warning(
+                f'速度选择器输入超时：source={self.source}, age={(now-self.received)*1000:.0f}ms, '
+                f'limit={self.timeout*1000:.0f}ms；输出零速')
         command = Twist()
         if (
             self.enabled
             and self.received is not None
-            and monotonic() - self.received <= self.timeout
+            and now - self.received <= self.timeout
         ):
             command = self.command
         self.publisher.publish(command)

@@ -17,7 +17,7 @@ from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, NotSubstitution, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -81,6 +81,7 @@ def generate_launch_description():
             "use_cartesian_path": LaunchConfiguration("arm_use_cartesian_path"),
             "cs_type": LaunchConfiguration("cs_type"),
             "admittance_enabled_on_startup": "false",
+            "launch_admittance": LaunchConfiguration("launch_admittance"),
             "auto_start_admittance": "false",
             "launch_coordinator": "false",
             "launch_sensor": LaunchConfiguration("launch_force_sensor"),
@@ -168,6 +169,7 @@ def generate_launch_description():
             "demo": "false",
             "video_device": LaunchConfiguration("line_camera_device"),
             "camera_frame": "line_camera_optical_frame",
+            "max_processing_fps": LaunchConfiguration("line_processing_fps"),
         }.items(),
     )
     line_follower = Node(
@@ -186,9 +188,14 @@ def generate_launch_description():
             ),
             {
                 "enabled": False,
+                "navigation_mode": LaunchConfiguration("line_navigation_mode"),
+                "standard_route_file": LaunchConfiguration("standard_route_file"),
+                "route_sample_distance": ParameterValue(LaunchConfiguration("line_route_sample_distance"), value_type=float),
                 "drive_direction": LaunchConfiguration("line_drive_direction"),
                 "route_file": LaunchConfiguration("line_route_file"),
                 "route_visual_finish": ParameterValue(LaunchConfiguration("line_route_visual_finish"), value_type=bool),
+                'charging_mode': ParameterValue(LaunchConfiguration('line_charging_mode'), value_type=bool),
+                'charging_status_layout': LaunchConfiguration('line_charging_status_layout'),
                 "route_camera_stop": ParameterValue(LaunchConfiguration("line_route_camera_stop"), value_type=bool),
                 "reverse_mode": LaunchConfiguration("line_reverse_mode"),
                 "reverse_steering_sign": ParameterValue(
@@ -211,8 +218,29 @@ def generate_launch_description():
                     LaunchConfiguration("line_stop_marker_target_ratio"), value_type=float
                 ),
                 "cmd_vel_topic": "/robot_control/line_follow/cmd_vel",
+                "reverse_route_lookahead": ParameterValue(
+                    LaunchConfiguration("line_reverse_route_lookahead"), value_type=float
+                ),
+                "reverse_route_max_curvature": ParameterValue(
+                    LaunchConfiguration("line_reverse_route_max_curvature"), value_type=float
+                ),
+                "route_finish_heading_gain": ParameterValue(
+                    LaunchConfiguration("line_reverse_finish_heading_gain"), value_type=float
+                ),
+                "start_alignment_enabled": ParameterValue(
+                    LaunchConfiguration("line_start_alignment_enabled"), value_type=bool
+                ),
+                "start_alignment_min_lateral_speed": ParameterValue(
+                    LaunchConfiguration("line_start_alignment_min_lateral_speed"), value_type=float
+                ),
+                "start_alignment_lateral_speed": ParameterValue(
+                    LaunchConfiguration("line_start_alignment_lateral_speed"), value_type=float
+                ),
                 "forward_speed": ParameterValue(
                     LaunchConfiguration("line_follow_speed"), value_type=float
+                ),
+                "reverse_max_speed": ParameterValue(
+                    LaunchConfiguration("line_reverse_speed"), value_type=float
                 ),
             },
         ],
@@ -269,6 +297,10 @@ def generate_launch_description():
                     LaunchConfiguration("start_image_transfer"), value_type=bool
                 ),
                 "workflow_file": LaunchConfiguration("workflow_file"),
+                "standard_route_output": LaunchConfiguration("standard_route_output"),
+                "manage_admittance": ParameterValue(LaunchConfiguration("launch_admittance"), value_type=bool),
+                "joint_posture_only": ParameterValue(LaunchConfiguration("joint_posture_only"), value_type=bool),
+                "manage_line_stream": ParameterValue(LaunchConfiguration("manage_line_stream"), value_type=bool),
                 "require_arm_ready": ParameterValue(
                     LaunchConfiguration("require_arm_ready"), value_type=bool
                 ),
@@ -282,6 +314,11 @@ def generate_launch_description():
         ],
     )
 
+    def start_line_devices(context):
+        # 只提前准备USB采集/识别；follower和速度选择器均未使能，不允许提前运动。
+        early = LaunchConfiguration("prepare_line_camera_early").perform(context).lower() in ("true", "1")
+        return [line_system] if early else []
+
     def start_control_stack(context):
         delay = float(LaunchConfiguration("arm_control_start_delay").perform(context))
         if not math.isfinite(delay) or delay < 0:
@@ -292,7 +329,9 @@ def generate_launch_description():
         motion_enabled = LaunchConfiguration("start_moveit").perform(
             context
         ).lower() in ("true", "1")
-        stack = [robot_motion_system, line_system, workflow_controller]
+        early = LaunchConfiguration("prepare_line_camera_early").perform(context).lower() in ("true", "1")
+        stack = [robot_motion_system, workflow_controller] if early else [
+            robot_motion_system, line_system, workflow_controller]
         if not driver_enabled or not motion_enabled or delay == 0:
             return stack
         gate = Node(
@@ -322,6 +361,17 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("start_hk_camera", default_value="true"),
             DeclareLaunchArgument("start_line_camera", default_value="true"),
+            DeclareLaunchArgument("line_navigation_mode", default_value="vision"),
+            DeclareLaunchArgument("standard_route_file", default_value="~/.ros/line_follow/standards/route_01/standard_route.json"),
+            DeclareLaunchArgument("standard_route_output", default_value=""),
+            DeclareLaunchArgument("line_processing_fps", default_value="0.0"),
+            DeclareLaunchArgument("line_route_sample_distance", default_value="0.02"),
+            DeclareLaunchArgument("joint_posture_only", default_value="false"),
+            DeclareLaunchArgument("launch_admittance", default_value=NotSubstitution(
+                LaunchConfiguration("joint_posture_only"))),
+            DeclareLaunchArgument("manage_line_stream", default_value="false"),
+            DeclareLaunchArgument("prepare_line_camera_early", default_value="false",
+                                 description="提前准备USB相机，任务仍等待机械臂连接稳定和设备检查"),
             DeclareLaunchArgument("start_image_transfer", default_value="true"),
             DeclareLaunchArgument("image_listen_ip", default_value="0.0.0.0"),
             DeclareLaunchArgument("image_receiver_ip", default_value="169.254.199.120"),
@@ -335,9 +385,18 @@ def generate_launch_description():
             DeclareLaunchArgument("image_max_fps", default_value="10.0"),
             DeclareLaunchArgument("hk_output_dir", default_value="~/robot_data/hk"),
             DeclareLaunchArgument("line_camera_device", default_value="/dev/video0"),
+            DeclareLaunchArgument("line_reverse_route_lookahead", default_value="0.26"),
+            DeclareLaunchArgument("line_reverse_route_max_curvature", default_value="5.0"),
+            DeclareLaunchArgument("line_reverse_finish_heading_gain", default_value="0.60"),
+            DeclareLaunchArgument("line_start_alignment_enabled", default_value="true"),
             DeclareLaunchArgument("line_follow_speed", default_value="0.075"),
+            DeclareLaunchArgument("line_reverse_speed", default_value="0.05"),
+            DeclareLaunchArgument("line_start_alignment_min_lateral_speed", default_value="0.02"),
+            DeclareLaunchArgument("line_start_alignment_lateral_speed", default_value="0.03"),
             DeclareLaunchArgument("line_route_file", default_value="~/.ros/line_follow/last_route.json"),
             DeclareLaunchArgument("line_route_visual_finish", default_value="true"),
+            DeclareLaunchArgument('line_charging_mode', default_value='false'),
+            DeclareLaunchArgument('line_charging_status_layout', default_value='byte_flags'),
             DeclareLaunchArgument("line_route_camera_stop", default_value="true"),
             DeclareLaunchArgument("line_reverse_mode", default_value="recorded_route", choices=["recorded_route", "camera"]),
             DeclareLaunchArgument("line_reverse_steering_sign", default_value="-1.0"),
@@ -408,6 +467,7 @@ def generate_launch_description():
             hk_camera,
             hk_capture,
             hk_transfer,
+            OpaqueFunction(function=start_line_devices),
             arm_driver,
             OpaqueFunction(function=start_control_stack),
         ]

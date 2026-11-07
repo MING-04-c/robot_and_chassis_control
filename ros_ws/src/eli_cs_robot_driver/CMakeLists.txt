@@ -211,7 +211,7 @@ install(
 )
 
 # Install examples
-install(PROGRAMS scripts/auto_power_on.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/auto_power_on.py scripts/protective_stop_guard.py DESTINATION lib/${PROJECT_NAME})
 install(
   DIRECTORY example/launch/
   DESTINATION share/${PROJECT_NAME}/launch/

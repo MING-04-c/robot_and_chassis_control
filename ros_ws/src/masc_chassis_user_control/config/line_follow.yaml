@@ -1,11 +1,41 @@
 line_follow_controller:
   ros__parameters:
+    opencv_threads: 2                 # 有限计算并行；1/2可对比，控制状态机仍串行
     enabled: true                    # 有效蓝线和底盘反馈到齐后开始循迹
     forward_speed: 0.075              # m/s：7.5 cm/s，可在线调整
+    start_alignment_enabled: true     # 起步横线多帧对齐后才建立路线原点
+    start_alignment_timeout_sec: 45.0
+    start_alignment_settle_sec: 0.6   # 停稳后等待，再收集停车后拍摄的新帧
+    start_alignment_step_distance: 0.015 # 每次里程计修正最多1.5cm；未标定首次试探5mm
+    start_alignment_speed: 0.03       # 起步对齐受限低速
+    start_alignment_lateral_speed: 0.03 # 起步横移独立上限，m/s
+    start_alignment_min_lateral_speed: 0.02 # 横移最低目标速度；需实车确认能够稳定运动
+    start_alignment_min_linear_speed: 0.012 # 超出0.01零速判定；到位立即归零
+    start_alignment_min_angular_speed: 0.02 # rad/s；避免微小指令不能解锁底盘
+    start_alignment_max_angular_speed: 0.12
+    start_alignment_lateral_gain: 0.45
+    start_alignment_lateral_tolerance_ratio: 0.02 # 半图宽2%，640宽约6.4像素
+    start_alignment_heading_tolerance_rad: 0.035 # 图像切线约2度；未标定不等于地面yaw
+    start_alignment_tolerance_ratio: 0.015
+    start_alignment_max_distance: 0.30
+    start_alignment_reverse_correction: true
+    start_alignment_max_reverse_distance: 0.10
     drive_direction: forward          # forward/reverse；前置相机安装方向不随倒车修改
-    reverse_max_speed: 0.04            # 前置相机后退速度绝对值上限，m/s
+    reverse_max_speed: 0.05            # 倒车巡航速度绝对值上限，摄像头/记录轨迹共用，m/s
+    dock_departure_enabled: true      # 前进时允许充电桩离站，不允许手动充电离站
+    dock_departure_speed: 0.02        # m/s，未脱离充电时的速度上限
+    dock_departure_max_distance: 0.30 # m，实际里程累计超过限度仍充电则锁停
+    dock_departure_timeout: 25.0      # s，含暂停时间；连续3帧不充电后恢复正常循迹
+    charging_mode: false             # 显式开启倒车充电模式；普通倒车仍按横线完成
+    charging_status_layout: byte_flags # 实车SDK使用dock_charging/manual_charging字段
+    charging_search_distance: 0.10    # 横线到位后搜索充电最多10cm，并受原起点围栏约束
     reverse_mode: recorded_route # 默认倒车跟踪前进里程计路线，camera仅保留旧测试模式
     record_route: true
+    standard_visual_loss_timeout: 5.0 # replay中段短暂丢线最多续行5秒；相机/里程计过期仍立即停
+    standard_visual_loss_distance: 0.30 # m，丢线续行累计实际路程上限；末段15cm必须视觉有效
+    standard_visual_assist_gain: 0.5 # replay视觉辅助，同时检查横向与朝向
+    standard_visual_assist_max_yaw: 0.06 # rad/s；最终仍服从总曲率/角速度上限
+    forward_route_max_curvature: 5.0 # 1/m，前进重放独立于末段对齐；大曲率时同步减速
     route_visual_finish: true # 最后直线使用相机对线找横线，找到才正常完成
     route_visual_strafe: true # 已确认底盘可横移：回中用vy，摆正用w；倒车不反转横移方向
     route_visual_lateral_speed: 0.025 # m/s，末段横移上限；途中可信直线段再限为0.01
@@ -19,7 +49,8 @@ line_follow_controller:
     route_finish_straight_distance: 0.60 # m，最后60cm内，近端可纠偏且剩余路径为小弯/直线时允许视觉接管
     route_finish_lateral_sign: 1.0 # 仅visual_strafe=false的回归分支；全向回中不使用此倒车反号
     route_finish_center_gain: 0.65 # 仅旧纵向+转向分支的回中力度；横移使用route_visual_*_gain
-    route_finish_heading_gain: 0.80 # 末段实测轴向对齐力度，不随横向标定反号
+    route_finish_heading_gain: 0.60 # 末段摆正力度，降低回正过冲；不改变前进转向
+    route_finish_entry_lateral: 0.65 # 允许偏线时接管纠偏；不是最终到位容差，640宽约208px
     route_finish_entry_heading: 0.40 # rad，约23度内且连续确认后允许低速接管
     route_finish_exit_heading: 0.65 # rad，接管后中等偏差降速纠偏，超过约37度停车
     route_finish_exit_lateral: 0.75 # 半图宽比例，接管后允许横向纠偏余量；640宽对应±240px，非米
@@ -37,7 +68,9 @@ line_follow_controller:
     route_sample_distance: 0.02 # m，路线采样间隔；终点额外保存
     route_max_speed: 0.08 # m/s，记录路线倒车独立上限，旧camera模式仍为0.04
     route_approach_distance: 0.10 # m，关闭视觉末段时最后10cm减速，与转向前瞻独立
-    route_lookahead: 0.20 # m，车后记录路线的前瞻弧长
+    route_lookahead: 0.20 # m，标准路线前进重放的前瞻弧长
+    reverse_route_lookahead: 0.26 # m，仅记录路线倒车的前瞻，适当放长减轻急纠偏；过长会切弯
+    reverse_route_max_curvature: 5.0 # 1/m，仅途中倒车跟踪；实测记录弯道约5/m，不能沿用末段2/m限制
     route_max_curvature: 2.0 # 1/m，默认最小转弯半径0.5m，需结合实际轨迹验证
     route_max_tracking_error: 0.15 # m，超出则停车
     route_goal_tolerance: 0.02 # m，里程计下到起点的停车容差，不是实车精度承诺
@@ -69,7 +102,7 @@ line_follow_controller:
     steering_filter_time_sec: 0.16 # 保留转向低通，减少拖慢弯道响应的延迟
     steering_curvature_enter: 0.30   # 1/m，启动小幅转向门槛；按配置速度归一，避免低速放大
     straight_center_curvature_enter: 0.10 # 持续直线偏移确认后，小幅回中门槛（1/m）
-    straight_center_confirmation_frames: 5 # 同侧偏移达到直线死区1.5倍，连续5张新图才放行
+    straight_center_confirmation_frames: 5 # 同侧偏移达到直线死区1.25倍，连续5张新图才放行
     steering_curvature_exit: 0.15    # 1/m，退出门槛；迟滞防止小噪声反复启停转向
     steering_reverse_frames: 3      # 轻微反向需3张新图确认；50Hz重复同帧不累计
     steering_fast_reverse_curvature: 1.5 # 1/m，明显反向弯缩为2张新图，避免拖慢真实S弯
@@ -107,7 +140,7 @@ line_follow_controller:
     stop_marker_target_ratio: 0.5       # 原始相机处理画面高度中间，不是拼接预览的中间
     stop_marker_position_tolerance_ratio: 0.03 # 提前图高3%可到达；480高约14.4px
     stop_marker_slowdown_ratio: 0.25    # 距目标还有图高25%时开始接近减速
-    stop_marker_creep_speed: 0.008      # m/s，近距离最低接近限速，不会抬高已有更低限速
+    stop_marker_creep_speed: 0.012      # m/s，须高于驱动0.01驻车门槛；仅限速，不抬高已有更低限速
     stop_marker_dropout_grace_sec: 0.6 # 主线/帧有效且确认过的横线尚远，漏检最多缓行0.6秒
     stop_marker_dropout_max_distance: 0.005 # m，同一次横线漏检最多累计发出5mm行驶指令
     stop_marker_average_frames: 3 # 同一横线最近3张新图像取平均，减少运动中的位置滞后

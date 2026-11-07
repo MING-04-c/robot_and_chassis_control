@@ -137,7 +137,7 @@ ros2 run geminipro_camer_calibration capture_transfer.py send --archive ~/Deskto
 
 ## 相机 joint 检测坐标转换为机器人触碰目标
 
-这里的工作是**检测点坐标转换**，默认不要求手眼标定。以 Joint_1 的子坐标系 `terminal_link_1` 为相机原点，检测得到相对于它的 XYZ；Joint_2 的子坐标系 `terminal_link_2` 是测厚探头检测点。控制器仍控制 `tool0`，必须补偿探头与 tool0 的偏移。
+这里的工作是**检测点坐标转换**，默认不要求手眼标定。以共用末端模型中的 `terminal_link_1` 为相机原点，检测得到相对于它的 XYZ；Joint_2 的子坐标系 `terminal_link_2` 是测厚探头检测点。控制器仍控制 `tool0`，必须补偿探头与 tool0 的偏移。
 
 统一 `A_T_B` 表示把 B 中坐标转换到 A，位置单位米：
 
@@ -159,7 +159,7 @@ ros2 launch geminipro_camer_calibration target_transform.launch.py
 
 推荐输入 `/geminipro_calibration/camera_point`，类型 `geometry_msgs/PointStamped`：
 
-- `header.frame_id: terminal_link_1`，即相机 Joint_1 的子坐标系。
+- `header.frame_id: terminal_link_1`，即模型中的相机坐标系。
 - `header.stamp` 是观测图像对应的 ROS 时间，不能填零。节点用这个时刻的机器人位姿转换，避免机器人移动后用新位姿解释旧照片。
 - `point.x/y/z` 是相对于相机 joint 的检测点坐标，单位**米**。主机如果计算的是毫米，先除以 1000。
 

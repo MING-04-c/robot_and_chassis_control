@@ -2,6 +2,7 @@
 """Execute a YAML-defined chassis and robot motion workflow."""
 
 import json
+from copy import deepcopy
 import math
 import os
 import signal
@@ -43,6 +44,8 @@ SUPPORTED_ACTIONS = set(CONTROL_COMMANDS) | {
     "line_follow",
     "wait_chassis_stopped",
     "save_line_route",
+    "arm_posture",
+    "continue_line_follow",
 }
 
 
@@ -52,13 +55,38 @@ class WorkflowController(Node):
         workflow_file = str(self.declare_parameter("workflow_file", "").value)
         if not workflow_file:
             raise ValueError("workflow_file parameter is required")
+        self.standard_output = str(self.declare_parameter("standard_route_output", "").value)
         self.capture_process = None
         self.capture_only = False
         self.capture_config_file = str(self.declare_parameter("capture_config_file", "").value)
         self.workflow_path = Path(workflow_file).resolve()
         self.workflow = self.load_workflow(self.workflow_path)
         self.workflow_name = str(self.workflow.get("name", "unnamed_workflow"))
-        self.steps = self.workflow["steps"]
+        self.steps = deepcopy(self.workflow["steps"])
+        self.original_steps = deepcopy(self.steps)
+        if self.standard_output and not any(step['action'] == 'save_line_route' for step in self.steps):
+            raise ValueError('teach模式需要包含save_line_route的流程，不能关闭round_trip后直接结束录制')
+        self.manage_line_stream = bool(self.declare_parameter('manage_line_stream', False).value)
+        self.line_streaming = True
+        self.line_stream_wait = None
+        self.line_warmup_deadline = None
+        self.line_warmup_future = None
+        self.manage_admittance = bool(self.declare_parameter('manage_admittance', True).value)
+        self.joint_posture_only = bool(self.declare_parameter('joint_posture_only', False).value)
+        if self.joint_posture_only and any(step['action'] in ('arm_move', 'arm_poses') for step in self.steps):
+            raise ValueError('joint_posture_only流程只允许关节姿态动作，不允许笛卡尔/导纳动作')
+        self.station_context = None
+        self.station_resume_requested = False
+        self.station_rearmed = True
+        self.posture_status = None
+        self.posture_status_time = None
+        self.posture_request_id = None
+        self.posture_clients = {name: self.create_client(Trigger, '/arm_joint_postures/'+name)
+                                for name in ('travel', 'detection_ready')}
+        self.posture_cancel_client = self.create_client(Trigger, '/arm_joint_postures/cancel')
+        self.create_subscription(String, '/arm_joint_postures/status', self.on_posture_status,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(Empty, '/line_follow/resume', self.on_station_resume, 10)
         self.tasks = self.load_task_table(self.workflow)
         self.validate_task_references()
         self.auto_start = bool(
@@ -196,12 +224,15 @@ class WorkflowController(Node):
                 "device check timing parameters must be finite; timeout > 0 and stable duration >= 0"
             )
         self.check_arm_devices = any(
-            step["action"] in ("arm_move", "arm_poses") for step in self.steps
+            step["action"] in ("arm_move", "arm_poses", "arm_posture") for step in self.steps
         )
+        self.check_posture_devices = any(step['action'] == 'arm_posture' for step in self.steps)
         self.check_admittance_devices = any(
             step["action"] == "arm_move" and step["control_mode"] == "admittance"
             for step in self.steps
         )
+        if self.check_admittance_devices and not self.manage_admittance:
+            raise ValueError('包含导纳动作的任务必须启用manage_admittance及对应节点')
         self.check_moveit_devices = any(
             step["action"] == "arm_poses"
             or (step["action"] == "arm_move" and step["control_mode"] == "moveit")
@@ -220,6 +251,14 @@ class WorkflowController(Node):
 
         self.stop_server = self.create_service(Trigger, "~/stop", self.on_stop_request)
         self.capture_server = self.create_service(Trigger, "~/capture", self.on_capture_request)
+        self.safety_inhibited = False
+        self.safety_checkpoint = None
+        self.recovery_arm_target = None
+        self.recovery_hold_step = None
+        self.create_subscription(Bool, "/robot_control/safety_inhibit", self.on_safety_inhibit,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_service(Trigger, "~/safety_pause", self.on_safety_pause)
+        self.create_service(Trigger, "~/safety_resume", self.on_safety_resume)
         self.generation = 0
         self.run_id = uuid4().hex
         self.route_checkpoint_file = None
@@ -262,11 +301,18 @@ class WorkflowController(Node):
             "capture_only": self.capture_only,
             "run_id": getattr(self, "run_id", ""), "active": self.active,
             "failed": self.failed, "failure_reason": self.last_failure,
+            "safety_inhibited": self.safety_inhibited,
+            "safety_checkpoint": self.safety_checkpoint is not None,
             "phase": self.phase,
             "step_index": int(self.phase == "capture_complete") if self.capture_only else self.step_index,
             "step_count": 1 if self.capture_only else len(self.steps),
             "action": step["action"] if step else None,
             "follow_state": self.follow_status,
+            "posture": step.get('posture') if step else None,
+            "drive_direction": step.get('drive_direction') if step else None,
+            "devices_ready": self.devices_checked,
+            "wait_seconds_remaining": (max(0., (self.deadline_ns-self.get_clock().now().nanoseconds)/1e9)
+                                       if self.phase == 'waiting_delay' else None),
             "route_checkpoint_file": self.route_checkpoint_file,
             "stamp_ns": self.get_clock().now().nanoseconds,
         }, ensure_ascii=False)))
@@ -282,7 +328,19 @@ class WorkflowController(Node):
         steps = workflow.get("steps")
         if not isinstance(steps, list) or not steps:
             raise ValueError("workflow.steps must be a non-empty list")
-        for index, step in enumerate(steps):
+        # YAML锚点共享站点动作，展开后按普通步骤执行，不复制维护点位。
+        def flatten(items):
+            return [deepcopy(step) for item in items
+                    for step in (flatten(item) if isinstance(item, list) else [item])]
+        steps = flatten(steps)
+        station_steps = flatten(workflow.get('station_steps', []))
+        workflow['station_steps'] = station_steps
+        if workflow.get('arm_postures_before_chassis', False):
+            steps = [part for step in steps for part in (
+                [{'action': 'arm_posture', 'posture': 'travel', 'step_timeout_sec': 600.}, step]
+                if step.get('action') in ('line_follow', 'chassis_execute') else [step])]
+        workflow['steps'] = steps
+        for index, step in enumerate(steps+station_steps):
             if not isinstance(step, dict):
                 raise ValueError(f"workflow step {index} must be a mapping")
             action = step.get("action")
@@ -301,6 +359,18 @@ class WorkflowController(Node):
             if action == "final_capture" and "config_file" in step:
                 if not isinstance(step["config_file"], str) or not step["config_file"].strip():
                     raise ValueError(f"workflow step {index} requires a valid config_file path")
+            if action == 'arm_posture' and step.get('posture') not in ('travel', 'detection_ready'):
+                raise ValueError('arm_posture requires travel or detection_ready')
+            if action == 'line_follow' and step.get('service_intermediate_stations', False):
+                if not station_steps or not workflow.get('arm_postures_before_chassis', False):
+                    raise ValueError('站点动作需要station_steps和行驶姿态保护')
+                if step.get('skip_intermediate_markers', False):
+                    raise ValueError('站点执行与自动跳站不能同时启用')
+            if action == 'line_follow' and type(step.get('finish_at_first_marker', False)) is not bool:
+                raise ValueError('finish_at_first_marker必须是bool')
+            if action == 'line_follow' and step.get('finish_at_first_marker', False):
+                if step.get('drive_direction') != 'forward' or step.get('service_intermediate_stations', False):
+                    raise ValueError('首条横线到站仅支持显式forward，且不能同时插入逐站动作')
             if action == "line_follow":
                 if 'drive_direction' in step and step['drive_direction'] not in ('forward', 'reverse'):
                     raise ValueError(f'workflow step {index} drive_direction must be forward or reverse')
@@ -453,7 +523,85 @@ class WorkflowController(Node):
                 "must be finite and non-negative"
             )
 
+    def on_safety_inhibit(self, message):
+        self.safety_inhibited = message.data
+        if message.data:
+            self.pause_for_safety()
+
+    def pause_for_safety(self):
+        """保存步骤和已解析的绝对目标；旧异步回调通过 generation 作废。"""
+        if self.safety_checkpoint is not None or self.capture_only:
+            return
+        step = self.current_step()
+        holding = not self.active and self.arm_control_mode == "admittance"
+        if not self.active and not holding:
+            return
+        target = None
+        if (step and step["action"] == "arm_move" and self.phase != "ready"
+                and getattr(self, "pending_arm_target", None) is not None):
+            target = deepcopy(self.pending_arm_target)
+        self.safety_checkpoint = dict(step_index=self.step_index, step=deepcopy(step),
+                                      target=target, holding=holding, run_id=self.run_id)
+        self.fail_workflow("机器人安全暂停；等待人工确认恢复")
+        self.phase = "safety_paused"
+        # 仅保存诊断摘要；进程重启后不自动恢复未完成运动。
+        checkpoint = Path.home()/".ros/robot_control/workflow_safety_checkpoint.json"
+        try:
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            data = dict(workflow=str(self.workflow_path), run_id=self.run_id,
+                        step_index=self.step_index, step=step, holding=holding)
+            if target is not None:
+                from rosidl_runtime_py.convert import message_to_ordereddict
+                data['resolved_target'] = message_to_ordereddict(target)
+            temporary = checkpoint.with_suffix('.tmp')
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            temporary.replace(checkpoint)
+        except OSError as error:
+            self.get_logger().error(f"无法保存安全暂停诊断文件：{error}")
+
+    def on_safety_pause(self, request, response):
+        self.pause_for_safety()
+        response.success = True
+        response.message = "Task paused; checkpoint retained" if self.safety_checkpoint else "No arm task to resume"
+        return response
+
+    def on_safety_resume(self, request, response):
+        checkpoint = self.safety_checkpoint
+        if self.safety_inhibited or checkpoint is None:
+            response.success = checkpoint is None and not self.safety_inhibited
+            response.message = "No checkpoint" if checkpoint is None else "Safety inhibit is still active"
+            return response
+        if self.workflow.get('arm_postures_before_chassis', False):
+            response.success = False
+            response.message = '联动姿态任务已中止锁定；完成安全恢复后重新启动联动launch，不原地续跑'
+            return response
+        step = checkpoint['step']
+        if not checkpoint['holding'] and (step is None or step['action'] not in ('arm_move', 'delay')):
+            response.success = False
+            response.message = "This step needs an explicit task restart; checkpoint retained (no side effects replayed)"
+            return response
+        self.generation += 1
+        self.step_index = checkpoint['step_index']
+        self.recovery_arm_target = deepcopy(checkpoint['target'])
+        if checkpoint['holding']:
+            # 独立柔顺任务早已完成时，只在当前姿态重新进入柔顺，不回报警前的姿态。
+            self.recovery_hold_step = dict(action='arm_move', control_mode='admittance',
+                frame_id='base_link', end_effector_frame='tool0', max_position_distance=.01,
+                target_pose=dict(position_mode='relative', position=[0., 0., 0.], orientation='current'))
+            self.recovery_arm_target = None
+        self.safety_checkpoint = None
+        self.failed, self.active, self.phase = False, True, 'ready'
+        self.last_failure = ''
+        self.step_started = monotonic()
+        self.mux_run_ready = not self.use_velocity_mux
+        self.reset_device_checks()
+        response.success = True
+        response.message = "Resuming saved arm step with fresh state; old trajectories discarded"
+        return response
+
     def current_step(self):
+        if self.recovery_hold_step is not None:
+            return self.recovery_hold_step
         if self.capture_only:
             return None if self.phase == "capture_complete" else {
                 "action": "final_capture", "step_timeout_sec": 300.,
@@ -464,12 +612,20 @@ class WorkflowController(Node):
         return self.steps[self.step_index]
 
     def on_start_request(self, request, response):
+        if self.safety_inhibited or self.safety_checkpoint is not None:
+            response.success = False
+            response.message = "Safety pause is latched; use /protective_stop_guard/confirm_recovery"
+            return response
         if self.workflow.get("camera_only", False):
             return self.on_capture_request(request, response)
         del request
         if self.capture_process is not None and self.capture_process.poll() is None:
             response.success = False
             response.message = "previous camera capture is still stopping"
+            return response
+        if self.active and self.station_context is not None:
+            self.station_resume_requested = True
+            response.success, response.message = True, '已收到继续请求；本站动作完成并到行驶姿态后继续循迹'
             return response
         if self.active:
             response.success = False
@@ -483,6 +639,10 @@ class WorkflowController(Node):
         if self.failed:
             self.step_index = 0
             self.failed = False
+        self.steps = deepcopy(self.original_steps)
+        self.station_context = None
+        self.station_resume_requested = False
+        self.station_rearmed = True
         self.generation += 1
         self.run_id = uuid4().hex
         self.route_checkpoint_file = None
@@ -527,6 +687,8 @@ class WorkflowController(Node):
     def on_stop_request(self, request, response):
         del request
         capture_only = self.capture_only
+        self.safety_checkpoint = None
+        self.recovery_arm_target = self.recovery_hold_step = None
         self.fail_workflow("stopped by user")
         response.success = True
         if capture_only:
@@ -716,12 +878,19 @@ class WorkflowController(Node):
                 lambda result: self.checked_bool(result, "follow_enable"),
             )
         elif self.phase == "follow_enable":
-            self.phase = "follow_enable_pending"
-            self.request_bool(
-                self.follow_enable_client,
-                True,
-                lambda result: self.checked_bool(result, "follow_tracking"),
-            )
+            if (self.workflow.get('arm_postures_before_chassis', False)
+                    or self.workflow.get('lock_chassis_between_steps', False)):
+                self.phase = "follow_output_pending"
+                self.request_bool(self.mux_enable_client, True,
+                                  lambda result: self.checked_bool(result, 'follow_enable_controller'))
+            else:
+                self.phase = 'follow_enable_pending'
+                self.request_bool(self.follow_enable_client, True,
+                                  lambda result: self.checked_bool(result, 'follow_tracking'))
+        elif self.phase == 'follow_enable_controller':
+            self.phase = 'follow_enable_pending'
+            self.request_bool(self.follow_enable_client, True,
+                              lambda result: self.checked_bool(result, 'follow_tracking'))
         elif self.phase == "follow_tracking":
             now = monotonic()
             dt = min(now - self.follow_last_tick, 0.2)
@@ -730,12 +899,33 @@ class WorkflowController(Node):
                 self.follow_status_time is not None
                 and now - self.follow_status_time <= 1.0
             )
+            if fresh and self.follow_status and self.follow_status.startswith('start_alignment_failed'):
+                self.fail_workflow('起步横线对齐失败，底盘保持停车：'+self.follow_status)
+                return
+            if fresh and self.follow_status and self.follow_status.startswith('standard_'):
+                self.fail_workflow('标准路线重放停止，底盘保持停车：'+self.follow_status)
+                return
+            if fresh and self.follow_status and self.follow_status.startswith('start_alignment_'):
+                self.follow_last_tracking = now
+                self.follow_boundary_since = None
+                self.follow_station_confirm_since = None
+                return  # 对齐期间只走受限微调，不计入循迹进度超时。
+            if fresh and self.follow_status and self.follow_status.startswith('charging_dock_'):
+                if self.follow_status == 'charging_dock_confirming':
+                    self.follow_last_tracking = now
+                    return
+                self.fail_workflow('倒车充电停止：'+self.follow_status)
+                return
             if fresh and self.follow_status == "reverse_finish_goal_not_centered":
                 self.fail_workflow(
                     "倒车终点横线已到，但横向或朝向尚未达标；底盘保持停车，返程未完成，不执行后续步骤"
                 )
                 return  # 必须早于计时结束判断，不能用运行时长替代最终居中。
-            if fresh and self.follow_status == "stop_marker_intermediate":
+            if (fresh and self.follow_status == "stop_marker_intermediate"
+                    and not step.get('finish_at_first_marker', False)):
+                if step.get('service_intermediate_stations', False) and self.station_rearmed:
+                    self.begin_station(step)
+                    return
                 if step.get('skip_intermediate_markers', False) and now-self.follow_resume_sent >= 1.:
                     self.follow_resume_publisher.publish(Empty())
                     self.follow_resume_sent = now
@@ -761,6 +951,7 @@ class WorkflowController(Node):
                 self.follow_boundary_since = None
                 return  # 纵向已停，视觉仍在横移/摆正；不计行走时长，也不误报完成。
             if fresh and self.follow_status in ("tracking", "stop_marker_approaching", "stop_marker_missing_approaching", "reverse_route_tracking", "reverse_visual_finish_tracking"):
+                self.station_rearmed = True
                 self.follow_tracking_seconds += dt
                 self.follow_last_tracking = now
                 if self.follow_boundary_since is not None:
@@ -787,15 +978,16 @@ class WorkflowController(Node):
             timed_finish = (not until_untrusted and
                             self.follow_tracking_seconds >= float(step["seconds"]))
             route_complete = fresh and self.follow_status == "reverse_route_complete"
-            final_marker = fresh and self.follow_status == "stop_marker_final"
+            final_marker = fresh and (self.follow_status == "stop_marker_final" or
+                step.get('finish_at_first_marker', False) and self.follow_status == 'stop_marker_intermediate')
             if boundary_confirmed and step.get("require_final_marker", False) and not (final_marker or route_complete):
-                self.fail_workflow("最终停止横线尚未确认，主线持续不可用；不会执行后续机械臂点位")
+                self.fail_workflow("目标停止横线尚未确认，主线持续不可用；不会执行后续机械臂点位")
                 return
             if boundary_confirmed or timed_finish or final_marker or route_complete:
                 if route_complete:
                     self.get_logger().info("已返回记录路线起点，结束倒车并等待底盘停稳")
                 if final_marker:
-                    self.get_logger().info("最终停止横线已居中停车，结束循迹并等待底盘停稳")
+                    self.get_logger().info("目标停止横线已到位停车，结束循迹并等待底盘停稳")
                 if boundary_confirmed:
                     self.get_logger().info(f"可信实测段不足，结束本次循迹：{self.follow_status}")
                 self.phase = "follow_disable_pending"
@@ -832,6 +1024,10 @@ class WorkflowController(Node):
             if not result.success:
                 raise RuntimeError(result.message)
             self.route_checkpoint_file = json.loads(result.message)['snapshot_file']
+            if self.standard_output:
+                from .standard_route import publish_standard
+                saved = publish_standard(self.route_checkpoint_file, self.standard_output, self.run_id)
+                self.get_logger().info('标准路线已保存：'+saved['standard_file']+'；版本：'+saved['version_dir'])
         except Exception as error:
             self.fail_workflow('返程路线封存失败：'+str(error))
             return
@@ -841,7 +1037,122 @@ class WorkflowController(Node):
     def on_follow_finished(self, future):
         self.checked_bool(future, "ready")
         if not self.failed:
+            if (self.workflow.get('arm_postures_before_chassis', False)
+                    or self.workflow.get('lock_chassis_between_steps', False)):
+                self.phase = 'follow_finish_mux_pending'
+                self.request_bool(self.mux_enable_client, False, self.on_final_mux_stopped)
+            else:
+                self.complete_step()
+
+    def on_final_mux_stopped(self, future):
+        self.checked_bool(future, 'ready')
+        if not self.failed:
             self.complete_step()
+
+    def on_posture_status(self, message):
+        try:
+            status = json.loads(message.data)
+            if not isinstance(status, dict):
+                return
+            self.posture_status, self.posture_status_time = status, monotonic()
+        except (ValueError, TypeError):
+            pass
+
+    def advance_arm_posture(self, posture, next_phase=None):
+        """请求仅代表排队；匹配本次ID且实际关节到位的DONE才可放行。"""
+        if self.phase in ('ready', 'station_travel'):
+            client = self.posture_clients[posture]
+            if not client.service_is_ready():
+                return
+            self.posture_request_id = None
+            self.phase = 'posture_accept_pending'
+            self.add_callback(client.call_async(Trigger.Request()), self.on_posture_accepted)
+        elif self.phase == 'posture_wait':
+            status = self.posture_status or {}
+            if self.posture_status_time is None or monotonic()-self.posture_status_time > 3.:
+                self.fail_workflow('关节姿态服务状态失联，底盘不放行')
+                return
+            if status.get('request_id') != self.posture_request_id:
+                return
+            if status.get('state') == 'FAILED':
+                self.fail_workflow('关节姿态失败：'+str(status.get('error')))
+            elif status.get('state') == 'DONE' and status.get('posture') == posture:
+                self.arm_control_mode = 'moveit'
+                if next_phase is None:
+                    self.complete_step()
+                else:
+                    self.phase = next_phase
+
+    def on_posture_accepted(self, future):
+        try:
+            result = future.result()
+            if not result.success:
+                raise RuntimeError(result.message)
+            self.posture_request_id = json.loads(result.message)['request_id']
+            if not self.posture_request_id:
+                raise ValueError('空request_id')
+            self.phase = 'posture_wait'
+        except Exception as error:
+            self.fail_workflow('关节姿态请求失败：'+str(error))
+
+    def on_station_resume(self, message):
+        del message
+        if self.active and self.station_context is not None:
+            self.station_resume_requested = True
+
+    def begin_station(self, step):
+        """仅关闭底盘输出，不关闭循迹节点，前进路线/里程计记录保持连续。"""
+        if not self.mux_enable_client.service_is_ready():
+            self.fail_workflow('站点无法关闭底盘速度输出')
+            return
+        self.phase = 'station_mux_stop_pending'
+        self.request_bool(self.mux_enable_client, False, lambda future: self.on_station_stopped(future, step))
+
+    def on_station_stopped(self, future, step):
+        self.checked_bool(future, 'ready')
+        if self.failed:
+            return
+        self.station_context = {'step': deepcopy(step), 'tracking_seconds': self.follow_tracking_seconds}
+        self.station_resume_requested = False
+        self.station_rearmed = False
+        station = deepcopy(self.workflow['station_steps'])
+        self.steps[self.step_index:self.step_index+1] = station+[{'action': 'continue_line_follow'}]
+        self.step_started = monotonic()
+        self.get_logger().info('途中站：底盘输出已锁定，执行本站机械臂动作，完成后等待开始消息')
+
+    def advance_station_continue(self):
+        if self.station_context is None:
+            self.fail_workflow('途中站上下文丢失')
+            return
+        if self.phase == 'ready':
+            self.phase = 'station_wait_start'
+            self.get_logger().info('本站动作完成，停在中转姿态；等待下一次开始消息')
+        if self.phase == 'station_wait_start':
+            self.step_started = monotonic()  # 人工等待没有运动，不消耗动作超时。
+            if not self.station_resume_requested:
+                return
+            self.phase = 'station_travel'
+        if self.phase in ('station_travel', 'posture_accept_pending', 'posture_wait'):
+            self.advance_arm_posture('travel', next_phase='station_resume_mux')
+        elif self.phase == 'station_resume_mux':
+            self.phase = 'station_resume_mux_pending'
+            self.request_bool(self.mux_enable_client, True, self.on_station_released)
+
+    def on_station_released(self, future):
+        self.checked_bool(future, 'follow_tracking')
+        if self.failed:
+            return
+        context = self.station_context
+        self.steps[self.step_index] = context['step']
+        self.follow_tracking_seconds = context['tracking_seconds']
+        self.follow_status, self.follow_status_time = None, None
+        self.follow_last_tick = self.follow_last_tracking = monotonic()
+        self.follow_boundary_since = self.follow_station_confirm_since = None
+        self.step_started = monotonic()
+        self.station_context = None
+        self.station_resume_requested = False
+        self.follow_resume_publisher.publish(Empty())
+        self.get_logger().info('行驶关节姿态已实际到位，继续循迹；路线记录沿用，不重新启停驱动')
 
     def on_compliant_wrench(self, message):
         del message
@@ -890,8 +1201,57 @@ class WorkflowController(Node):
             self.get_logger().info(f"Chassis task '{expected_task}' completed")
             self.complete_step()
 
+    def prepare_step_camera(self, action):
+        """底盘驱动常驻；关节/等待阶段暂停USB采集，循迹前恢复并等待新视觉数据。"""
+        if not self.manage_line_stream or action not in ('line_follow', 'arm_posture', 'delay'):
+            return True
+        desired = action == 'line_follow'
+        now = monotonic()
+        if self.line_stream_wait is not None:
+            goal, future, deadline = self.line_stream_wait
+            if not future.done():
+                if now > deadline:
+                    self.fail_workflow('USB相机启停服务响应超时，底盘保持停车')
+                return False
+            self.line_stream_wait = None
+            try:
+                if not future.result().success:
+                    raise RuntimeError(future.result().message)
+            except Exception as error:
+                self.fail_workflow('USB相机启停失败：'+str(error))
+                return False
+            self.line_streaming = goal
+            self.get_logger().info('按需恢复循迹相机，等待新视觉反馈' if goal else '按需暂停循迹相机，保留底盘/机械臂驱动及里程计')
+            self.line_warmup_deadline = now+15. if goal else None
+            self.line_warmup_future = None
+        if self.line_streaming != desired:
+            if not self.line_stream_client.service_is_ready():
+                self.fail_workflow('缺少循迹相机streaming服务，不能切换任务')
+                return False
+            request = SetBool.Request()
+            request.data = desired
+            self.line_stream_wait = (desired, self.line_stream_client.call_async(request), now+5.)
+            return False
+        if desired and self.line_warmup_deadline is not None:
+            if now > self.line_warmup_deadline:
+                self.fail_workflow('循迹相机恢复后15秒仍无有效新反馈，底盘保持停车')
+                return False
+            if self.line_warmup_future is not None and self.line_warmup_future.done():
+                try:
+                    ready = self.line_warmup_future.result().success
+                except Exception:
+                    ready = False
+                self.line_warmup_future = None
+                if ready:
+                    self.line_warmup_deadline = None
+                    return True
+            if self.line_warmup_future is None and self.follow_ready_client.service_is_ready():
+                self.line_warmup_future = self.follow_ready_client.call_async(Trigger.Request())
+            return False
+        return True
+
     def advance(self):
-        if not self.active or self.failed:
+        if self.safety_inhibited or not self.active or self.failed:
             return
         if self.capture_only:
             # 独立拍照不启用底盘选择器、导纳或机器人动作，也不要求运动驱动在线。
@@ -929,6 +1289,8 @@ class WorkflowController(Node):
                 f"step {self.step_index} timed out in phase {self.phase}"
             )
             return
+        if not self.prepare_step_camera(action):
+            return
         if not self.mux_run_ready:
             if self.phase == "ready" and self.mux_enable_client.service_is_ready():
                 if not self.mux_mode_client.service_is_ready():
@@ -943,7 +1305,11 @@ class WorkflowController(Node):
                 self.phase = "mux_enable_pending"
                 self.request_bool(self.mux_enable_client, True, self.on_mux_run_ready)
             return
-        if action == "final_capture":
+        if action == 'arm_posture':
+            self.advance_arm_posture(step['posture'])
+        elif action == 'continue_line_follow':
+            self.advance_station_continue()
+        elif action == "final_capture":
             self.advance_final_capture(step)
         elif action == 'save_line_route':
             if self.phase == 'ready' and self.route_checkpoint_client.service_is_ready():
@@ -1005,7 +1371,7 @@ class WorkflowController(Node):
         if self.phase == 'ready':
             self.stationary_since = None
             self.phase = 'waiting_stationary'
-            self.get_logger().info('等待底盘轮速反馈连续停稳后开始机械臂任务')
+            self.get_logger().info('等待底盘轮速反馈连续停稳后继续任务')
         timeout = float(step.get('data_timeout_sec', 0.5))
         if (self.wheel_odom is None or self.wheel_odom_received is None or
                 self.wheel_odom_received < self.step_started or now - self.wheel_odom_received > timeout):
@@ -1025,7 +1391,7 @@ class WorkflowController(Node):
         if self.stationary_since is None:
             self.stationary_since = now
         if now - self.stationary_since >= float(step.get('stable_seconds', 1.0)):
-            self.get_logger().info('底盘轮速反馈已连续停稳，继续机械臂任务')
+            self.get_logger().info('底盘轮速反馈已连续停稳，继续后续步骤')
             self.complete_step()
 
     def reset_device_checks(self):
@@ -1059,8 +1425,11 @@ class WorkflowController(Node):
         if self.check_arm_devices:
             if not self.arm_ready():
                 missing.append("robot external control/controllers")
-            if not self.admittance_enable_client.service_is_ready():
+            if self.manage_admittance and not self.joint_posture_only and not self.admittance_enable_client.service_is_ready():
                 missing.append("arm control mode service")
+            if self.check_posture_devices and not all(
+                    client.service_is_ready() for client in self.posture_clients.values()):
+                missing.append('arm joint posture services')
             # 只有实际包含导纳动作的流程依赖零偏完成后的力反馈。
             # 普通 MoveIt 点位规划仍保留外控、控制器、TF 和执行接口检查。
             if self.check_admittance_devices:
@@ -1135,6 +1504,16 @@ class WorkflowController(Node):
 
     def advance_chassis_control(self, step, action, now_ns):
         del now_ns
+        if (action == 'chassis_execute' and self.phase == 'ready'
+                and self.workflow.get('arm_postures_before_chassis', False)):
+            if not self.mux_enable_client.service_is_ready():
+                return
+            self.phase = 'chassis_output_pending'
+            self.request_bool(self.mux_enable_client, True,
+                              lambda result: self.checked_bool(result, 'chassis_output_ready'))
+            return
+        if self.phase == 'chassis_output_ready':
+            self.phase = 'ready'
         if self.phase != "ready" or not self.control_client.service_is_ready():
             return
         if any(
@@ -1246,6 +1625,12 @@ class WorkflowController(Node):
                 )
                 return None
 
+        recovered_target = self.recovery_arm_target
+        if recovered_target is not None:
+            step = deepcopy(step)
+            saved = recovered_target.poses[0]
+            step['target_pose']['position'] = [saved.position.x, saved.position.y, saved.position.z]
+            step['target_pose']['position_mode'] = 'absolute'
         x, y, z = map(float, step["target_pose"]["position"])
         if step["target_pose"].get("position_mode", "absolute") == "relative":
             # 偏移在 frame_id 中表达，并且每一步只在起始时解析一次。
@@ -1282,6 +1667,8 @@ class WorkflowController(Node):
             pose.orientation.y = cr * sp * cy + sr * cp * sy
             pose.orientation.z = cr * cp * sy - sr * sp * cy
             pose.orientation.w = cr * cp * cy + sr * sp * sy
+        if recovered_target is not None:
+            pose.orientation = deepcopy(recovered_target.poses[0].orientation)
         target.poses.append(pose)
         self.get_logger().info(
             f"Arm target in {base_frame}: current=[{translation.x:.3f}, "
@@ -1343,7 +1730,7 @@ class WorkflowController(Node):
         if self.phase == "ready":
             if not self.arm_ready():
                 return
-            if not self.admittance_enable_client.service_is_ready():
+            if self.manage_admittance and not self.admittance_enable_client.service_is_ready():
                 return
             if mode == "admittance":
                 if self.compliant_target_publisher.get_subscription_count() == 0:
@@ -1378,10 +1765,13 @@ class WorkflowController(Node):
                     return
                 self.pending_arm_skip = self.arm_target_reached(actual, target.poses[0], step)
             self.phase = "arm_mode_pending"
-            request = SetBool.Request()
-            request.data = mode == "admittance"
-            future = self.admittance_enable_client.call_async(request)
-            self.add_callback(future, self.on_arm_mode_response)
+            if self.manage_admittance:
+                request = SetBool.Request()
+                request.data = mode == "admittance"
+                future = self.admittance_enable_client.call_async(request)
+                self.add_callback(future, self.on_arm_mode_response)
+            else:
+                self.arm_mode_ready()
         elif self.phase == "arm_delivery" and now_ns >= self.deadline_ns:
             self.phase = "arm_pending"
             future = self.execute_client.call_async(Trigger.Request())
@@ -1421,6 +1811,10 @@ class WorkflowController(Node):
         if not response.success:
             self.fail_workflow(f"arm control mode rejected: {response.message}")
             return
+        self.arm_mode_ready()
+
+    def arm_mode_ready(self):
+        """模式已确认后投递目标；纯MoveIt任务不需要导纳开关服务。"""
         mode = self.current_step()["control_mode"]
         self.arm_control_mode = mode
         if mode == 'moveit' and self.pending_arm_skip:
@@ -1541,6 +1935,12 @@ class WorkflowController(Node):
             self.fail_workflow(f"Robot motion failed: {response.message}")
 
     def complete_step(self):
+        self.recovery_arm_target = None
+        if self.recovery_hold_step is not None:
+            self.recovery_hold_step = None
+            self.active = False
+            self.phase = "recovered_compliant_hold"
+            return
         if self.capture_only:
             self.active = False
             self.phase = "capture_complete"
@@ -1552,6 +1952,9 @@ class WorkflowController(Node):
 
     def fail_workflow(self, message):
         self.stop_capture_process()
+        if (self.workflow.get('arm_postures_before_chassis', False)
+                and self.posture_cancel_client.service_is_ready()):
+            self.posture_cancel_client.call_async(Trigger.Request())
         self.last_failure = str(message)
         self.generation += 1
         if self.capture_only:

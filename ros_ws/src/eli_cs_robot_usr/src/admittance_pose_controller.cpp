@@ -11,6 +11,8 @@
 //
 // 这个节点只在独立的 Gazebo 导纳仿真中使用位置控制器，不修改真机控制器。
 
+#include <std_msgs/msg/bool.hpp>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -257,6 +259,7 @@ public:
     tracking_pose_subscription_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "~/tracking_target_pose", rclcpp::QoS(1).reliable(),
       [this](const geometry_msgs::msg::PoseStamped::ConstSharedPtr message) {
+        if (safety_inhibited_) { return; }
         const double age = (now() - rclcpp::Time(message->header.stamp)).seconds();
         if (message->header.frame_id != base_frame_ || !finite_pose(message->pose) ||
           age < -0.1 || age > 0.3)
@@ -278,12 +281,30 @@ public:
       "~/target_poses", rclcpp::QoS(10).reliable(),
       std::bind(&AdmittancePoseController::poses_callback, this, std::placeholders::_1));
 
+    safety_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/robot_control/safety_inhibit", rclcpp::QoS(1).reliable().transient_local(),
+      [this](const std_msgs::msg::Bool::SharedPtr message) {
+        safety_inhibited_ = message->data;
+        if (safety_inhibited_) {
+          enabled_ = false;
+          reset_admittance_state();
+          std::lock_guard<std::mutex> lock(data_mutex_);
+          targets_.clear();
+          RCLCPP_ERROR(get_logger(), "Safety pause: admittance disabled and old targets cleared");
+        }
+      });
+
     enable_service_ = create_service<std_srvs::srv::SetBool>(
       "~/enable",
       [this](
         const std_srvs::srv::SetBool::Request::SharedPtr request,
         std_srvs::srv::SetBool::Response::SharedPtr response)
       {
+        if (request->data && safety_inhibited_) {
+          response->success = false;
+          response->message = "Safety recovery is latched";
+          return;
+        }
         enabled_ = request->data;
         // 每次开关都清空柔顺偏移。新目标不会继承上一个目标受到的外力让位。
         reset_admittance_state();
@@ -308,6 +329,11 @@ public:
         const std_srvs::srv::Trigger::Request::SharedPtr,
         std_srvs::srv::Trigger::Response::SharedPtr response)
       {
+        if (safety_inhibited_) {
+          response->success = false;
+          response->message = "Safety recovery is latched";
+          return;
+        }
         try {
           const auto current = tf_buffer_.lookupTransform(
             base_frame_, end_effector_frame_, tf2::TimePointZero);
@@ -524,6 +550,7 @@ private:
 
   void set_targets(std::vector<geometry_msgs::msg::Pose> targets)
   {
+    if (safety_inhibited_) { return; }
     // 分段控制进入柔顺阶段时，MoveIt 已经把末端带到接近点，并完成了目标
     // 姿态。此处锁存真实 TCP 姿态作为柔顺阶段的固定姿态，只允许 XYZ 随力
     // 改变。这样即使输入目标四元数与仿真当前 TF 存在约 90 度的表示差异，
@@ -760,7 +787,7 @@ private:
 
   void control_step()
   {
-    if (!enabled_ || !robot_model_) {
+    if (safety_inhibited_ || !enabled_ || !robot_model_) {
       return;
     }
 
@@ -1310,6 +1337,8 @@ private:
   bool streaming_target_{false};
   rclcpp::Time last_tracking_target_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr tracking_pose_subscription_;
+  bool safety_inhibited_{false};
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr safety_subscription_;
   bool enabled_{true};
   bool log_force_direction_{false};
   tf2_ros::Buffer tf_buffer_;

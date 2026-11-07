@@ -128,6 +128,9 @@ def launch_setup(context, *args, **kwargs):
             "use_fake_hardware:=",
             use_fake_hardware,
             " ",
+            "initial_positions_file:=",
+            LaunchConfiguration("initial_positions_file"),
+            " ",
             "fake_sensor_commands:=",
             fake_sensor_commands,
             " ",
@@ -265,82 +268,59 @@ def launch_setup(context, *args, **kwargs):
         arguments=["-d", rviz_config_file],
     )
 
-    # Spawn controllers
-    def controller_spawner(name, active=True):
-        inactive_flags = ["--inactive"] if not active else []
-        return Node(
-            package="controller_manager",
-            executable="spawner",
-            arguments=[
-                name,
-                "--controller-manager",
-                "/controller_manager",
-                "--controller-manager-timeout",
-                controller_spawner_timeout,
-                "--param-file",
-                controller_parameters_path,
-            ]
-            + inactive_flags,
-        )
-
-    controller_spawner_names = [
-        "joint_state_broadcaster",
-        "io_and_status_controller",
-        "speed_scaling_state_broadcaster",
-        "force_torque_sensor_broadcaster",
+    # 同一spawner批量加载，避免8个Python进程竞争ROS的全局文件锁。
+    active_names = [
+        "joint_state_broadcaster", "io_and_status_controller",
+        "speed_scaling_state_broadcaster", "force_torque_sensor_broadcaster",
         "tcp_pose_broadcaster",
     ]
-    controller_spawner_inactive_names = ["forward_position_controller", "freedrive_controller"]
+    inactive_names = ["forward_position_controller", "freedrive_controller"]
+    initial_name = initial_joint_controller.perform(context)
+    activate_initial = activate_joint_controller.perform(context).lower() in ('true', '1')
+    # 初始控制器可能由调用者覆盖为forward_position_controller，不能重复加载或错误激活。
+    active_names = [name for name in active_names if name != initial_name]
+    inactive_names = [name for name in inactive_names if name != initial_name]
+    (active_names if activate_initial else inactive_names).append(initial_name)
 
-    controller_spawners = [controller_spawner(name) for name in controller_spawner_names] + [
-        controller_spawner(name, active=False) for name in controller_spawner_inactive_names
-    ]
-    
-    
+    def controller_batch(names, active):
+        return Node(
+            package="controller_manager", executable="spawner", output="screen",
+            arguments=names + ["--controller-manager", "/controller_manager",
+                "--controller-manager-timeout", controller_spawner_timeout.perform(context),
+                "--param-file", controller_parameters_path] + ([] if active else ["--inactive"]),
+        )
 
-      
-    # There may be other controllers of the joints, but this is the initially-started one
-    initial_joint_controller_spawner_started = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=[
-            initial_joint_controller,
-            "-c",
-            "/controller_manager",
-            "--controller-manager-timeout",
-            controller_spawner_timeout,
-            "--param-file",
-            controller_parameters_path,
-        ],
-        condition=IfCondition(activate_joint_controller),
-    )
-    initial_joint_controller_spawner_stopped = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=[
-            initial_joint_controller,
-            "-c",
-            "/controller_manager",
-            "--controller-manager-timeout",
-            controller_spawner_timeout,
-            "--param-file",
-            controller_parameters_path,
-            "--inactive",
-        ],
-        condition=UnlessCondition(activate_joint_controller),
-    )
-    
+    active_spawner = controller_batch(active_names, True)
+    inactive_spawner = controller_batch(inactive_names, False)
+
+    def active_controllers_loaded(event, launch_context):
+        if launch_context.is_shutdown:
+            return []
+        if event.returncode != 0:
+            return [EmitEvent(event=Shutdown(reason="Active controller batch failed"))]
+        return [inactive_spawner]
+
+    def inactive_controllers_loaded(event, launch_context):
+        if launch_context.is_shutdown or event.returncode == 0:
+            return []
+        return [EmitEvent(event=Shutdown(reason="Inactive controller batch failed"))]
 
     nodes_to_start = [
-        control_node,
-        eli_control_node,
-        # tool_communication_node,
-        controller_stopper_node,
-        robot_state_publisher_node,
-        rviz_node,
-        initial_joint_controller_spawner_stopped,
-        initial_joint_controller_spawner_started,
-    ] + controller_spawners
+        control_node, eli_control_node, controller_stopper_node,
+        robot_state_publisher_node, rviz_node,
+        RegisterEventHandler(OnProcessExit(target_action=active_spawner,
+                                          on_exit=active_controllers_loaded)),
+        RegisterEventHandler(OnProcessExit(target_action=inactive_spawner,
+                                          on_exit=inactive_controllers_loaded)),
+        active_spawner,
+    ]
+
+    if use_fake_hardware.perform(context).lower() != 'true':
+        nodes_to_start.append(Node(
+            package='eli_cs_robot_driver', executable='protective_stop_guard.py',
+            name='protective_stop_guard', output='screen',
+            parameters=[{'recovery_force_limit_n': ParameterValue(
+                LaunchConfiguration('recovery_force_limit_n'), value_type=float)}]))
 
     auto_power = LaunchConfiguration('auto_power_on').perform(context).lower() == 'true'
     fake_hardware = use_fake_hardware.perform(context).lower() == 'true'
@@ -374,6 +354,8 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     declared_arguments = []
     declared_arguments.extend([
+        DeclareLaunchArgument('recovery_force_limit_n', default_value='5.0',
+                             description='Maximum unbiased force norm allowed before confirmed recovery, in N'),
         DeclareLaunchArgument('auto_power_on', default_value='true', choices=['true', 'false'],
                              description='Automatically power on and release brakes before real robot controllers start'),
         DeclareLaunchArgument('power_on_timeout', default_value='240.0',
@@ -511,6 +493,8 @@ def generate_launch_description():
             description="Activate loaded joint controller.",
         )
     )
+    declared_arguments.append(DeclareLaunchArgument("initial_positions_file", default_value=PathJoinSubstitution([
+        FindPackageShare("eli_cs_robot_description"), "config", "initial_positions.yaml"])))
     declared_arguments.append(
         DeclareLaunchArgument("launch_rviz", default_value="true", description="Launch RViz?")
     )

@@ -589,3 +589,50 @@ ros2 topic pub --once /line_follow/resume std_msgs/msg/Empty '{}'
 `/line_follow/status` 的 `station_counts` 提供 `encountered/ignored/arrived/resumed/passed/uncertain`；`stop_marker.station_history` 保留每根横线的动作，`current_station_number` 和 `ignored_station_number` 标明当前目标和离站旧线。`/line_follow/station_events` 为事件流（`std_msgs/String`，JSON），晚订阅者可从状态查看本轮历史。
 
 本轮事件和计数异步原子保存到 `~/.ros/line_follow/last_station_log.json`，可通过只读启动参数 `station_log_file` 修改。前进路线 `last_route.json` 还会保存 `station_events`；下一次倒车可打印前进已记录站点的逆序供核对，实际倒车仍独立编号，不凭期望总数伪造站点或停车。旧路线无事件时明确报告“不能推断总横线数”。事件中的 `odom_pose_at_receipt` 是接收时车体里程计位置，用于追踪，不是标定后的横线世界坐标。账本表示已观测站点，不保证是场地全部横线的完整地图。
+
+## 倒车充电模式
+
+复用现有入口，默认关闭：
+
+```bash
+ros2 launch robot_task_control line_follow_only.launch.py \
+  drive_direction:=reverse charging_mode:=true line_show_window:=true
+```
+
+需要已保存的同一路线前进记录（默认`~/.ros/line_follow/last_route.json`），不是任意起点的未知路线倒车。前进记录与普通倒车入口不变。`charging_mode:=false`仍使用原来的横线终停规则。
+
+流程：先按记录路线返程，在剩余约60cm、近端视觉连续3帧可信且剩余路线为直线/缓弯时进入末段。使用画面上方靠车头的局部主线，先单独摆正，再单独横移回中；每次切换等待新帧与停稳，确认回中后只发直线倒车指令。方向目标3°；有实测地面映射时回中目标1.5cm，无映射时为半图宽的0.04（640宽约13像素），不能把像素比例当成厘米。末段未看到横线时不高于0.02m/s，看到横线或到达横线后不高于0.008m/s。
+
+横线仅表示已接近充电位，仍沿线直退搜索充电信号，不再把到横线等同充电成功。横线平均位置明显越过目标时允许低速前挪，累计不超过5cm，换向前先停稳。前置相机只能观测当前可见胶带，剩余记录路线和原起点围栏仍有效。
+
+充电信号来自现有`/masc_chassis/chassis_status`：循迹任务默认`charging_status_layout:=byte_flags`，使用本机已实测的SDK手动/桩充电标志；另一版32位协议才选择`charging_status_layout:=bitfield32`，取原始状态码bit3。独立TCP桥的布局也应与实际SDK一致。充电首帧立即发零速，连续3个不同源时间戳的新反馈确认后报告`reverse_route_complete`，`completion_source=charging_signal`。首次充电信号后也保持停车等待确认，抖动持续2秒不能确认则锁停报错；完成保持锁停，信号抖动不会重新发车；只有横线到位位置附近10cm内、或记录起点10cm内才报告成功；其他位置出现充电位也会停车，但报告位置异常而非完成。
+
+保护：横线到位后实际累计搜索行程最多10cm，同时保留记录起点外最多10cm围栏；距剩余路线的里程计横向偏离最多10cm。有地面映射时视觉横向偏离也限制10cm，无映射用半图宽0.35做独立图像保护。超过35°朝向误差、输入失效、末段总用时超过90秒、横线后30秒仍没充电，均停止并报错，不绕开围栏继续找桩。10cm是基于里程计/已标定视觉的相对测量限度，不承诺未标定情况下的绝对定位精度。额外搜索距离可在`line_follow.yaml`的`charging_search_distance`调小（范围0.01～0.10米）。
+
+查看：
+
+```bash
+ros2 topic echo /line_follow/status
+```
+
+`charging_dock`内含对齐阶段、横线后累计行程、限度及故障；`charging_signal`为true/false/null。常见故障：`charging_dock_search_limit`（横线后搜索超限）、`charging_dock_alignment_out_of_range`（视觉偏离过大）、`charging_dock_status_unavailable`（充电反馈过期/未知）、`charging_dock_charge_not_detected`（横线后等待超时）、`reverse_finish_deviation`（里程计偏离围栏）。报错后不自动重试，先检查实机位置、坐标方向和充电位定义，再重新启动任务。
+
+正式测试先确认充电标志，再以空载/足够空间观察：未摆正不纵向后退；回中后直退；横线附近缓慢搜索；充电首帧停车并确认；没有充电时不能靠超距继续。开发测试仅使用隔离ROS域上的模拟状态与速度话题，不驱动实车。
+
+## 充电桩前进离站
+
+前进启动时允许从桩充电状态离站，不需要手动禁用充电检查；手动充电线仍禁止运动。
+任务的设备检查只确认离桩条件，不使能或发运动指令。机械臂完成行驶姿态后，任务才使能循迹。
+离桩沿相机识别到的轨迹前进，初始横线仍按原有出发线规则忽略；不会因充电状态跳过后续站点。
+`dock_departure_speed=0.02` m/s 为离桩速度上限，连续三帧新CAN反馈不再充电后恢复正常循迹。
+累计实际里程超过 `dock_departure_max_distance=0.30` m，或使能后超过
+`dock_departure_timeout=25.0` s 仍未脱离充电，锁停并报告
+`dock_departure_distance_exceeded` / `dock_departure_timeout`。
+急停、故障、障碍、倾斜、相机/里程计/底盘反馈失效仍然停车；倒车不会豁免充电停车。
+参数在 `config/line_follow.yaml` 中调整，`dock_departure_enabled=false` 可关闭离桩豁免。
+状态话题中的 `dock_departure` 提供状态和累计里程。
+
+本机实测桩充电由SDK的 `dock_charging` 字段反馈，所以循迹/联合充电任务默认
+`charging_status_layout=byte_flags`；仅另一版32位协议使用 `bitfield32`。
+
+当前底盘阶段划分、Nav2参考和直接launch实车测试流程见[底盘循迹逻辑](../../docs/tasks/CHASSIS_NAVIGATION_LOGIC.md)。

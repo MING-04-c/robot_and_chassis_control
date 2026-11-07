@@ -65,6 +65,6 @@ cs_manipulator:
     - TRRTkConfigDefault
     - PRMkConfigDefault
     - PRMstarkConfigDefault
-  ##Note: commenting the following line lets moveit chose RRTConnect as default planner rather than LBKPIECE
-  #projection_evaluator: joints(shoulder_pan_joint,shoulder_lift_joint)
+  # 为可选的姿态路径约束提供投影；普通点到点规划不强制约束状态空间。
+  projection_evaluator: joints(shoulder_pan_joint,shoulder_lift_joint)
   longest_valid_segment_fraction: 0.01

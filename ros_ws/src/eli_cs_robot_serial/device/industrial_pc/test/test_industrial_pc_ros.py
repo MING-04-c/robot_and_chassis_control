@@ -15,7 +15,8 @@ os.environ['ROS_DOMAIN_ID'] = '186'
 os.environ['ROS_AUTOMATIC_DISCOVERY_RANGE'] = 'LOCALHOST'
 os.environ['ROS_LOG_DIR'] = '/tmp/industrial-pc-ros-test'
 DEVICE = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(DEVICE/'src'), str(DEVICE/'host_tools')]
+sys.path[:0] = [str(DEVICE/'src'), str(DEVICE/'host_tools'),
+               str(DEVICE.parents[2]/'geminipro_camer_calibration/scripts')]
 
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -28,6 +29,265 @@ from robot_tcp_common import request, status
 
 
 class IndustrialPCTest(unittest.TestCase):
+    def test_tcp_remains_available_with_status_monitor_disabled(self):
+        """本机回环与隔离ROS域；任务服务为替身，不加载任何运动驱动。"""
+        with tempfile.TemporaryDirectory() as directory:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0))
+                port = probe.getsockname()[1]
+            rclpy.init(args=['--ros-args', '-p', 'bind_host:=127.0.0.1', '-p', 'port:='+str(port),
+                            '-p', 'enable_status_monitor:=false', '-p', 'output_dir:='+directory])
+            with patch('industrial_pc_node.RuntimeMonitor', side_effect=AssertionError('监视器不应启动')):
+                bridge = IndustrialPC()
+            fake = Node('tcp_only_test_services')
+            calls = []
+            def handler(name):
+                def call(request, response):
+                    calls.append(name)
+                    response.success, response.message = True, 'test-only service'
+                    return response
+                return call
+            for name in ('start', 'stop'):
+                fake.create_service(Trigger, '/task_controller/'+name, handler(name))
+            executor = SingleThreadedExecutor()
+            executor.add_node(bridge)
+            executor.add_node(fake)
+            thread = threading.Thread(target=executor.spin, daemon=True)
+            thread.start()
+            config = dict(robot_host='127.0.0.1', control_port=port, timeout=5., use_shared_key=False)
+            try:
+                self.assertIsNone(bridge.monitor)
+                topics = {sub.topic_name for sub in bridge.subscriptions}
+                self.assertNotIn('/rosout', topics)
+                self.assertNotIn('/protective_stop_guard/status', topics)
+                self.assertNotIn('/arm_joint_postures/status', topics)
+                self.assertFalse(any(timer.timer_period_ns == 500_000_000 for timer in bridge.timers))
+                bridge.cache_status('task', String(data=json.dumps(dict(active=False, phase='ready'))))
+                packet = status(config)
+                self.assertTrue(packet['ok'])
+                self.assertFalse(packet['robot_status']['status_monitor_enabled'])
+                self.assertIsNone(packet['robot_status']['normal_status'])
+                self.assertEqual(packet['robot_status']['task']['data']['phase'], 'ready')
+                for channel in ('normal', 'abnormal'):
+                    packet = request(config, dict(schema='paint_robot_status_request_v1',
+                                     message_id='disabled-'+channel, channel=channel))
+                    self.assertFalse(packet['ok'])
+                    self.assertFalse(packet['status_monitor_enabled'])
+                deadline = time.monotonic()+3.
+                while not bridge.start_task.service_is_ready() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                for name in ('start', 'stop'):
+                    packet = request(config, dict(schema='paint_robot_task_request_v1',
+                                     message_id='tcp-only-'+name, action=name))
+                    self.assertTrue(packet['ok'], packet)
+                self.assertEqual(calls, ['start', 'stop'])
+            finally:
+                executor.shutdown()
+                thread.join(timeout=3)
+                bridge.close()
+                bridge.destroy_node()
+                fake.destroy_node()
+                rclpy.shutdown()
+
+    def test_monitor_codes_unknown_state_dedup_and_explicit_recovery(self):
+        from runtime_monitor import RuntimeMonitor
+        monitor = RuntimeMonitor()
+        normal, abnormal = monitor.snapshot(now=0.)
+        self.assertEqual(normal['state'], 'unknown')
+        self.assertFalse(normal['healthy'])
+        task = dict(active=True, phase='follow_tracking', action='line_follow', run_id='r1')
+        monitor.receive('task', task, now=1.)
+        monitor.receive('line_follow', dict(state='reverse_visual_finish_tracking'), now=1.)
+        normal, abnormal = monitor.snapshot(now=1.)
+        self.assertTrue(normal['healthy'])
+        monitor.receive('task', dict(task, failed=True, failure_reason='test failed'), now=2.)
+        monitor.receive('line_follow', dict(state='charging_dock_search_limit'), now=2.)
+        monitor.receive('arm', dict(state='FAILED', error='planning failed', native_error_code=-1), now=2.)
+        monitor.receive('safety', dict(latched=True, safety_mode=3, detail='protective stop'), now=2.)
+        monitor.receive('chassis', dict(fault=0x100), now=2.)
+        monitor.receive('comm', dict(state=4, fail_reason=0), now=2.)
+        normal, abnormal = monitor.snapshot(now=2.)
+        codes = {item['error_code'] for item in abnormal['active_faults']}
+        self.assertTrue({'E1001', 'E2001', 'E2101', 'E3101', 'E4001'} <= codes)
+        self.assertEqual(next(e for e in abnormal['active_faults'] if e['error_code'] == 'E2101')['native_error_code'], -1)
+        count = len(abnormal['events'])
+        self.assertEqual(len(monitor.snapshot(now=2.1)[1]['events']), count, '相同故障重复刷事件')
+        normal, abnormal = monitor.snapshot(now=8.)
+        codes = {item['error_code'] for item in abnormal['active_faults']}
+        self.assertTrue({'E1002', 'E2001', 'E4001', 'E4003'} <= codes, '失联不能抹掉已知故障')
+        monitor.receive('task', dict(active=False, phase='ready', step_index=10, step_count=10), now=9.)
+        monitor.receive('arm', dict(state='DONE'), now=9.)
+        monitor.receive('safety', dict(latched=False, safety_mode=1), now=9.)
+        monitor.receive('chassis', dict(fault=0), now=9.)
+        monitor.receive('comm', dict(state=4, fail_reason=0), now=9.)
+        normal, abnormal = monitor.snapshot(now=9.)
+        self.assertEqual(normal['state'], 'completed')
+        self.assertFalse(abnormal['has_fault'])
+        self.assertTrue(any(event['event'] == 'cleared' for event in abnormal['events']))
+        monitor.receive('task', dict(active=False, failed=True, failure_reason='stopped by user'), now=9.1)
+        self.assertEqual(monitor.snapshot(now=9.1)[0]['state'], 'stopped')
+        self.assertFalse(monitor.snapshot(now=9.1)[1]['has_fault'])
+        for i in range(150):
+            monitor.log_error('driver', 'error '+str(i)+'x'*2000, 40, now=float(i))
+        _, abnormal = monitor.snapshot(now=150.)
+        self.assertLessEqual(len(abnormal['events']), 50)
+        self.assertLess(len(json.dumps(abnormal).encode()), 200000)
+
+    def test_tcp_monitor_sends_normal_and_abnormal_separately_without_motion(self):
+        from monitor_status import read_channel, run
+        from std_msgs.msg import Bool
+        from rcl_interfaces.msg import Log
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0))
+                port = probe.getsockname()[1]
+            rclpy.init(args=['--ros-args', '-p', 'bind_host:=127.0.0.1', '-p', 'port:='+str(port),
+                            '-p', 'use_shared_key:=false', '-p', 'output_dir:='+str(root/'bridge')])
+            node, fake = IndustrialPC(), Node('monitor_test_publisher')
+            executor = SingleThreadedExecutor()
+            executor.add_node(node)
+            executor.add_node(fake)
+            pub = fake.create_publisher(String, '/task_controller/status',
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            arm_pub = fake.create_publisher(String, '/arm_joint_postures/status',
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            log_pub = fake.create_publisher(Log, '/rosout', 10)
+            failed = [False]
+            def publish():
+                pub.publish(String(data=json.dumps(dict(workflow='test', active=True, phase='waiting_delay',
+                    action='delay', step_index=4, step_count=10, wait_seconds_remaining=5.,
+                    failed=failed[0], failure_reason='test failure' if failed[0] else ''))))
+                if failed[0]:
+                    arm_pub.publish(String(data=json.dumps(dict(state='FAILED', error='IK failed', native_error_code=-31))))
+                    log_pub.publish(Log(level=Log.ERROR, name='simulated_driver', msg='simulated native error',
+                                        file='driver.cpp', function='read', line=123))
+            fake.create_timer(.05, publish)
+            thread = threading.Thread(target=executor.spin, daemon=True)
+            thread.start()
+            config = dict(robot_host='127.0.0.1', control_port=port, timeout=5., use_shared_key=False,
+                          key_file='', output_dir=str(root/'host'), status_interval=.1)
+            try:
+                deadline = time.monotonic()+4.
+                while time.monotonic() < deadline:
+                    normal = read_channel(config, 'normal')
+                    if normal.get('workflow') == 'test':
+                        break
+                    time.sleep(.05)
+                self.assertEqual(normal['schema'], 'robot_normal_status_v1')
+                self.assertEqual(normal['state'], 'waiting')
+                abnormal = read_channel(config, 'abnormal')
+                self.assertFalse(abnormal['has_fault'])
+                failed[0] = True
+                deadline = time.monotonic()+4.
+                while time.monotonic() < deadline:
+                    abnormal = read_channel(config, 'abnormal')
+                    codes = {item['error_code'] for item in abnormal['active_faults']}
+                    if {'E1001', 'E2101'} <= codes and abnormal['recent_error_logs']:
+                        break
+                    time.sleep(.05)
+                self.assertEqual(abnormal['active_faults'][0]['error_code'], 'E1001')
+                self.assertEqual(next(f for f in abnormal['active_faults'] if f['error_code'] == 'E2101')['native_error_code'], -31)
+                self.assertEqual(abnormal['recent_error_logs'][0]['source'], 'simulated_driver')
+                self.assertEqual(run(config, once=True), 0)
+                output = root/'host/status'
+                self.assertTrue((output/'normal.json').is_file())
+                self.assertTrue((output/'abnormal.json').is_file())
+                size = (output/'events.jsonl').stat().st_size
+                self.assertEqual(run(config, once=True), 0)
+                self.assertEqual((output/'events.jsonl').stat().st_size, size, '历史事件重复保存')
+                bad = request(config, dict(schema='paint_robot_status_request_v1', message_id='bad-channel', channel='bad'))
+                self.assertFalse(bad['ok'])
+                self.assertFalse(list((root/'bridge/commands').glob('*.json')), '只读查询产生了运动命令记录')
+            finally:
+                executor.shutdown()
+                thread.join(timeout=3)
+                node.close()
+                node.destroy_node()
+                fake.destroy_node()
+                rclpy.shutdown()
+
+    def test_tcp_battery_charging_layout_and_stale_feedback(self):
+        """只发布模拟底盘状态，经真实本机TCP查询；不启动CAN或运动驱动。"""
+        from masc_chassis_msgs.msg import BmsStatus, ChassisStatus, CommStatus
+        with tempfile.TemporaryDirectory() as directory:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0))
+                port = probe.getsockname()[1]
+            rclpy.init(args=['--ros-args', '-p', 'bind_host:=127.0.0.1', '-p', 'port:='+str(port),
+                            '-p', 'use_shared_key:=false', '-p', 'output_dir:='+directory])
+            bridge, mock = IndustrialPC(), Node('mock_chassis_power')
+            executor = SingleThreadedExecutor()
+            executor.add_node(bridge)
+            executor.add_node(mock)
+            values = {'raw': 8, 'soc': 73, 'connected': True, 'old_stamp': False}
+            pubs = {kind: mock.create_publisher(cls, '/masc_chassis/'+topic, 10)
+                    for kind, cls, topic in [('bms', BmsStatus, 'bms_status'),
+                        ('system', ChassisStatus, 'chassis_status'), ('comm', CommStatus, 'comm_status')]}
+            def publish():
+                bms = BmsStatus(bat_soc=values['soc'], bat_voltage=48.2, bat_current=-1.5,
+                                bms_health=BmsStatus.BMS_HEALTH_GOOD)
+                system = ChassisStatus(system_status_flags=values['raw'], manual_charging=True)
+                comm = CommStatus(comm_state=(CommStatus.COMM_STATE_CONNECTED if values['connected']
+                                             else CommStatus.COMM_STATE_DISCONNECTED))
+                for kind, message in [('bms', bms), ('system', system), ('comm', comm)]:
+                    message.header.stamp = mock.get_clock().now().to_msg()
+                    if values['old_stamp'] and kind == 'system':
+                        message.header.stamp.sec -= 5
+                    pubs[kind].publish(message)
+            timer = mock.create_timer(.05, publish)
+            thread = threading.Thread(target=executor.spin, daemon=True)
+            thread.start()
+            config = dict(robot_host='127.0.0.1', control_port=port, timeout=5,
+                          use_shared_key=False, key_file='')
+            def wait_for(predicate):
+                deadline = time.monotonic()+4.
+                last = None
+                while time.monotonic() < deadline:
+                    last = status(config)['robot_status']['chassis_power']
+                    if predicate(last):
+                        return last
+                    time.sleep(.03)
+                self.fail('TCP电量状态未更新：'+str(last))
+            try:
+                power = wait_for(lambda p: p['available'])
+                self.assertEqual(power['battery_percent'], 73)
+                self.assertTrue(power['charging'])
+                self.assertEqual(power['voltage_v'], 48.2)
+                self.assertEqual(power['current_a'], -1.5)
+                values['raw'] = 4
+                power = wait_for(lambda p: p['charging'] is False and p['low_battery'] is True)
+                # driver.manual_charging=True，但截图布局必须仅按整个uint32的bit3。
+                self.assertEqual(power['charging_status_layout'], 'bitfield32')
+                bridge.charging_layout = 'byte_flags'
+                self.assertTrue(wait_for(lambda p: p['charging_status_layout'] == 'byte_flags')['charging'])
+                bridge.charging_layout = 'bitfield32'
+                values['soc'] = 0
+                self.assertEqual(wait_for(lambda p: p['battery_percent'] == 0)['battery_percent'], 0)
+                values['soc'] = 101
+                self.assertIsNone(wait_for(lambda p: p['battery_percent'] is None)['battery_percent'])
+                values.update(soc=73, old_stamp=True)
+                power = wait_for(lambda p: p['battery_percent'] == 73 and p['charging'] is None)
+                self.assertFalse(power['available'])
+                values.update(connected=False, old_stamp=False)
+                power = wait_for(lambda p: not p['connected'])
+                self.assertIsNone(power['battery_percent'])
+                self.assertIsNone(power['charging'])
+                values['connected'] = True
+                wait_for(lambda p: p['available'])
+                timer.cancel()
+                time.sleep(3.1)
+                power = status(config)['robot_status']['chassis_power']
+                self.assertIsNone(power['battery_percent'])
+                self.assertEqual(power['charging_state'], 'unknown')
+            finally:
+                executor.shutdown()
+                thread.join(timeout=3)
+                bridge.close()
+                bridge.destroy_node()
+                mock.destroy_node()
+                rclpy.shutdown()
+
     def test_tcp_detection_points_reach_shared_contact_flow(self):
         """真实TCP与ROS回环；采集、位姿与检测执行器为替身，无硬件或运动驱动。"""
         import numpy as np
@@ -52,6 +312,7 @@ class IndustrialPCTest(unittest.TestCase):
                             '-p', 'report_directory:='+str(root/'reports'),
                             '-p', 'output_dir:='+str(root/'results')])
             starts, targets, began = [], [], [None]
+            captures, home_records = [], []
             def pose(node, frame):
                 value = np.eye(4)
                 if frame == node.camera:
@@ -59,10 +320,12 @@ class IndustrialPCTest(unittest.TestCase):
                 return value
             def captured(command, **kwargs):
                 identity = command[command.index('--run-id')+1]
+                captures.append(identity)
+                digest = ('a' if len(captures) == 1 else 'c')*64
                 images = root/'images'
                 images.mkdir(exist_ok=True)
                 (images/'.capture_index.json').write_text(json.dumps({'sessions': {identity: {
-                    'directory': 'fixture', 'rgbd': {'capture_manifest_sha256': 'a'*64}}}}))
+                    'directory': 'fixture', 'rgbd': {'capture_manifest_sha256': digest}}}}))
                 process = MagicMock()
                 process.poll.return_value = process.returncode = 0
                 return process
@@ -82,18 +345,44 @@ class IndustrialPCTest(unittest.TestCase):
                     began[0] = time.monotonic()
                     return success(req, response)
                 detector.create_service(Trigger, '/detect_controller/clear_targets', success)
-                detector.create_service(Trigger, '/detect_controller/record_home', success)
+                def record_home(req, response):
+                    home_records.append(True)
+                    return success(req, response)
+                detector.create_service(Trigger, '/detect_controller/record_home', record_home)
                 detector.create_service(Trigger, '/detect_controller/start', start)
                 detector.create_service(Trigger, '/detect_controller/cancel', success)
                 detector.create_subscription(PoseArray, '/geminipro_calibration/targets_base', targets.append, 10)
                 publisher = detector.create_publisher(String, '/detect_controller/status', 10)
+                point_publisher = detector.create_publisher(String, '/detect_controller/point_result',
+                    QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+                sent_points = set()
                 def broadcast():
                     elapsed = time.monotonic()-began[0] if began[0] is not None else -1.
                     state = 'IDLE' if elapsed < 0 else ('HOLD' if elapsed < .8 else 'DONE')
-                    completed = (0 if elapsed < .4 else 1) if state == 'HOLD' else (2 if state == 'DONE' else 0)
-                    publisher.publish(String(data=json.dumps({'state': state, 'motion_ready': True,
+                    if len(starts) == 1 and elapsed >= .3:
+                        state = 'RETRY_REQUIRED'
+                    if len(starts) == 1:
+                        completed = 0
+                    else:
+                        completed = (0 if elapsed < .4 else 1) if state == 'HOLD' else (2 if state == 'DONE' else 0)
+                    publisher.publish(String(data=json.dumps({'state': state, 'batch_id': 'mock-batch', 'motion_ready': True,
+                        'returned_home': state in ('DONE', 'RETRY_REQUIRED'),
+                        'retry_context': {'code': 'travel_exhausted', 'message': 'mock extra travel used'} if state == 'RETRY_REQUIRED' else None,
                         'queued_points': len(targets[-1].poses) if targets else 0,
                         'completed_points': completed})))
+                    if state == 'DONE':
+                        for index in (1, 2):
+                            if index in sent_points:
+                                continue
+                            reading = {'schema': 'paint_thickness_measurement_v1', 'value': 100.+index,
+                                       'unit': 'unknown', 'sequence': index,
+                                       'received_at_ros': {'sec': 100, 'nanosec': index}}
+                            point_publisher.publish(String(data=json.dumps({
+                                'schema': 'paint_detection_point_result_v1',
+                                'result_id': 'mock-batch_'+str(index), 'batch_id': 'mock-batch',
+                                'point_index': index, 'success': True, 'returned_home': True,
+                                'measurement': reading})))
+                            sent_points.add(index)
                 detector.create_timer(.05, broadcast)
                 executor = SingleThreadedExecutor()
                 for node in (task, bridge, detector):
@@ -119,17 +408,47 @@ class IndustrialPCTest(unittest.TestCase):
                     self.assertFalse(starts)
                     payload.update(message_id='current-photo', capture_manifest_sha256='a'*64)
                     self.assertTrue(request(client, payload)['ok'])
+                    deadline = time.monotonic()+8.
+                    while (len(captures) < 2 or task.phase != 'WAIT_RESULT') and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertEqual(task.phase, 'WAIT_RESULT', task.detail)
+                    self.assertEqual(task.retry_count, 1)
+                    self.assertEqual(len(home_records), 1, '重拍不能重写本轮初始关节原位')
+                    self.assertNotEqual(captures[0], captures[1])
+                    # 重拍必须拒绝旧哈希，即使使用一个新的网络消息ID。
+                    payload.update(message_id='stale-photo-on-retry')
+                    self.assertTrue(request(client, payload)['ok'])
+                    time.sleep(.2)
+                    self.assertEqual(len(starts), 1)
+                    payload.update(message_id='recaptured-photo', capture_manifest_sha256='c'*64)
+                    self.assertTrue(request(client, payload)['ok'])
                     deadline = time.monotonic()+5.
                     while task.phase not in ('DONE', 'FAULT') and time.monotonic() < deadline:
                         time.sleep(.02)
                     self.assertEqual(task.phase, 'DONE', task.detail)
-                    self.assertEqual(len(starts), 1)
+                    self.assertEqual(len(starts), 2)
+                    self.assertEqual(len(home_records), 1)
+                    deadline = time.monotonic()+3.
+                    while len(bridge.detection_results) < 2 and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    returned = status(client)['robot_status']['detection_results']
+                    self.assertEqual([x['point_id'] for x in returned], ['p1', 'p2'])
+                    self.assertEqual([x['measurement']['value'] for x in returned], [101., 102.])
+                    from listen_robot import RobotListener
+                    listener = RobotListener({'output_dir': str(root/'host'),
+                                              'rgbd_bind': '127.0.0.1', 'rgbd_port': 0})
+                    try:
+                        listener.save_detection_results({'detection_results': returned})
+                        listener.save_detection_results({'detection_results': returned})
+                        self.assertEqual(len(list((root/'host/detection_results').glob('*.json'))), 2)
+                    finally:
+                        listener.server.close()
                     self.assertEqual(len(targets[-1].poses), 2)
                     first = targets[-1].poses[0].position
                     for actual, expected in zip([first.x, first.y, first.z], [.21, .02, .3]):
                         self.assertAlmostEqual(actual, expected)
                     self.assertEqual(request(client, payload)['disposition'], 'duplicate')
-                    self.assertEqual(len(starts), 1)
+                    self.assertEqual(len(starts), 2)
                 finally:
                     executor.shutdown(timeout_sec=1.)
                     worker.join(1.)

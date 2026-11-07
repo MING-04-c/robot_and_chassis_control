@@ -331,6 +331,10 @@ class VirtualDetectionTask(Node):
         force = 0.0
         if self.target is not None and self.status.get("state") in (
             "DESCEND",
+            "MOVEIT_DESCEND",
+            "MOVEIT_PLAN_DESCENT",
+            "VERIFY_MOVEIT_SEGMENT",
+            "MOVEIT_WAIT_CONTACT",
             "STOP_CONTACT",
             "HOLD",
         ):

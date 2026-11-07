@@ -94,11 +94,16 @@ def main():
     path_ranges = [(100, 421)]
     custom_points = None
     marker_y = None
+    departure_case = False
 
     def pump(seconds, visual=True):
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             comm.publish(comm_value)
+            chassis_value.header.stamp = harness.get_clock().now().to_msg()
+            if departure_case:
+                controller.latest_odom = dict(pose=(0., 0., 0.), receipt=time.monotonic(),
+                    stamp=harness.get_clock().now().nanoseconds)
             chassis.publish(chassis_value)
             if visual:
                 message = PolygonStamped()
@@ -145,6 +150,28 @@ def main():
         assert future.done() and future.result().success, 'disabled follower failed readiness check'
         assert not controller.enabled
         stopped()  # Readiness must never enable movement.
+        departure_case = True
+        chassis_value.dock_charging = True
+        pump(.4)
+        assert controller.on_ready(None, Trigger.Response()).success
+        assert controller.departure.state == 'idle'
+        controller.set_parameters([Parameter('enabled', value=True)])
+        pump(.8)
+        assert controller.departure.state == 'active'
+        assert 0. < commands[-1].linear.x <= .02, '充电离站应只限速而不阻止前进'
+        chassis_value.obstacle_status_flags = 1
+        pump(.2)
+        stopped()
+        chassis_value.obstacle_status_flags = 0
+        pump(.4)
+        assert 0. < commands[-1].linear.x <= .02
+        chassis_value.dock_charging = False
+        pump(.7)
+        assert controller.departure.state == 'complete' and commands[-1].linear.x > .02
+        controller.set_parameters([Parameter('enabled', value=False)])
+        departure_case = False
+        pump(.1)
+        stopped()
         comm_value.comm_state = CommStatus.COMM_STATE_DISCONNECTED
         pump(0.2)
         assert not controller.on_ready(Trigger.Request(), Trigger.Response()).success
@@ -349,10 +376,13 @@ def main():
         pump(.4)
         marker_y = None
         mark = len(commands)
-        pump(.45)  # 主线/图像仍新鲜，横线半秒内漏检不应反复插入零速。
+        pump(.2)  # 新速度下短暂漏检仍可有效爬行，但不能超过5mm总行程。
         assert controller.reason == 'stop_marker_missing_approaching', controller.reason
         assert commands[mark:] and all(0. < cmd.linear.x <= controller.config.stop_marker_creep_speed+1e-6
-                                      for cmd in commands[mark+2:])
+                                      for cmd in commands[mark+2:]), [round(cmd.linear.x, 5) for cmd in commands[mark:]]
+        pump(.3)
+        assert commands[-1].linear.x == 0. and controller.reason == 'stop_marker_missing'
+        assert controller.marker_gate.dropout_commanded_distance <= .005+1e-9
         marker_y = 400
         pump(.3)
         marker_y = None
@@ -474,7 +504,7 @@ def route_pause_snapshot_checks():
         for index in range(21):
             recorder.add((index*.01, 0., 0.))
         logger = SimpleNamespace(info=lambda message: None, error=lambda message: None)
-        node = SimpleNamespace(recorder=recorder, latest_odom={'v': 0., 'w': 0.},
+        node = SimpleNamespace(recorder=recorder, latest_odom={'v': 0., 'vy': 0., 'w': 0.},
                                odom_reason=lambda now: None, odom_fault=None, enabled=True,
                                config=SimpleNamespace(stop_marker_enabled=True),
                                marker_gate=SimpleNamespace(arrived=True),
@@ -702,7 +732,7 @@ def recorded_route_ros():
             rclpy.shutdown()
 
 
-def recorded_route_camera_ros(visual_finish=False, holonomic=False):
+def recorded_route_camera_ros(visual_finish=False, holonomic=False, wide_entry=False):
     """记录路线倒车叠加同帧视觉横线，验证离站、锁停、继续和失效停车。"""
     import tempfile
     import numpy as np
@@ -820,8 +850,19 @@ def recorded_route_camera_ros(visual_finish=False, holonomic=False):
             pump(-.03, .4)
             assert controller.previous_v < 0.
             for index in range(1, 11):
-                pump(-index*.1, .15)
+                pump(-index*.1, .15, offset=-180. if wide_entry else 0.)
                 if visual_finish and index == 5:
+                    if wide_entry:
+                        pump(-.5, 1.2, offset=-180.)
+                        assert controller.return_finish is not None, '偏离约56%半图宽无法进入纠偏'
+                        assert controller.reason == 'reverse_visual_finish_aligning', controller.reason
+                        assert commands[-1].linear.x == 0. and commands[-1].linear.y < 0.
+                        assert abs(commands[-1].angular.z) < .005
+                        assert not controller.return_finish.arrived, '放宽接管范围不能算作最终居中'
+                        pump(-.5, .8, vision=False)
+                        assert commands[-1].linear.x == commands[-1].linear.y == commands[-1].angular.z == 0.
+                        print('PASS: logged 56% lateral offset enters bounded alignment, strafe points toward centre, no false arrival, stale camera stops')
+                        return
                     pump(-.5, .45, offset=20., short_line=True)
                     assert controller.return_axis is None, 'fixture must fail whole-line fit'
                     assert controller.return_finish is not None, 'confirmed last straight did not hand over before 30cm'
@@ -1007,9 +1048,495 @@ def recorded_route_camera_ros(visual_finish=False, holonomic=False):
             rclpy.shutdown()
 
 
+def reverse_tracking_limits_ros():
+    """只检查真实节点的输出限幅；隔离速度话题，不连接实车。"""
+    import math
+    from dataclasses import replace
+    rclpy.init(args=['--ros-args', '-p', 'enabled:=true', '-p', 'drive_direction:=reverse',
+                    '-p', 'record_route:=false', '-p', 'route_camera_stop:=false',
+                    '-p', 'cmd_vel_topic:=/reverse_limits_test/cmd',
+                    '-p', 'route_file:=/tmp/nonexistent-reverse-limits-test.json',
+                    '-p', 'station_log_file:=/tmp/reverse-limits-test-stations.json'])
+    node = LineFollowNode()
+    try:
+        points = [(.2*math.sin(t), .2*(1-math.cos(t)), t)
+                  for t in (i*math.pi/200 for i in range(101))]
+        node.route_document = dict(points=points, length_m=math.pi*.1)
+        node.latest_odom = dict(pose=points[-1], frame='odom', v=0., vy=0., w=0.)
+        # 输入失效/急停门控已有集成用例；此用例隔离检查路径跟踪到发布阶段的限幅。
+        node.blocked_reason = lambda *args, **kwargs: None
+        for speed in (.03, .08):
+            node.config = replace(node.config, forward_speed=speed)
+            node.return_tracker = None
+            node.previous_v = node.previous_w = 0.
+            for _ in range(150):
+                node.tick_return_route(time.monotonic(), .02)
+                assert node.reason == 'reverse_route_tracking', node.reason
+                assert abs(node.previous_w) <= node.config.max_angular_speed+1e-9
+                assert abs(node.previous_v) <= min(speed, node.config.reverse_max_speed)+1e-9
+                assert abs(node.previous_w) <= abs(node.previous_v)*node.reverse_route_max_curvature+1e-9
+            assert abs(node.previous_w/node.previous_v) > 4.5, '发布阶段仍按末段2/m削掉转弯需求'
+            if speed == .08:
+                assert abs(abs(node.previous_w)-node.config.max_angular_speed) < 1e-6
+        assert node.route_config.max_curvature == 2., '末段充电的限制被途中配置覆盖'
+        node.latest_odom['pose'] = (*points[-1][:2], points[-1][2]+math.pi)
+        node.tick_return_route(time.monotonic(), .02)
+        assert node.reason == 'reverse_target_not_behind'
+        assert node.previous_v == node.previous_w == 0., '目标方向保护应立即停车'
+        # A straight route can reach cruise speed, unlike a curvature-limited
+        # bend. Changing the reverse cap must leave the forward setting intact.
+        straight = [(i*.01, 0., 0.) for i in range(101)]
+        node.return_fault = None  # Independent scenario after the latched-stop assertion above.
+        node.route_document = dict(points=straight, length_m=1.)
+        node.latest_odom['pose'] = straight[-1]
+        for forward, reverse in ((.075, .05), (.075, .025), (.03, .05)):
+            node.config = replace(node.config, forward_speed=forward, reverse_max_speed=reverse)
+            node.return_tracker = None
+            node.previous_v = node.previous_w = 0.
+            for _ in range(150):
+                node.tick_return_route(time.monotonic(), .02)
+                assert node.reason == 'reverse_route_tracking', node.reason
+                assert abs(node.previous_v) <= min(forward, reverse)+1e-9
+            assert abs(node.previous_v+min(forward, reverse)) < 1e-6
+            assert node.config.forward_speed == forward
+            assert abs(node.previous_w) < 1e-9
+        print('PASS: independent forward 0.075 / reverse 0.05 cruise and lower reverse limits')
+        print('PASS: reverse tight bend survives publish-stage cap, yaw speed regulation, finish limit and stop protection')
+    finally:
+        node.stop()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def charging_signal_ros():
+    """真实节点，本机隔离速度话题；验证充电首帧停车、去重确认和锁停。"""
+    from types import SimpleNamespace
+    rclpy.init(args=['--ros-args', '-p', 'enabled:=true', '-p', 'drive_direction:=reverse',
+                    '-p', 'charging_mode:=true', '-p', 'charging_status_layout:=bitfield32',
+                    '-p', 'cmd_vel_topic:=/charging_test/cmd',
+                    '-p', 'route_file:=/tmp/nonexistent-charging-test-route.json',
+                    '-p', 'station_log_file:=/tmp/charging-test-stations.json'])
+    node = LineFollowNode()
+    try:
+        node.return_tracker = SimpleNamespace(diagnostics={'remaining_m': .1}, points=[(0., 0.), (.1, 0.)])
+        node.latest_odom = {'frame': 'odom', 'pose': (.1, 0., 0.),
+                            'receipt': time.monotonic(), 'stamp': node.get_clock().now().nanoseconds}
+        node.connected, node.comm_time = True, time.monotonic()
+        def feed(offset):
+            message = ChassisStatus(chassis_state=ChassisStatus.CHASSIS_STATE_COMM_CONTROL, system_status_flags=8)
+            message.header.stamp = node.get_clock().now().to_msg()
+            message.header.stamp.nanosec += offset
+            node.on_chassis(message)
+            node.tick_return_route(time.monotonic(), .02)
+            assert node.previous_v == node.previous_vy == node.previous_w == 0.
+            return message
+        first = feed(0)
+        assert node.reason == 'charging_dock_confirming'
+        node.on_chassis(first)
+        assert node.charge_frames == 1, '重复CAN源时间戳不能累计确认'
+        feed(1)
+        feed(2)
+        assert node.reason == 'reverse_route_complete' and node.dock.done
+        node.charge_value = False
+        node.tick_return_route(time.monotonic(), .02)
+        assert node.reason == 'reverse_route_complete', '充电位抖动不能重新发车'
+        node.dock.done = False
+        node.charge_candidate_at = time.monotonic()
+        node.tick_return_route(time.monotonic(), .02)
+        assert node.reason == 'charging_dock_confirming' and node.previous_v == 0.
+        node.charge_candidate_at -= 3.
+        node.tick_return_route(time.monotonic(), .02)
+        assert node.reason == 'charging_dock_charge_unstable' and node.previous_v == 0.
+        node.charge_at = time.monotonic()-2
+        assert node.charging_signal(time.monotonic()) is None
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def departure_readiness_ros():
+    """本机节点验证：只豁免桩充电；安全门、倒车及反馈超时仍有效。"""
+    rclpy.init(args=['--ros-args', '-p', 'enabled:=false', '-p', 'record_route:=false',
+                    '-p', 'cmd_vel_topic:=/departure_test/cmd',
+                    '-p', 'station_log_file:=/tmp/departure-test-stations.json'])
+    node = LineFollowNode()
+    try:
+        now = time.monotonic()
+        node.connected, node.comm_time = True, now
+        node.latest_odom = dict(pose=(0., 0., 0.), receipt=now,
+                               stamp=node.get_clock().now().nanoseconds)
+        msg = ChassisStatus(chassis_state=7, dock_charging=True, system_status_flags=53510)
+        def feed():
+            msg.header.stamp = node.get_clock().now().to_msg()
+            node.on_chassis(msg)
+        feed()
+        assert node.charge_value is True, '实车53510需按SDK dock_charging解析'
+        assert node.departure_permitted() and not node.chassis_allowed
+        assert node.blocked_reason(now, False) == 'camera_timeout', '只能豁免充电，不豁免相机'
+        node.on_ready(None, Trigger.Response())
+        assert node.departure.state == 'idle', '就绪检查不能开始离桩计时'
+        for field, value in [('manual_charging', True), ('chassis_fault', 1),
+                             ('obstacle_status_flags', 1), ('excessive_tilt', True), ('chassis_state', 1)]:
+            saved = getattr(msg, field)
+            setattr(msg, field, value)
+            feed()
+            assert not node.departure_permitted(), field
+            assert node.blocked_reason(time.monotonic(), False) == 'chassis_not_ready'
+            setattr(msg, field, saved)
+        feed()
+        node.config = __import__('dataclasses').replace(node.config, drive_direction='reverse')
+        assert not node.departure_permitted(), '倒车绝不豁免充电停车'
+        node.config = __import__('dataclasses').replace(node.config, drive_direction='forward')
+        node.chassis_time = time.monotonic()-10
+        assert node.blocked_reason(time.monotonic(), False) == 'chassis_not_ready'
+        node.chassis_time = time.monotonic()
+        node.departure.advance(0., (0., 0.), True)
+        node.departure.advance(26., (0., 0.), True)
+        assert node.blocked_reason(time.monotonic(), False) == 'dock_departure_timeout'
+        print('PASS: dock departure preflight, actual SDK charging bit, safety gates, reverse prohibition, stale feedback and latched timeout')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+
+def standard_route_ros(check_finish=False, check_loss=None):
+    """隔离话题：标准路线前进、辅助视觉、过期停车、文件不覆盖及起点拒绝。"""
+    import tempfile
+    import numpy as np
+    from cv_bridge import CvBridge
+    from nav_msgs.msg import Odometry
+    from std_msgs.msg import String
+    from sensor_msgs.msg import Image
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        standard = directory/'standard.json'
+        standard.write_text(json.dumps(dict(version=1,valid=True,finished=True,
+            frame_id='odom',child_frame_id='base_link',points=[[i*.01,0.,0.] for i in range(31 if check_finish else 81)],
+            standard_route=dict(schema='robot_standard_route_v1',quality=dict(accepted=True)))))
+        original = standard.read_bytes()
+        rclpy.init(args=['--ros-args','-p','enabled:=false','-p','navigation_mode:=replay',
+            '-p','standard_route_file:='+str(standard),'-p','route_file:='+str(directory/'actual.json'),
+            '-p','station_log_file:='+str(directory/'stations.json'),
+            '-p','cmd_vel_topic:=/standard_test/cmd','-p','line_status_topic:=/standard_test/line',
+            '-p','centerline_topic:=/standard_test/path','-p','stop_marker_mask_topic:=/standard_test/mask',
+            '-p','comm_status_topic:=/standard_test/comm','-p','chassis_status_topic:=/standard_test/chassis',
+            '-p','odom_topic:=/standard_test/odom','-p','forward_speed:=0.05',
+            '-p','image_forward_direction:=up','-p','vehicle_reference_y_ratio:=1.05',
+            '-p','steering_sign:=-1.0'])
+        node,harness=LineFollowNode(),Node('standard_test_harness')
+        executor=SingleThreadedExecutor()
+        executor.add_node(node);executor.add_node(harness)
+        line=harness.create_publisher(String,'/standard_test/line',10)
+        path=harness.create_publisher(PolygonStamped,'/standard_test/path',qos_profile_sensor_data)
+        mask=harness.create_publisher(Image,'/standard_test/mask',qos_profile_sensor_data)
+        comm=harness.create_publisher(CommStatus,'/standard_test/comm',10)
+        chassis=harness.create_publisher(ChassisStatus,'/standard_test/chassis',10)
+        odom=harness.create_publisher(Odometry,'/standard_test/odom',10)
+        commands=[]
+        harness.create_subscription(Twist,'/standard_test/cmd',commands.append,10)
+        position=[0.]
+        def pump(seconds,visual=True,error=0.,odometry=True,missing=False):
+            end=time.monotonic()+seconds
+            previous=time.monotonic()
+            while time.monotonic()<end:
+                now=time.monotonic();dt=now-previous;previous=now
+                v=commands[-1].linear.x if commands else 0.
+                position[0]+=v*dt
+                comm.publish(CommStatus(comm_state=CommStatus.COMM_STATE_CONNECTED))
+                state=ChassisStatus(chassis_state=ChassisStatus.CHASSIS_STATE_COMM_CONTROL)
+                state.header.stamp=harness.get_clock().now().to_msg();chassis.publish(state)
+                if odometry:
+                    message=Odometry();message.header.stamp=state.header.stamp
+                    message.header.frame_id='odom';message.child_frame_id='base_link'
+                    message.pose.pose.orientation.w=1.;message.pose.pose.position.x=position[0]
+                    message.twist.twist.linear.x=v;odom.publish(message)
+                if visual:
+                    polygon=PolygonStamped();polygon.header.stamp=state.header.stamp
+                    polygon.header.frame_id='camera_optical_frame'
+                    x=319.5+319.5*error
+                    polygon.polygon.points=[] if missing else [Point32(x=x,y=float(y)) for y in range(100,422,6)]
+                    path.publish(polygon)
+                    image=np.zeros((480,640),np.uint8)
+                    cv2.line(image,(int(x),100),(int(x),421),255,16)
+                    image=CvBridge().cv2_to_imgmsg(image,encoding='mono8');image.header=polygon.header;mask.publish(image)
+                    payload=observation(error_normalized=error,image_width=640,image_height=480,
+                        source_stamp_sec=state.header.stamp.sec,source_stamp_nanosec=state.header.stamp.nanosec)
+                    if missing:
+                        payload.update(lost=True, valid_row_fraction=0.)
+                    line.publish(String(data=json.dumps(payload)))
+                cycle_end=min(end, now+.125)
+                while time.monotonic()<cycle_end:
+                    executor.spin_once(timeout_sec=.002)
+        try:
+            pump(1.5)
+            readiness=node.on_ready(None,Trigger.Response())
+            assert readiness.success, readiness.message
+            assert node.set_parameters([Parameter('enabled',value=True)])[0].successful
+            pump(1.5)
+            assert commands[-1].linear.x>0. and abs(commands[-1].angular.z)<.005
+            assert node.standard_follower.diagnostics['progress_m']>0.
+            if check_loss:
+                if check_loss == 'curve':
+                    import math
+                    from recorded_route import StandardRouteFollower
+                    curved = json.loads(standard.read_text())
+                    curved['points'] = [[.25*math.sin(i*.01/.25), .25*(1-math.cos(i*.01/.25)), i*.01/.25]
+                                        for i in range(81)]
+                    node.standard_follower = StandardRouteFollower(curved, (position[0], 0., 0.), node.forward_route_config)
+                    node.standard_follower.command((position[0], 0., 0.), .05)
+                before = node.standard_follower.diagnostics['progress_m']
+                commands.clear()
+                pump(.6, missing=True)
+                assert commands and all(0. < c.linear.x <= .05 for c in commands), 'fresh empty centerlines must not repeatedly publish zero'
+                assert node.standard_follower.diagnostics['progress_m'] > before
+                assert node.standard_visual_loss is not None and node.standard_correction == 0.
+                if check_loss == 'curve':
+                    assert commands[-1].angular.z > .01, 'recorded curve must keep steering when vision disappears'
+                    assert node.steering_guard.state == 'standard_route'
+                    curvature = abs(commands[-1].angular.z/commands[-1].linear.x)
+                    assert 2. < curvature <= node.forward_route_config.max_curvature+1e-6, curvature
+                    assert abs(commands[-1].angular.z) <= node.config.curve_max_angular_speed+1e-6
+                elif check_loss in ('timeout', 'distance'):
+                    if check_loss == 'timeout':
+                        node.standard_visual_loss['started'] -= node.standard_visual_loss_timeout
+                    else:
+                        node.standard_visual_loss['travel'] = node.standard_visual_loss_distance
+                    pump(.25, missing=True)
+                    expected = 'standard_visual_loss_timeout' if check_loss == 'timeout' else 'standard_visual_loss_distance_limit'
+                    assert node.standard_fault == expected, node.standard_fault
+                    assert commands[-1].linear.x == commands[-1].angular.z == 0.
+                    pump(.4)
+                    assert node.standard_fault == expected and commands[-1].linear.x == 0., 'loss limit must latch'
+                elif check_loss == 'finish':
+                    position[0] = .66
+                    pump(.3, missing=True)
+                    assert commands[-1].linear.x == 0., 'final approach cannot continue without vision'
+                    assert not node.marker_gate.arrived
+                elif check_loss == 'odom':
+                    pump(.6, missing=True, odometry=False)
+                    assert commands[-1].linear.x == 0., 'odometry loss must still stop'
+                elif check_loss == 'deviation':
+                    node.latest_odom['pose'] = (position[0], .3, 0.)
+                    result = node.standard_forward_command(time.monotonic(), 'insufficient_heading_points')
+                    assert result[:2] == (0., 0.) and node.standard_fault == 'standard_route_deviation'
+                else:
+                    pump(.6)
+                    assert node.standard_visual_loss is None and commands[-1].linear.x > 0.
+                assert standard.read_bytes() == original
+                print('PASS: standard odometry-led fresh line-loss continuation: '+str(check_loss))
+                return
+            if check_finish:
+                deadline=time.monotonic()+28.
+                while node.standard_fault is None and time.monotonic()<deadline:
+                    pump(.25)
+                    if check_finish=='timeout' and node.standard_finish is not None:
+                        node.standard_finish['started']-=31.
+                expected='standard_finish_timeout' if check_finish=='timeout' else 'standard_finish_search_limit'
+                assert node.standard_fault==expected,(node.reason,node.standard_finish)
+                assert commands[-1].linear.x==0.
+                assert position[0]<=.36,position[0]
+                assert standard.read_bytes()==original
+                print('PASS: standard final visual handoff, bounded extra search/timeout and immutable route: '+expected)
+                return
+            pump(.5,error=.15)
+            assert 0. < abs(node.standard_correction)<=.06
+            assert node.standard_navigator.speed_factor < 1., 'visual deviation must reduce route speed'
+            assert standard.read_bytes()==original
+            pump(.8,visual=False)
+            assert commands[-1].linear.x==0.,'视觉长时间失效仍必须停车'
+            node.set_parameters([Parameter('enabled',value=False)])
+            pump(.4,error=.4)
+            assert not node.set_parameters([Parameter('enabled',value=True)])[0].successful,'起点偏离不能强行重放'
+            pump(.4)
+            node.standard_file=str(directory/'missing.json')
+            from std_srvs.srv import SetBool
+            response = node.on_enable(SetBool.Request(data=True), SetBool.Response())
+            assert not response.success
+            assert 'missing.json' in response.message and response.message != 'disabled', response.message
+            assert not node.enabled
+            assert standard.read_bytes()==original
+            print('PASS: standard path forward, bounded visual assist, stale vision stop, origin alignment, missing route rejection and immutable standard')
+        finally:
+            executor.shutdown();node.destroy_node();harness.destroy_node();rclpy.shutdown()
+
+def start_alignment_ros(replay=False, docked=False):
+    """The recorder and replay anchor must wait for the aligned odometry pose."""
+    import tempfile
+    import numpy as np
+    from cv_bridge import CvBridge
+    from nav_msgs.msg import Odometry
+    from sensor_msgs.msg import Image
+    from std_msgs.msg import String
+    with tempfile.TemporaryDirectory() as directory:
+        route_file = str(Path(directory)/'route.json')
+        standard_file = str(Path(directory)/'standard.json')
+        if replay:
+            points = [[i*.01, 0., 0.] for i in range(31)]
+            Path(standard_file).write_text(json.dumps(dict(version=1, valid=True, finished=True,
+                frame_id='odom', child_frame_id='base_link', points=points,
+                standard_route=dict(schema='robot_standard_route_v1',
+                                    quality=dict(accepted=True)))))
+        rclpy.init(args=['--ros-args', '-p', 'enabled:=false', '-p', 'dry_run:=true',
+            '-p', 'record_route:='+str(not replay), '-p', 'navigation_mode:='+('replay' if replay else 'vision'),
+            '-p', 'standard_route_file:='+standard_file, '-p', 'start_alignment_enabled:=false',
+            '-p', 'image_forward_direction:=down', '-p', 'forward_speed:=0.05',
+            '-p', 'start_alignment_speed:=0.02', '-p', 'route_file:='+route_file,
+            '-p', 'station_log_file:='+str(Path(directory)/'stations.json'),
+            '-p', 'cmd_vel_topic:=/start_alignment_test/cmd',
+            '-p', 'odom_topic:=/start_alignment_test/odom',
+            '-p', 'line_status_topic:=/start_alignment_test/status',
+            '-p', 'centerline_topic:=/start_alignment_test/path',
+            '-p', 'stop_marker_mask_topic:=/start_alignment_test/mask'])
+        executor = SingleThreadedExecutor()
+        harness, controller = Node('start_alignment_harness'), LineFollowNode()
+        executor.add_node(harness)
+        executor.add_node(controller)
+        odom_pub = harness.create_publisher(Odometry, '/start_alignment_test/odom', 10)
+        status_pub = harness.create_publisher(String, '/start_alignment_test/status', 10)
+        path_pub = harness.create_publisher(PolygonStamped, '/start_alignment_test/path', qos_profile_sensor_data)
+        mask_pub = harness.create_publisher(Image, '/start_alignment_test/mask', qos_profile_sensor_data)
+        commands = []
+        harness.create_subscription(Twist, '/line_follow/cmd_vel', commands.append, 10)
+        bridge = CvBridge()
+        odom_x, odom_y, marker_x, marker_y = [0.], [0.], [350], [290]
+        charging = [docked]
+        origin_x = .04 if docked else 0.
+
+        def pump(duration):
+            end = time.monotonic()+duration
+            while time.monotonic() < end:
+                stamp = harness.get_clock().now().to_msg()
+                odom = Odometry()
+                odom.header.stamp, odom.header.frame_id, odom.child_frame_id = stamp, 'odom', 'base_link'
+                odom.pose.pose.position.x = odom_x[0]
+                odom.pose.pose.position.y = odom_y[0]
+                odom.pose.pose.orientation.w = 1.
+                odom_pub.publish(odom)
+                if docked:
+                    controller.on_chassis(ChassisStatus(
+                        header=odom.header,
+                        chassis_state=ChassisStatus.CHASSIS_STATE_COMM_CONTROL,
+                        dock_charging=charging[0]))
+                path = PolygonStamped()
+                path.header.stamp, path.header.frame_id = stamp, 'start_alignment_camera'
+                path.polygon.points = [Point32(x=float(marker_x[0]), y=float(y)) for y in range(100, 421, 6)]
+                path_pub.publish(path)
+                mask = np.zeros((480, 640), np.uint8)
+                cv2.line(mask, (marker_x[0], 100), (marker_x[0], 420), 255, 16)
+                cv2.line(mask, (marker_x[0]-80, marker_y[0]), (marker_x[0]+80, marker_y[0]), 255, 16)
+                image = bridge.cv2_to_imgmsg(mask, encoding='mono8')
+                image.header.stamp, image.header.frame_id = stamp, path.header.frame_id
+                mask_pub.publish(image)
+                status_pub.publish(String(data=json.dumps(observation(
+                    source_stamp_sec=stamp.sec, source_stamp_nanosec=stamp.nanosec,
+                    image_width=640, image_height=480))))
+                for _ in range(6):
+                    executor.spin_once(timeout_sec=.005)
+
+        try:
+            pump(.4)
+            result = controller.set_parameters([
+                Parameter('start_alignment_enabled', value=True),
+                Parameter('enabled', value=True)])
+            assert result[0].successful, result[0].reason
+            if docked:
+                commands.clear()
+                pump(.6)
+                assert controller.departure.state == 'active'
+                assert controller.start_alignment_state == 'start_alignment_departing_dock'
+                assert commands and 0. < commands[-1].linear.x <= controller.departure_speed
+                assert all(c.linear.y == c.angular.z == 0. for c in commands)
+                assert controller.start_aligner.step_count == 0
+                if replay:
+                    assert controller.standard_follower is None
+                else:
+                    assert not controller.recorder.points
+                # A blocked input immediately stops undocking as well.
+                assert controller.tick_alignment_departure(
+                    time.monotonic(), .02, 'camera_timeout')[:3] == (0., 0., 0.)
+                old_start = controller.start_aligner.started_at
+                odom_x[0] = origin_x
+                charging[0] = False
+                pump(.15)
+                assert controller.departure.state == 'complete'
+                assert controller.start_aligner.started_at > old_start
+                assert commands[-1].linear.x == commands[-1].linear.y == commands[-1].angular.z == 0.
+            pump(1.3)  # Initial stationary dwell plus fresh stable camera frames.
+            assert controller.start_alignment_active
+            if replay:
+                assert controller.standard_document is not None
+                assert controller.standard_follower is None, 'replay anchor must wait for visual alignment'
+            else:
+                assert controller.recorder is not None and not controller.recorder.points
+            assert commands and 0. < commands[-1].linear.y <= controller.config.start_alignment_lateral_speed
+            assert commands[-1].linear.x == commands[-1].angular.z == 0.
+            assert abs(controller.start_aligner.step_lateral_m-.005) < 1e-9
+            assert controller.start_aligner.velocity()[1] >= controller.config.start_alignment_min_lateral_speed
+            pump(.35)  # A minimum-speed command is not evidence of actual motion.
+            assert controller.start_alignment_active and controller.start_aligner.phase == 'moving'
+            assert controller.start_aligner.snapshot()['step_actual_m'] == 0.
+            assert commands[-1].linear.y >= controller.config.start_alignment_min_lateral_speed
+            odom_y[0], marker_x[0] = .005, 320
+            pump(1.5)  # Finish lateral alignment; a separate forward step is still needed.
+            assert controller.start_alignment_active
+            assert commands[-1].linear.x > 0.
+            assert commands[-1].linear.y == commands[-1].angular.z == 0.
+            if replay:
+                assert controller.standard_follower is None
+            else:
+                assert not controller.recorder.points, 'lateral corrections must not enter the route'
+            odom_x[0], marker_y[0] = origin_x+.02, 240
+            pump(1.6)  # Stop at the odometry target, then observe new stopped frames.
+            assert not controller.start_alignment_active, controller.start_alignment_state
+            if replay:
+                assert controller.standard_follower is not None
+                anchor = controller.standard_follower.tracker.points[0]
+                assert abs(anchor[0]-(origin_x+.02)) < 1e-6, anchor
+                assert abs(anchor[1]-.005) < 1e-6, anchor
+            else:
+                assert controller.recorder.points
+                assert abs(controller.recorder.points[0][0]-(origin_x+.02)) < 1e-6, controller.recorder.points[0]
+                assert abs(controller.recorder.points[0][1]-.005) < 1e-6, controller.recorder.points[0]
+            assert controller.marker_gate.startup_ignored
+            if docked:
+                # A failed undocking must latch a workflow-visible alignment
+                # failure, never fall through to a visual step or retry itself.
+                controller.set_parameters([Parameter('enabled', value=False)])
+                charging[0] = True
+                pump(.1)
+                result = controller.set_parameters([Parameter('enabled', value=True)])
+                assert result[0].successful, result[0].reason
+                pump(.2)
+                assert controller.departure.state == 'active'
+                controller.departure.started -= controller.departure.timeout+1.
+                pump(.2)
+                assert controller.start_alignment_state == 'start_alignment_failed_dock_departure_timeout'
+                assert commands[-1].linear.x == commands[-1].linear.y == commands[-1].angular.z == 0.
+                assert controller.start_aligner.step_count == 0
+                charging[0] = False
+                pump(.2)
+                assert controller.start_alignment_state == 'start_alignment_failed_dock_departure_timeout'
+            print('PASS: startup servo is bounded; '+
+                  ('replay anchor' if replay else 'route origin')+
+                  ' uses the post-alignment odometry pose')
+        finally:
+            executor.shutdown()
+            controller.destroy_node()
+            harness.destroy_node()
+            rclpy.shutdown()
+
+
 if __name__ == '__main__':
+    reverse_tracking_limits_ros()
+    departure_readiness_ros()
+    charging_signal_ros()
     route_pause_snapshot_checks()
     background_work_ros()
     main()
     recorded_route_ros()
     recorded_route_camera_ros()
+    start_alignment_ros()
+    start_alignment_ros(replay=True)
+    start_alignment_ros(docked=True)
+    start_alignment_ros(replay=True, docked=True)

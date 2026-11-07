@@ -20,12 +20,15 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import Pose, PoseArray
-from std_msgs.msg import Empty, String
+from masc_chassis_msgs.msg import BmsStatus, ChassisStatus, CommStatus
+from std_msgs.msg import Bool, Empty, String
+from rcl_interfaces.msg import Log
+from runtime_monitor import RuntimeMonitor
 from std_srvs.srv import Trigger
 
 from industrial_pc_protocol import (
     ProtocolError, authenticate, canonical, envelope, load_key, read_message,
-    validate_result, validate_thickness, validate_thickness_request, validate_command, decode, write_message,
+    validate_result, validate_thickness, validate_detection_result, validate_thickness_request, validate_command, decode, write_message,
 )
 
 
@@ -53,8 +56,41 @@ class IndustrialPC(Node):
         self.status_pub = self.create_publisher(String, "~/status", retained)
         self.points_pub = self.create_publisher(PoseArray, "~/camera_points", 10)
         self.demo_pub = self.create_publisher(PoseArray, "~/demo_camera_points", 10)
+        self.point_result_dir = self.output / "detection_results"
+        self.point_result_dir.mkdir(exist_ok=True)
+        self.detection_results = {}
+        # 落盘后再提供给监听端；桥接重启后仍能补收最近100条结果。
+        for path in sorted(self.point_result_dir.glob('*.json'), key=lambda x: x.stat().st_mtime)[-100:]:
+            try:
+                result = validate_detection_result(json.loads(path.read_text()))
+                self.detection_results[result['result_id']] = result
+            except (OSError, ValueError):
+                self.get_logger().warning('忽略无效逐点结果文件：'+str(path))
         self.latest_thickness = None
         self.observations = {}
+        self.enable_status_monitor = param('enable_status_monitor', True)
+        self.monitor = RuntimeMonitor() if self.enable_status_monitor else None
+        self.monitor_normal = self.monitor_abnormal = None
+        if self.enable_status_monitor:
+            self.normal_pub = self.create_publisher(String, '/robot_status/normal', retained)
+            self.abnormal_pub = self.create_publisher(String, '/robot_status/abnormal', retained)
+            self.create_subscription(String, '/arm_joint_postures/status',
+                                     lambda msg: self.cache_status('arm', msg), retained)
+            self.create_subscription(String, '/protective_stop_guard/status',
+                                     lambda msg: self.cache_status('safety', msg), retained)
+            self.create_subscription(Bool, '/robot_control/safety_inhibit',
+                                     lambda msg: self.monitor.receive('inhibit', {'inhibited': msg.data}), retained)
+            self.create_subscription(Log, '/rosout', self.on_ros_log, 50)
+        self.power_feedback = {}
+        self.charging_layout = str(param('charging_status_layout', 'bitfield32'))
+        if self.charging_layout not in ('bitfield32', 'byte_flags'):
+            raise ValueError('charging_status_layout只能是bitfield32或byte_flags')
+        self.create_subscription(BmsStatus, '/masc_chassis/bms_status',
+                                 lambda msg: self.cache_power('bms', msg), 10)
+        self.create_subscription(ChassisStatus, '/masc_chassis/chassis_status',
+                                 lambda msg: self.cache_power('system', msg), 10)
+        self.create_subscription(CommStatus, '/masc_chassis/comm_status',
+                                 lambda msg: self.cache_power('comm', msg), 10)
         self.last_result = None
         self.pending_controls = {}
         self.command_dir = self.output / "commands"
@@ -68,6 +104,8 @@ class IndustrialPC(Node):
         self.create_subscription(String, "/line_follow/status",
                                  lambda msg: self.cache_status("line_follow", msg), 10)
         self.create_subscription(String, "/detactor/measurement", self.on_thickness, retained)
+        self.create_subscription(String, "/task_controller/detection_result", self.on_detection_result,
+                                 QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.requests = queue.Queue(maxsize=16)
         self.stop_event = threading.Event()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -84,15 +122,37 @@ class IndustrialPC(Node):
         self.thread.start()
         self.create_timer(0.02, self.process_requests)
         self.create_timer(.1, self.check_control_timeouts)
+        if self.enable_status_monitor:
+            self.create_timer(.5, self.update_monitor)
         self.status("LISTENING", endpoint=f"{host}:{port}")
         self.get_logger().info(
             f"工控机结果接口监听 {host}:{port}；保存到 {self.output}；"
             "检测点只发布观测；独立任务请求可调用已加载任务的 start/stop/resume/capture"
         )
 
+    def on_detection_result(self, message):
+        """回原位后形成的逐点结果持久化，通过9010状态查询交给麒麟常驻监听。"""
+        try:
+            result = validate_detection_result(json.loads(message.data))
+            identity = result['result_id']
+            path = self.point_result_dir/(hashlib.sha256(identity.encode()).hexdigest()+'.json')
+            if path.exists():
+                if json.loads(path.read_text()) != result:
+                    raise ProtocolError('逐点结果ID重复但内容不同')
+            else:
+                self.save_json(path, result)
+            self.detection_results[identity] = result
+            while len(self.detection_results) > 100:
+                self.detection_results.pop(next(iter(self.detection_results)))
+        except (OSError, ValueError) as error:
+            self.get_logger().error('逐点测厚结果接收失败：'+str(error))
+
     def cache_status(self, name, message):
         try:
-            self.observations[name] = (decode(message.data.encode("utf-8")), time.monotonic())
+            value = decode(message.data.encode("utf-8"))
+            self.observations[name] = (value, time.monotonic())
+            if self.monitor is not None:
+                self.monitor.receive(name, value)
         except ProtocolError:
             pass
 
@@ -106,9 +166,84 @@ class IndustrialPC(Node):
                             "age_seconds": age, "data": value}
         return {**output, "latest_result": self.last_result,
                 "latest_thickness": self.thickness_snapshot(),
+                "chassis_power": self.chassis_power_snapshot(),
+                "status_monitor_enabled": self.enable_status_monitor,
+                "normal_status": self.monitor_normal, "abnormal_status": self.monitor_abnormal,
+                "detection_results": list(self.detection_results.values()),
                 "start_service_ready": self.start_task.service_is_ready(),
                 "stop_service_ready": self.stop_task.service_is_ready(),
                 "capture_service_ready": self.capture_camera.service_is_ready()}
+
+    def on_ros_log(self, message):
+        if self.monitor is None:
+            return
+        if message.name == 'task_controller' and message.msg.endswith('stopped by user'):
+            return  # 明确的人工停止属于正常运行状态，不当成设备故障。
+        if message.level >= Log.ERROR:
+            self.monitor.log_error(message.name, message.msg, message.level,
+                                   message.file, message.function, message.line)
+
+    def update_monitor(self):
+        if self.monitor is None:
+            return
+        self.monitor_normal, self.monitor_abnormal = self.monitor.snapshot(self.chassis_power_snapshot())
+        self.normal_pub.publish(String(data=canonical(self.monitor_normal).decode()))
+        self.abnormal_pub.publish(String(data=canonical(self.monitor_abnormal).decode()))
+
+    def cache_power(self, name, message):
+        """缓存已有底盘反馈，不开CAN口、不发送运动命令。"""
+        self.power_feedback[name] = (message, time.monotonic())
+        if self.monitor is None:
+            return
+        if name == 'system':
+            self.monitor.receive('chassis', {'fault': int(message.chassis_fault)})
+        elif name == 'comm':
+            self.monitor.receive('comm', {'state': int(message.comm_state), 'fail_reason': int(message.fail_reason)})
+
+    def power_sample(self, name, timeout):
+        message, received = self.power_feedback.get(name, (None, None))
+        if message is None:
+            return None, False, None
+        age = time.monotonic()-received
+        stamp = message.header.stamp
+        stamp_ns = stamp.sec*10**9+stamp.nanosec
+        source_age = (self.get_clock().now().nanoseconds-stamp_ns)/1e9
+        fresh = age < timeout and stamp_ns > 0 and -.1 <= source_age < timeout
+        return message, fresh, max(age, source_age)
+
+    def chassis_power_snapshot(self):
+        """电量来自0x206；充电按配置解析0x204，失联/超时返回null。"""
+        bms, bms_fresh, bms_age = self.power_sample('bms', 3.)
+        system, system_fresh, system_age = self.power_sample('system', 1.)
+        comm, comm_fresh, _ = self.power_sample('comm', 3.)
+        connected = bool(comm_fresh and comm.comm_state == CommStatus.COMM_STATE_CONNECTED)
+        bms_valid = bool(connected and bms_fresh and 0 <= bms.bat_soc <= 100
+                         and math.isfinite(bms.bat_voltage) and math.isfinite(bms.bat_current)
+                         and bms.bms_health not in (BmsStatus.BMS_HEALTH_TIMEOUT,
+                                                    BmsStatus.BMS_HEALTH_UNKNOWN))
+        system_valid = bool(connected and system_fresh)
+        raw = int(system.system_status_flags) if system is not None else None
+        charging, low_battery = None, None
+        if system_valid:
+            if self.charging_layout == 'bitfield32':
+                charging, low_battery = bool(raw & (1 << 3)), bool(raw & (1 << 2))
+            else:
+                charging = bool(system.manual_charging or system.dock_charging)
+                low_battery = bool(system.low_battery)
+        return {
+            'available': bms_valid and system_valid,
+            'connected': connected,
+            'battery_percent': int(bms.bat_soc) if bms_valid else None,
+            'charging': charging,
+            'charging_state': 'unknown' if charging is None else ('charging' if charging else 'not_charging'),
+            'low_battery': low_battery,
+            'voltage_v': float(bms.bat_voltage) if bms_valid else None,
+            'current_a': float(bms.bat_current) if bms_valid else None,
+            'bms_fresh': bms_valid, 'system_fresh': system_valid,
+            'bms_age_seconds': bms_age, 'system_age_seconds': system_age,
+            'charging_status_layout': self.charging_layout,
+            'system_status_flags': raw,
+        }
 
     @staticmethod
     def save_json(path, value):
@@ -149,6 +284,17 @@ class IndustrialPC(Node):
         """固定接口桥接；同一ID永久去重，网络重试不会再次启动任务。"""
         action = validate_command(payload)
         identity = payload["message_id"]
+        if action in ('status_normal', 'status_abnormal'):
+            if not self.enable_status_monitor:
+                job['ack'] = self.ack(False, message_id=identity,
+                                      status_monitor_enabled=False, reason='状态汇总监视未启用；可用status查询基础任务状态')
+                return False
+            if self.monitor_normal is None:
+                self.update_monitor()
+            field = 'normal_status' if action == 'status_normal' else 'abnormal_status'
+            job['ack'] = self.ack(True, message_id=identity, **{field:
+                self.monitor_normal if field == 'normal_status' else self.monitor_abnormal})
+            return False
         if action == "status":
             job["ack"] = self.ack(True, message_id=identity, robot_status=self.robot_status())
             return False

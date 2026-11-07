@@ -11,6 +11,8 @@
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <eli_common_interface/msg/safety_mode.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 class ControllerStopper {
    public:
@@ -48,5 +50,10 @@ class ControllerStopper {
 
     bool stop_controllers_on_startup_;
     bool robot_running_;
+    bool safety_latched_{false};
+    int safety_mode_{-2};
+    rclcpp::Subscription<eli_common_interface::msg::SafetyMode>::SharedPtr safety_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr inhibit_sub_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr recovery_service_;
 };
 #endif

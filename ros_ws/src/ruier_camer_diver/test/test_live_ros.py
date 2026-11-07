@@ -24,7 +24,7 @@ from std_msgs.msg import String
 from geometry_msgs.msg import PolygonStamped
 
 
-def main():
+def main(max_processing_fps=0.0):
     package = Path(__file__).resolve().parents[1]
     workspace = package.parents[1]
     sys.path.insert(0, str(package.parent / "masc_chassis_user_control/scripts"))
@@ -34,6 +34,7 @@ def main():
     process = subprocess.Popen([
         str(binary), "--ros-args", "-r", "__ns:=/line_integration_test",
         "-p", "show_window:=false", "-p", "frame_timeout_sec:=0.5",
+        "-p", "max_processing_fps:="+str(max_processing_fps),
     ])
     node = None
     rclpy.init()
@@ -41,13 +42,18 @@ def main():
         node = Node("line_integration_probe")
         bridge = CvBridge()
         status, debug, path, estimated = {}, [], [], []
+        source_stamps=[]
+        def on_status(message):
+            value=json.loads(message.data)
+            status.update(value)
+            source_stamps.append((value.get('source_stamp_sec'),value.get('source_stamp_nanosec')))
         masks, marker_masks = [], []
         node.create_subscription(Image, "/line_integration_test/line/mask",
                                  lambda m: masks.__setitem__(slice(None), [m]), qos_profile_sensor_data)
         node.create_subscription(Image, "/line_integration_test/line/stop_marker_mask",
                                  lambda m: marker_masks.__setitem__(slice(None), [m]), qos_profile_sensor_data)
         node.create_subscription(String, "/line_integration_test/line/status",
-                                 lambda m: status.update(json.loads(m.data)), 10)
+                                 on_status, 10)
         node.create_subscription(Image, "/line_integration_test/line/debug_image",
                                  lambda m: debug.__setitem__(slice(None), [m]), qos_profile_sensor_data)
         node.create_subscription(PolygonStamped, "/line_integration_test/line/centerline",
@@ -186,6 +192,21 @@ def main():
                 return any(m["kind"] == ("final" if terminal else "intermediate") for m in found)
 
             pump(separated_and_detected, crossing)
+        if max_processing_fps > 0.:
+            source_stamps.clear()
+            started=time.monotonic()
+            next_publish=0.
+            while time.monotonic()-started < 2.:
+                if time.monotonic() >= next_publish:
+                    frame=bridge.cv2_to_imgmsg(crossing,encoding='bgr8')
+                    frame.header.stamp=node.get_clock().now().to_msg()
+                    frame.header.frame_id='camera_optical_frame'
+                    publisher.publish(frame)
+                    next_publish=time.monotonic()+.05
+                rclpy.spin_once(node,timeout_sec=.003)
+            count=len(set(source_stamps))
+            assert 3 <= count <= int(max_processing_fps*2)+3, count
+            print(f'PASS: processing cap {max_processing_fps}Hz, {count} distinct results in 2 seconds')
         pump(lambda: status.get("state") == "STALE_FRAME", seconds=3)
         assert status["lost"] and status["error_pixels"] is None
         pump(lambda: bool(estimated) and not estimated[0].polygon.points, seconds=2)

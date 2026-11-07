@@ -1,0 +1,49 @@
+# 相机点 → 探头触碰测试。先把机器人放在拍照姿态；启动后自动执行。
+# 当前测试点：相对相机光心 (15, 15, 160) 毫米。
+camera_detection_task:
+  ros__parameters:
+    joint_postures_enabled: true
+    camera_frame: terminal_link_1  # 已确认原点为光心，X右、Y下、Z沿镜头向前
+    probe_frame: terminal_link_2   # 探针实际触点，不是 tool0
+    base_frame: base_link
+    target_source: local
+    # 多点按 x1,y1,z1,x2,y2,z2... 填写；所有数字带小数点，保持ROS浮点数组类型一致。
+    # 每个点完成后返回启动时原位。
+    camera_points_mm: [15.0, 15.0, 160.0]
+    startup_timeout: 300.0  # 包含冷启动上电、释放抱闸及控制栈就绪等待
+    capture_timeout: 240.0
+    result_timeout: 300.0
+    contact_timeout: 600.0
+    max_reacquire_retries: 3  # 仅TCP新拍照取点模式自动重试
+    hold_position_tolerance: 0.001
+    hold_angle_tolerance_deg: 0.5
+    report_directory: ~/.ros/camera_probe_touch
+
+detect_controller:
+  ros__parameters:
+    touch_control_mode: moveit_force_guard
+    joint_postures_enabled: true
+    initial_position_enabled: false  # 以启动时的实际拍照姿态为原位
+    workspace_min: [-1.0, -1.0, 0.08]
+    target_source: camera
+    targets_file: ~/.ros/detect_control/camera_probe_touch_targets.yaml
+    # 各到位目标沿用启动时 tool0 朝向，中途允许规划器调整姿态。
+    # 下探时仍检查姿态；检测点自身只填写 XYZ。
+    lock_tool_orientation: false
+    orientation_tolerance_deg: 1.0
+    approach_axis: tool_positive_z  # 预接近到位后冻结 tool0 局部+Z，当前姿态下朝下
+    continue_until_contact: true    # 未达20N时允许越过名义检测点，受额外行程限制
+    approach_clearance: 0.02        # 沿接近轴反方向退20mm作为预接近点
+    approach_speed: 0.002    # 2mm/s
+    moveit_cartesian_step: 0.005  # 5mm笛卡尔插值步长，整段只规划一次
+    max_penetration: 0.05  # 从预测检测点起，最多额外下探50mm
+    phase_timeout: 120.0
+    recover_approach_failure: true
+    recovery_settle_seconds: 0.5
+    require_thickness_measurement: true
+    contact_force: 20.0      # 接近轴方向力的绝对值达到20N时停止位置推进，并非恒力伺服
+    overload_force: 40.0
+    initial_force_limit: 5.0
+    hold_seconds: 5.0
+    velocity_scaling: 0.1
+    acceleration_scaling: 0.1

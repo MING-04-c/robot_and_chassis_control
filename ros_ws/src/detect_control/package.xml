@@ -2,11 +2,13 @@
 <package format="3">
   <name>detect_control</name>
   <version>0.1.0</version>
-  <description>Probe contact detection using calibrated camera targets and admittance control.</description>
+  <description>Probe contact detection using calibrated camera targets, MoveIt planning and optional admittance control.</description>
   <maintainer email="robot@example.com">robot</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>eli_cs_robot_moveit_config</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>

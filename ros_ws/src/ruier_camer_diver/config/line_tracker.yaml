@@ -1,5 +1,6 @@
 /**:
   ros__parameters:
+    opencv_threads: 2                 # 有限计算并行；1/2可对比，控制状态机仍串行
     input_topic: "image_raw"  # 默认命名空间 /camera -> /camera/image_raw
     frame_timeout_sec: 0.5
     processing_width: 640     # 按比例缩小，不放大；以下像素参数均基于处理图

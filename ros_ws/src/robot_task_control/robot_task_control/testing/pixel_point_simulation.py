@@ -198,7 +198,9 @@ class PixelPointSimulation(Node):
         if not self.mock_verified:
             return
         phase = self.detect_status.get('state')
-        contact_phases = ('DESCEND', 'COMPLIANT_HOLD', 'STOP_CONTACT', 'HOLD')
+        contact_phases = ('DESCEND', 'MOVEIT_PLAN_DESCENT', 'MOVEIT_DESCEND',
+                          'MOVEIT_WAIT_CONTACT', 'VERIFY_MOVEIT_SEGMENT',
+                          'COMPLIANT_HOLD', 'STOP_CONTACT', 'HOLD')
         if phase not in contact_phases:
             self.contact_latched = False
         elif self.target is not None and not self.contact_latched:

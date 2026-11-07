@@ -1,0 +1,34 @@
+# 纯底盘自动充电测试：离桩→首条有效横线停稳→等待5秒→原路倒车充电。
+workflow:
+  name: line_follow_charge_test
+  auto_start: true
+  lock_chassis_between_steps: true # 到站/结束后关闭速度输出，下一段循迹前重新放行
+  steps:
+  - &stopped
+    action: wait_chassis_stopped
+    stable_seconds: 1.0
+    step_timeout_sec: 15.0
+  - action: line_follow
+    drive_direction: forward
+    finish_at_first_marker: true   # 起步出发线仍按原规则忽略，下一条有效横线即到站
+    until_untrusted: true
+    require_final_marker: true
+    boundary_wait_sec: 5.0
+    progress_timeout_sec: 5.0
+    step_timeout_sec: 900.0
+  - *stopped
+  - action: save_line_route       # 保留完整前进路线和里程计坐标，等待不修改快照
+    step_timeout_sec: 10.0
+  - action: delay
+    seconds: 5.0
+    step_timeout_sec: 10.0
+  - action: line_follow
+    drive_direction: reverse
+    skip_intermediate_markers: true
+    return_to_start: true
+    until_untrusted: true
+    require_final_marker: true
+    boundary_wait_sec: 5.0
+    progress_timeout_sec: 5.0
+    step_timeout_sec: 900.0
+  - *stopped

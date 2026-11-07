@@ -51,6 +51,8 @@ class CameraDetectionTask(Node):
         def param(name, value):
             return self.declare_parameter(name, value).value
 
+        self.joint_postures_enabled = bool(param('joint_postures_enabled', False))
+        self.posture_prepared = False
         self.base = param('base_frame', 'base_link')
         self.camera = param('camera_frame', 'terminal_link_1')
         self.probe = param('probe_frame', 'terminal_link_2')
@@ -69,6 +71,18 @@ class CameraDetectionTask(Node):
         if self.target_source == 'tcp':
             from robot_task_control.final_capture import load_config
             self.storage = Path(load_config(self.capture_config_file)['output_dir']).expanduser()
+        self.max_reacquire_retries = int(param('max_reacquire_retries', 3))
+        if not 0 <= self.max_reacquire_retries <= 10:
+            raise ValueError('max_reacquire_retries 必须为0～10')
+        self.retry_count = 0
+        self.home_recorded = False
+        self.root_run_id = None
+        self.point_ids = []
+        self.completed_point_ids = set()
+        self.reported_result_ids = set()
+        self.expected_point_ids = set()
+        self.return_events = set()
+        self.completion_wait_started = None
         self.capture_process = None
         self.results = deque(maxlen=16)
         self.report_dir = Path(param('report_directory', '~/.ros/camera_detection')).expanduser()
@@ -92,12 +106,17 @@ class CameraDetectionTask(Node):
         self.cancel_future = None
         self.started_detection = False
         self.run_id = uuid4().hex
+        self.root_run_id = self.run_id
         self.snapshot = None
         self.targets = []
         self.holds = 0
         self.ready_since = None
         retained = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.status_pub = self.create_publisher(String, '/task_controller/status', retained)
+        self.point_result_pub = self.create_publisher(String, '/task_controller/detection_result',
+                                                     QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, '/detect_controller/point_result', self.on_point_result,
+                                 QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.target_pub = self.create_publisher(PoseArray, '/geminipro_calibration/targets_base', 10)
         self.create_subscription(String, '/detect_controller/status', self.on_detect, 10)
         if self.target_source == 'tcp':
@@ -106,6 +125,7 @@ class CameraDetectionTask(Node):
                                                      self.on_external, retained)
         self.hardware_client = self.create_client(ListHardwareComponents,
                                                   '/controller_manager/list_hardware_components')
+        self.prepare_client = self.create_client(Trigger, '/detect_controller/prepare_detection')
         self.record_client = self.create_client(Trigger, '/detect_controller/record_home')
         self.clear_client = self.create_client(Trigger, '/detect_controller/clear_targets')
         self.start_client = self.create_client(Trigger, '/detect_controller/start')
@@ -116,6 +136,55 @@ class CameraDetectionTask(Node):
             f'真机相机点检测：target_source={self.target_source}；'
             + ('稳定采图后等待本次TCP检测点，收到即自动限力触碰'
                if self.target_source == 'tcp' else '直接使用YAML毫米点，就绪后自动限力触碰'))
+
+    def on_point_result(self, message):
+        """只有确认回原位的本批结果才回传；读数在接触保持时冻结。"""
+        try:
+            result = json.loads(message.data)
+            if (self.phase != 'RUNNING' or result.get('schema') != 'paint_detection_point_result_v1'
+                    or result.get('batch_id') != self.detect.get('batch_id')
+                    or result.get('returned_home') is not True):
+                return
+            identity = result['result_id']
+            index = result['point_index']-1
+            if identity in self.reported_result_ids or not 0 <= index < len(self.targets):
+                return
+            point_id = self.point_ids[index] if index < len(self.point_ids) else f'point_{index+1}'
+            output = dict(result, run_id=self.run_id, root_run_id=self.root_run_id, point_id=point_id,
+                          retry_count=self.retry_count,
+                          capture_manifest_sha256=(self.snapshot or {}).get('capture_manifest_sha256'))
+            encoded = json.dumps(output, ensure_ascii=False, allow_nan=False)
+            path = self.report_dir/'point_results.jsonl'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(encoded+'\n')
+            self.point_result_pub.publish(String(data=encoded))
+            self.reported_result_ids.add(identity)
+            self.return_events.add((result['batch_id'], result['point_index']))
+            if result.get('success') and result.get('measurement') is not None:
+                self.completed_point_ids.add(point_id)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            self.get_logger().error('逐点回位结果处理失败：'+str(error))
+
+    def schedule_reacquire(self, reason):
+        """已经返回原位后才能重拍；本地固定点模式不假装产生新照片/新检测点。"""
+        if self.target_source != 'tcp':
+            raise ValueError('已安全回原位；本地固定点模式需更新坐标后重启：'+reason)
+        if self.retry_count >= self.max_reacquire_retries:
+            raise ValueError('重新拍照取点重试次数已用完：'+reason)
+        self.stop_capture()
+        self.retry_count += 1
+        self.started_detection = False
+        self.results.clear()
+        self.holds = 0
+        self.completion_wait_started = None
+        self.targets = []
+        self.point_ids = []
+        self.snapshot = None
+        self.ready_since = None
+        self.posture_prepared = False
+        self.run_id = uuid4().hex  # 每次新拍照使用新身份，拒绝上一次的结果。
+        self.transition('WAIT_READY', f'已回原位，准备第{self.retry_count}次重拍取点：'+reason)
 
     def stop_request(self, request, response):
         del request
@@ -178,7 +247,7 @@ class CameraDetectionTask(Node):
     def ready(self):
         return (self.connected() and monotonic()-self.detect_at < 1.
                 and self.detect.get('motion_ready') is True
-                and self.detect.get('state') in ('IDLE', 'DONE')
+                and self.detect.get('state') in ('IDLE', 'DONE', 'RETRY_REQUIRED', 'READY_DETECTION', 'READY_TRAVEL')
                 and all(client.service_is_ready() for client in (
                     self.record_client, self.clear_client, self.start_client, self.cancel_client)))
 
@@ -195,6 +264,8 @@ class CameraDetectionTask(Node):
             'run_id': self.run_id, 'state': self.phase, 'message': self.detail,
             'snapshot': self.snapshot, 'targets_base': [x.tolist() for x in self.targets],
             'detect_status': self.detect, 'hold_events': self.holds,
+            'root_run_id': self.root_run_id, 'retry_count': self.retry_count,
+            'completed_point_ids': sorted(self.completed_point_ids),
         }, ensure_ascii=False, indent=2))
         temporary.replace(path)
 
@@ -214,11 +285,24 @@ class CameraDetectionTask(Node):
             run_id=self.run_id, base_frame=self.base, camera_frame=self.camera,
             probe_frame=self.probe, source=str(self.target_source),
             camera_points_mm=self.points_mm.tolist())
+        if not self.point_ids:
+            self.point_ids = [f'point_{i+1}' for i in range(len(self.points_mm))]
+        self.snapshot['point_ids'] = list(self.point_ids)
         self.targets = frozen_probe_targets(self.snapshot['base_T_camera'],
                                             self.snapshot['base_T_probe'], self.points_mm)
         self.get_logger().info('基座下探针目标（米）：'+str([x[:3, 3].tolist() for x in self.targets]))
         self.operation = self.clear_client.call_async(Trigger.Request())
         self.transition('CLEAR_TARGETS', f'{self.target_source}模式 {len(self.targets)} 个点转换完成；清空旧目标')
+
+    def publish_targets(self):
+        message = PoseArray()
+        message.header.frame_id = self.base
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.poses = [to_pose(goal) for goal in self.targets]
+        self.target_stamp = {"sec": message.header.stamp.sec, "nanosec": message.header.stamp.nanosec}
+        self.target_pub.publish(message)
+        self.published_at = monotonic()
+        self.transition('WAIT_TARGETS', '等待检测器确认整组探针目标；保持同一记录原位')
 
     def begin_capture(self):
         self.snapshot.update(run_id=self.run_id, source='tcp',
@@ -250,7 +334,21 @@ class CameraDetectionTask(Node):
                 continue
             if not self.ready():
                 raise ValueError('收到检测点，但真实力或运动接口未就绪，取消本轮')
-            self.points_mm = points
+            entries = payload.get('points_xyz_camera_mm', [])
+            ids = [item.get('point_id') for item in entries]
+            if len(ids) != len(points) or any(not isinstance(value, str) or not value for value in ids) or len(set(ids)) != len(ids):
+                raise ValueError('主机检测点必须携带唯一point_id，保证重拍后不重复已成功的点')
+            if self.expected_point_ids:
+                pending = self.expected_point_ids-self.completed_point_ids
+                if not pending.issubset(set(ids)) or not set(ids).issubset(self.expected_point_ids):
+                    raise ValueError('重拍后point_id必须与原检测任务对应，且包含所有剩余点；不按新ID重测旧点')
+            else:
+                self.expected_point_ids = set(ids)
+            selected = [i for i, identity in enumerate(ids) if identity not in self.completed_point_ids]
+            if not selected:
+                raise ValueError('重拍结果没有剩余待测点；不复测已经成功的点')
+            self.point_ids = [ids[i] for i in selected]
+            self.points_mm = points[selected]
             self.snapshot['result_message_id'] = payload['message_id']
             self.prepare_targets()
             return
@@ -291,6 +389,14 @@ class CameraDetectionTask(Node):
             if not self.ready():
                 self.ready_since = None
                 return
+            if self.joint_postures_enabled is True and self.home_recorded is True and not self.posture_prepared:
+                if not self.prepare_client.service_is_ready():
+                    self.detail = '等待检测关节姿态准备接口'
+                    return
+                self.started_detection = True
+                self.operation = self.prepare_client.call_async(Trigger.Request())
+                self.transition('PREPARE_DETECTION', '经准备关节姿态恢复原拍照姿态，再冻结新照片坐标')
+                return
             try:
                 camera, probe = self.pose(self.camera), self.pose(self.probe)
             except (TransformException, ValueError):
@@ -309,6 +415,21 @@ class CameraDetectionTask(Node):
             return
         if not self.connected():
             raise ValueError('真机外控已断开，取消本轮')
+        if self.phase == 'PREPARE_DETECTION':
+            if self.operation_complete():
+                self.transition('WAIT_PREPARE_DETECTION', '等待检测准备关节姿态实际到位')
+            return
+        if self.phase == 'WAIT_PREPARE_DETECTION':
+            if self.detect.get('state') == 'FAULT':
+                raise ValueError(self.detect.get('message', '检测准备姿态不可达'))
+            if monotonic()-self.since > self.timeouts['startup']:
+                raise ValueError('检测准备关节姿态到位超时')
+            if self.ready() and self.detect.get('state') == 'READY_DETECTION':
+                self.posture_prepared = True
+                self.started_detection = False
+                self.ready_since = None
+                self.transition('WAIT_READY', '检测准备姿态已到位，开始稳定拍照等待')
+            return
         if self.phase in ('CAPTURE', 'WAIT_RESULT', 'CLEAR_TARGETS', 'RECORD_HOME', 'WAIT_TARGETS'):
             self.check_stationary()
         if self.phase == 'CAPTURE':
@@ -320,18 +441,20 @@ class CameraDetectionTask(Node):
                 raise ValueError('等待主机本次结果超时，不使用旧点继续运动')
             self.consume_result()
         elif self.phase == 'CLEAR_TARGETS' and self.operation_complete():
-            self.operation = self.record_client.call_async(Trigger.Request())
-            self.transition('RECORD_HOME', '旧队列已清空，记录当前六轴关节原位')
+            if self.home_recorded:
+                self.publish_targets()
+            else:
+                self.operation = self.record_client.call_async(Trigger.Request())
+                self.transition('RECORD_HOME', '旧队列已清空，记录本轮唯一六轴关节原位')
         elif self.phase == 'RECORD_HOME' and self.operation_complete():
-            message = PoseArray()
-            message.header.frame_id = self.base
-            # 本地点位在启动位置冻结后，发布为当前基座目标。
-            message.header.stamp = self.get_clock().now().to_msg()
-            message.poses = [to_pose(goal) for goal in self.targets]
-            self.target_pub.publish(message)
-            self.published_at = monotonic()
-            self.transition('WAIT_TARGETS', '等待检测器确认整组探针目标')
+            self.home_recorded = True
+            self.publish_targets()
         elif self.phase == 'WAIT_TARGETS':
+            rejection = self.detect.get('target_rejection') or {}
+            if (self.detect_at > self.published_at and rejection.get('stamp') == self.target_stamp
+                    and str(rejection.get('message', '')).startswith('TARGET_UNREACHABLE:')):
+                self.schedule_reacquire(rejection['message'])  # 尚未运动，且前面已确认拍照原位静止。
+                return
             if monotonic()-self.since > 5.:
                 raise ValueError('检测器没有确认新目标，检查工作空间和坐标')
             if self.detect_at > self.published_at and self.detect.get('queued_points') == len(self.targets):
@@ -340,20 +463,55 @@ class CameraDetectionTask(Node):
                 self.started_detection = True
                 self.operation = self.start_client.call_async(Trigger.Request())
                 self.transition('STARTING', '启动真实限力检测')
-        elif self.phase == 'STARTING' and self.operation_complete():
-            self.transition('RUNNING', '规划预接近、20 N 停止推进、保持 5 秒、逐点回原位')
+        elif self.phase == 'STARTING':
+            if self.operation.done():
+                response = self.operation.result()
+                if not response.success and response.message.startswith('TARGET_UNREACHABLE:'):
+                    self.check_stationary()  # 服务拒绝发生在实际运动之前，仍须确认拍照原位。
+                    self.schedule_reacquire(response.message)
+                    return
+            if self.operation_complete():
+                self.transition('RUNNING', '限5cm额外接近、20N停止、保持5秒、逐点回原位并回传厚度')
         elif self.phase == 'RUNNING':
             if monotonic()-self.detect_at > 2.:
                 raise ValueError('检测状态断流')
+            if self.detect.get('state') == 'RETRY_REQUIRED':
+                if self.detect.get('returned_home') is not True or not self.home_recorded:
+                    raise ValueError('重拍前未取得回原位确认')
+                if not self.return_results_ready():
+                    return
+                self.schedule_reacquire((self.detect.get('retry_context') or {}).get('message', '接近未完成'))
+                return
             if self.detect.get('state') == 'FAULT':
                 raise ValueError(self.detect.get('message', '检测失败'))
             if monotonic()-self.since > self.timeouts['contact']:
                 raise ValueError('整组检测超时')
             if self.detect.get('state') == 'DONE':
+                if not self.return_results_ready():
+                    return
+                if any(identity not in self.completed_point_ids for identity in self.point_ids):
+                    raise ValueError('已回位但缺少本批有效测厚结果，未宣布成功')
                 if self.detect.get('completed_points') != len(self.targets) or self.holds != len(self.targets):
                     raise ValueError('缺少整组触碰保持完成证据')
                 self.started_detection = False
-                self.transition('DONE', '本轮所有检测点完成并返回测试初始位置')
+                self.transition('DONE', '本轮所有检测点完成并返回配置行驶姿态'
+                                if self.joint_postures_enabled is True else '本轮所有检测点完成并返回测试初始位置')
+
+    def return_results_ready(self):
+        """跨话题到达顺序不保证一致；最多等2秒收齐已回位的事件。"""
+        count = int(self.detect.get('completed_points', 0))
+        retry = self.detect.get('retry_context') or {}
+        if retry.get('code') == 'measurement_missing':
+            count += 1  # 失败的采集同样要上报，不能被重拍覆盖。
+        batch = self.detect.get('batch_id')
+        if all((batch, index) in self.return_events for index in range(1, count+1)):
+            self.completion_wait_started = None
+            return True
+        if self.completion_wait_started is None:
+            self.completion_wait_started = monotonic()
+        elif monotonic()-self.completion_wait_started > 2.:
+            raise ValueError('回位结果话题缺失，停止重拍或宣布成功，防止丢失测厚记录')
+        return False
 
     def fail(self, message):
         if self.phase not in ('FAULT', 'DONE'):
@@ -375,6 +533,7 @@ class CameraDetectionTask(Node):
             'message': self.detail, 'run_id': self.run_id,
             'detect_state': self.detect.get('state'),
             'completed_points': self.detect.get('completed_points', 0),
+            'retry_count': self.retry_count, 'completed_point_ids': sorted(self.completed_point_ids),
             'capture_manifest_sha256': (self.snapshot or {}).get('capture_manifest_sha256'),
         }, ensure_ascii=False)))
 

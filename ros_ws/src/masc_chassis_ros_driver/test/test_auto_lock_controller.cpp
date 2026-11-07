@@ -21,7 +21,7 @@ AutoLockUpdateInput Input(MotionMode mode, int tick) {
 }
 
 TEST(AutoLockController, LowSpeedAccumulatesAndUnlocksAfterIdle) {
-    for (const double speed : {0.025, -0.025}) {
+    for (const double speed : {0.012, -0.012, 0.025, -0.025}) {
         AutoLockController controller;
         controller.Configure(AutoLockConfig{});
         controller.Update(Input(MotionMode::Park, 0));
@@ -67,6 +67,23 @@ TEST(AutoLockController, BelowThresholdNoiseDoesNotUnlock) {
         auto input = Input(MotionMode::Park, tick);
         input.m_command.m_target_linear_x_mps = 0.005;
         EXPECT_EQ(controller.Update(input).m_action, AutoLockAction::None);
+    }
+}
+
+TEST(AutoLockController, TerminalCreepDoesNotParkWhileCommandIsActive) {
+    for (const double speed : {0.012, -0.012}) {
+        AutoLockController controller;
+        controller.Configure(AutoLockConfig{});
+        controller.Update(Input(MotionMode::DefaultChassis, 0));
+        for (int tick = 1; tick <= 400; ++tick) {
+            auto input = Input(MotionMode::DefaultChassis, tick);
+            input.m_command.m_target_linear_x_mps = speed;
+            // 即使反馈被归入“停稳”范围，持续有效的爬行指令也不能触发驻车。
+            input.m_motion_feedback->m_current_linear_x_mps = speed;
+            const auto result = controller.Update(input);
+            EXPECT_EQ(result.m_action, AutoLockAction::None);
+            EXPECT_DOUBLE_EQ(result.m_command.m_target_linear_x_mps, speed);
+        }
     }
 }
 

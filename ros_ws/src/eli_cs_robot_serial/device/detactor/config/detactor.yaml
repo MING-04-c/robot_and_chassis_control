@@ -1,4 +1,5 @@
-# 探测器专用配置。真实串口与模拟设备使用相同的 ROS 接口。
+# 测厚仪默认使用原串口115200、8N1；TCP仅作为可选调试方式。
+# 若使用串口转网口模块，其串口侧仍需设置为115200、8位、1停止位、无校验。
 
 serial_node:
   ros__parameters:
@@ -21,6 +22,7 @@ serial_node:
     # 探测器专用 ROS 接口，统一放在 /detactor 下，避免和其他串口串台。
     text_topic: /detactor/rx
     bytes_topic: /detactor/rx_bytes
+    connected_topic: /detactor/connected
     write_service: /detactor/write
     send_file_service: /detactor/send_file
     tx_string_topic: /detactor/tx
@@ -28,8 +30,35 @@ serial_node:
     tx_int_topic: /detactor/tx_int
     publish_wrench: false
 
+
+tcp_node:
+  ros__parameters:
+    mode: client
+    host: 169.254.199.90
+    port: 9001
+    connect_timeout: 1.0
+    reconnect_period: 2.0
+    # 原始接收：字节数组及完整HEX；不强行转换二进制为文本。
+    publish_text: false
+    hex_topic: /detactor/rx_hex
+    # TCP是字节流，保留原.d0<:>命令，不添加换行；交由采集节点按.e...<:>组帧。
+    line_mode: false
+    append_newline: false
+    text_topic: /detactor/rx
+    bytes_topic: /detactor/rx_bytes
+    write_service: /detactor/write
+    send_file_service: /detactor/send_file
+    tx_string_topic: /detactor/tx
+    tx_float_topic: /detactor/tx_float
+    tx_int_topic: /detactor/tx_int
+    connected_topic: /detactor/connected
+
 detactor_node:
   ros__parameters:
+    require_transport_connection: true
+    task_once: false
+    acquisition_timeout: 3.0
+    connected_topic: /detactor/connected
     # 触发一次采集时发给探测器的命令。
     request_command: .d0<:>
     # 完整返回帧的开始和结束标记。
@@ -45,13 +74,18 @@ detactor_node:
     request_period: 1.0
 
     # 保存目录：启动后使用此目录。latest.txt 保存当前最新 10 个数，测量文件滚动保存。
-    data_directory: device/detactor/data
+    data_directory: ~/.ros/eli_cs_robot_serial/detactor
+
+    # 直接处理字节流，保留并正确处理仪器回包中的NUL填充。
+    use_bytes_rx: true
+    rx_bytes_topic: /detactor/rx_bytes
 
     # 设备节点接口。
     rx_topic: /detactor/rx
     frame_topic: /detactor/frame
     latest_topic: /detactor/latest
     latest_values_topic: /detactor/latest_values
+    latest_value_topic: /detactor/latest_value  # Float64，单次最新有效读数，不是10个数的窗口
     write_service: /detactor/write
     trigger_topic: /detactor/acquire_trigger
     trigger_service: /detactor/acquire

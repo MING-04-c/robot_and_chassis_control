@@ -1,0 +1,39 @@
+# 自动测试：行驶位→第一条有效横线→中转位→等待5s→行驶位→原路倒车充电。
+# 两组关节角共用 eli_cs_robot_moveit_config/config/arm_joint_postures.yaml，单位度。
+workflow:
+  name: line_follow_arm_return_charge_test
+  auto_start: true
+  arm_postures_before_chassis: true  # 每次底盘移动前自动插入行驶位，并等待实际到位
+  steps:
+  - &wait_stopped
+    action: wait_chassis_stopped
+    stable_seconds: 1.0
+    step_timeout_sec: 15.0
+  - action: line_follow
+    drive_direction: forward
+    finish_at_first_marker: true    # 忽略出发横线后，第一条有效横线到位即结束前进
+    until_untrusted: true
+    require_final_marker: true      # 丢线不能充当到站；first模式允许途中横线作为本站目标
+    boundary_wait_sec: 5.0
+    progress_timeout_sec: 5.0
+    step_timeout_sec: 900.0
+  - *wait_stopped
+  - action: save_line_route         # 先停稳封存；机械臂动作/延时不重新录制或清空里程计
+    step_timeout_sec: 10.0
+  - action: arm_posture
+    posture: detection_ready        # [-45, 0, 0, 0, 90, 0]度，实际到位才开始下一步计时
+    step_timeout_sec: 600.0
+  - action: delay
+    seconds: 5.0
+    step_timeout_sec: 10.0
+  # arm_postures_before_chassis会在下方倒车前自动恢复行驶位。
+  - action: line_follow
+    drive_direction: reverse
+    skip_intermediate_markers: true
+    return_to_start: true
+    until_untrusted: true
+    require_final_marker: true
+    boundary_wait_sec: 5.0
+    progress_timeout_sec: 5.0
+    step_timeout_sec: 900.0
+  - *wait_stopped

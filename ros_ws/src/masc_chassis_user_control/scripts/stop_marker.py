@@ -13,6 +13,19 @@ def travel_image_sign(config):
     return -front if config.drive_direction == 'reverse' else front
 
 
+def _median_pair_slope(points, axis, min_span):
+    """输入二维点、分母坐标轴及最小跨度；返回成对斜率中位数，无有效对时返回None。"""
+    if len(points) < 2:
+        return None
+    values = np.asarray(points, dtype=np.float64)
+    denominator = values[:, axis, None]-values[None, :, axis]
+    numerator = values[:, 1-axis, None]-values[None, :, 1-axis]
+    valid = np.triu(np.abs(denominator) >= min_span, k=1)
+    if not np.any(valid):
+        return None
+    return float(np.median(numerator[valid]/denominator[valid]))
+
+
 def detect_stop_markers(mask, points, config, reference=None, diagnostics=None):
     """输入同尺寸单通道蓝线掩膜、实测中线点；输出横线交点及后续主线类别。"""
     diagnostics = {} if diagnostics is None else diagnostics
@@ -48,12 +61,10 @@ def detect_stop_markers(mask, points, config, reference=None, diagnostics=None):
         length = math.hypot(dx, dy)
         middle_y = (y1+y2) / 2.0
         local = [(x, y) for x, y in points if abs(y-middle_y) <= 0.14 * height]
-        slopes = [(a[0]-b[0])/(a[1]-b[1]) for i, a in enumerate(local)
-                  for b in local[i+1:] if abs(a[1]-b[1]) >= 3]
-        if not slopes or len(local) < 3 or max(y for _, y in local)-min(y for _, y in local) < .04*height:
+        slope = _median_pair_slope(local, 1, 3)
+        if slope is None or len(local) < 3 or max(y for _, y in local)-min(y for _, y in local) < .04*height:
             reject('mainline_support')
             continue
-        slope = median(slopes)
         intercept = median(x-slope*y for x, y in local)
         if (reference is not None and 'main_slope' in reference
                 and abs(middle_y-reference['y']) < .08*height):
@@ -104,11 +115,9 @@ def detect_stop_markers(mask, points, config, reference=None, diagnostics=None):
                 if np.count_nonzero(selected) >= 8:
                     samples.append((float(np.median(wing_x[selected])),
                                     float(np.median(wing_y[selected]))))
-            bar_slopes = [(b[1]-a[1])/(b[0]-a[0]) for i, a in enumerate(samples)
-                          for b in samples[i+1:] if abs(b[0]-a[0]) >= 2*bin_width]
-            if not bar_slopes:
+            bar_slope = _median_pair_slope(samples, 0, 2*bin_width)
+            if bar_slope is None:
                 continue
-            bar_slope = median(bar_slopes)
             bar_intercept = median(y-bar_slope*x for x, y in samples)
             divisor = 1-bar_slope*slope
             if abs(divisor) < 1e-6:
@@ -256,7 +265,7 @@ class StopMarkerGate:
             self.ignore_measured_distance += distance
             self.ignore_measured_unseen += distance
 
-    def observe(self, candidates, height, config, now=None):
+    def observe(self, candidates, height, config, now=None, start_alignment=False):
         """每张新图像调用一次；缺失帧不以零误差混入平均值。"""
         now = monotonic() if now is None else now
         self.height = height
@@ -324,7 +333,8 @@ class StopMarkerGate:
         if match is None and self.marker is None and not self.stopped:
             # 已选中的停车目标漏检/跳变时保留目标，不改追后面一条横线。
             # 启动时已略过中心的横线也需识别；轻微越线可作为到达。
-            ahead = [m for m in remaining if distance(m) >= -2*config.stop_marker_overshoot_tolerance_ratio]
+            ahead = (list(remaining) if start_alignment else
+                     [m for m in remaining if distance(m) >= -2*config.stop_marker_overshoot_tolerance_ratio])
             match = min(ahead, key=lambda m: abs(distance(m)), default=None)
             if match is not None:
                 self.current_identity = self.ledger.encounter(match)
@@ -438,13 +448,18 @@ class StopMarkerGate:
             return 'settling'
         return 'stopped_'+(self.latched_kind or 'unknown')
 
-    def limit(self, speed, config, now=None):
+    def limit(self, speed, config, now=None, dt=.02):
         """平均位置未到时持续靠近；到位/轻微越线为零速，不自动倒车。"""
         state = self.state(config, now)
         if state == 'searching':
             return speed, state
         if state in ('approaching', 'missing_approaching'):
             cap = config.stop_marker_creep_speed
+            if (state == 'missing_approaching' and self.dropout_commanded_distance
+                    + min(abs(speed), cap)*max(0., dt) > config.stop_marker_dropout_max_distance+1e-9):
+                # 提高有效爬行速度后仍不能扩大漏检行程；下一周期会越界则先停车，
+                # 不把剩余微小距离换成低于驻车门槛的持续速度指令。
+                return 0., 'missing'
             if state == 'approaching' and len(self.samples) == config.stop_marker_average_frames:
                 cap = max(cap, config.forward_speed*min(1., self.error/config.stop_marker_slowdown_ratio))
             return math.copysign(min(abs(speed), cap), speed), state
@@ -458,6 +473,26 @@ class StopMarkerGate:
         self.ignored, self.station_id, self.ledger = ignored, station_id, ledger
         self.ignored_identity = identity
         self.ledger.record('resumed', identity, ignored)
+        return True
+
+    def complete_start_alignment(self, config, marker=None):
+        """Release the aligned departure bar without requiring it to be intermediate."""
+        selected = marker if marker is not None else self.marker
+        if selected is None:
+            return False
+        ignored = dict(selected)
+        identity = self.current_identity
+        ledger = self.ledger
+        station_id = self.station_id
+        if identity is None:
+            identity = ledger.encounter(ignored, 'ignored_departure')
+        self.reset(allow_start_marker=False)
+        self.ignored, self.ignored_identity = ignored, identity
+        self.station_id, self.ledger = station_id, ledger
+        self.startup_checked = True
+        self.startup_ignored = True
+        self.ignore_commanded_distance = 0.0
+        self.ignore_measured_distance = self.ignore_measured_unseen = 0.0
         return True
 
     def snapshot(self, config):

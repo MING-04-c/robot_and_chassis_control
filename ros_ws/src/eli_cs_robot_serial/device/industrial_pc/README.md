@@ -11,3 +11,11 @@
 命令固定桥接/task_controller/start、/stop、/capture及/line_follow/resume。采集与运动互斥，同ID请求持久去重。收到坐标只发布/industrial_pc/camera_points，演示点为/industrial_pc/demo_camera_points，不自动执行触碰。
 
 详细启动步骤见host_tools/QUICKSTART.md，线缆字段和检测点示例见项目根目录TCP通讯协议_麒麟工控机.md。
+
+## TCP通信与额外状态汇总开关
+
+`industrial_pc.launch.py enable_status_monitor:=false` 保留9010 TCP监听、任务开始/停止/继续、
+基础任务查询和原有结果通道，关闭正常/异常汇总、相关日志订阅与汇总定时器。
+基础状态回包中的`status_monitor_enabled`为false，`normal_status`和`abnormal_status`为null；
+单独查询normal/abnormal会明确返回未启用。此开关不关闭设备运动保护。
+默认值为true，已有启动方式保持原行为。

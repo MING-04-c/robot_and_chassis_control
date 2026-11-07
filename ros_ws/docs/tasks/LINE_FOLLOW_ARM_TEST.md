@@ -1,104 +1,173 @@
-# 底盘循迹与机械臂四点联动测试
+# 循迹各站点与机械臂姿态联动测试
 
-入口：`robot_task_control/launch/line_follow_arm_test.launch.py`。流程定义：`robot_task_control/config/line_follow_arm_test.yaml`。
+入口：`ros2 launch robot_task_control line_follow_arm_test.launch.py`。
 
-## 动作顺序
+当前“行车位→循迹到站→过渡位等待5秒→行车位→沿记录路线返程”的完整实车方案见
+[机械臂与小车整体往返测试](ARM_CHASSIS_ROUND_TRIP_TEST.md)。
+该方案用 `test_profile:=return_charge start_tcp:=true enable_status_monitor:=false`，
+保持9010 TCP通信，关闭额外状态汇总；首次默认自动执行。
 
-1. 启动机械臂驱动、MoveIt、力传感器、底盘驱动、USB 循迹相机、识别、循迹控制及速度选择器。按现有就绪流程检查设备、外控和控制器，驱动连续稳定等待默认 5 秒。
-2. 设备就绪后自动开始任务，无需调用 start 服务。读取 `/wheel_odom`，连续 1 秒满足线速度 ≤0.005 m/s、角速度 ≤0.02 rad/s，才进入机械臂初始准备。反馈必须新鲜，旧的零速消息不能放行。
-3. 比较 tool0 实际位置和方向与初始点 P1；位置误差 ≤5 mm **且**方向误差 ≤1°时跳过重复移动，否则 MoveIt 规划并运动到 P1。只位置相同、角度不同，仍需运动到目标方向。初始点规划失败就停止流程，不开始循迹。
-4. 底盘沿识别轨迹行走。90°横线两侧均伸出主线才作为停止标记，接近时降速，横线交点到单帧相机图像高度50%时停车（最近5帧取平均；未到容差图高0.8%，轻微越过不超过图高2%也算到达，480高对应+3.84/−9.6像素）。前方仍有主线为途中站，保持停车等待新的 `/line_follow/resume` 消息，收到后才继续；不在途中站执行后续机械臂点位。前方无主线、视野和连续确认足够的 T 形标记为最终站，居中停车后才进入停稳确认。无法区分时停住，不猜成最终站。当前 YAML 要求 `require_final_marker: true`：普通丢线5秒未恢复会中止，不能再当成正常走完；行走超时默认90秒，途中站等消息的时间不计入，但通信或图像失效仍会中止。
-5. 再次等待底盘连续停稳 1 秒。10 秒内不能确认停稳，就中止，不开始后面的机械臂运动。
-6. MoveIt 依次规划、执行 P2、P3、P4。每个点完成后等待 1 秒。每步必须成功才继续，不循环、不自动返回初始点。
-7. 在 P4 再确认底盘停稳，暂停循迹 USB 相机采流，保持底盘和机械臂驱动运行。等待3秒后按需启动 HK，相机收到新图像后至少预热3秒，连续8帧缩略图变化不超过阈值才保存一张 JPEG；关闭 HK。
-8. 按需启动深度相机，采用同样稳定检查，然后从同一 SDK FrameSet 保存 RGB、原始深度和本次参数；关闭深度相机。不打开相机预览、点云或额外标定界面。
-9. 照片先本地保存，再通过原有两个 TCP 通道发送：HK 为主机连接树莓派9002，RGB-D 为树莓派连接主机9030。成功后才完成任务；失败保留文件并报告，不能跳过。默认末尾步骤总超时300秒。
+该入口包含真机机械臂驱动、MoveIt、8cm地面碰撞场景、关节姿态任务、底盘驱动、速度选择器和USB循迹。沿用机械臂控制栈中的力传感器节点；本测试用MoveIt位置规划，不依赖单位标定和有效力数据。默认不启动HK、深度相机或拍照发送；默认加载9010状态桥，`remote_control:=true`时等待主机首次开始。
 
-| 点 | tool0 XYZ（米） | 固定轴 RPY（度） | 用途 |
-|---|---|---|---|
-| P1 | -0.05, 0.2, 0.475 | 0, 0, 90 | 初始点，循迹前到位 |
-| P2 | -0.13, 0.35, 0.8 | 0, 0, 90 | 循迹停稳后的第二点 |
-| P3 | 0.3, 0.165, 0.8 | 0, 0, 0 | 第三点 |
-| P4 | 0.3, 0.2, 0.6 | -160, 0, -77 | 最后运动点，随后原地拍照 |
+## 启动
 
-坐标系统一为机械臂 `base_link`，控制点为 `tool0`，旋转约定为 `Rz(yaw) Ry(pitch) Rx(roll)`。这些不是世界坐标：底盘移动后，点位随机械臂基座一起移动。这里使用 MoveIt 点到点规划，不要求两点间为直线，不执行触碰或 20 N 接触检测；规划使用当前更新后的机器人碰撞模型，现场桌面等环境物体仍需加入规划场景。
-
-## 启动与测试
-
-在工作区根目录的 `ros_ws` 中执行：
+先退出重复的机器人、底盘和循迹launch。在`ros_ws`执行：
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select robot_task_control
 source install/setup.bash
 sudo bash scripts/setup_can.sh auto
-ros2 launch robot_task_control line_follow_arm_test.launch.py \
-  robot_ip:=169.254.199.150 sensor_host:=169.254.199.80 launch_rviz:=true
+ros2 launch robot_task_control line_follow_arm_test.launch.py launch_rviz:=true
 ```
 
-本入口包含驱动，不能与已有同一套驱动同时启动。CAN 配置脚本需要在 launch 前运行；launch 不自动执行该脚本。该入口不启动海康拍照及照片传输；沿用现有机械臂控制框架，力传感器仍会启动并报告自身状态，但本流程全为 MoveIt 位置规划，不等待零偏和力数据；只有包含导纳动作的工作流才检查力反馈。默认在 launch 后等待设备就绪，然后自动执行四点流程。
+CAN脚本仍需手动运行，launch不执行sudo。机器人默认IP为169.254.199.150，可用`robot_ip`修改。已有机器人驱动时加`start_arm_driver:=false`；已有MoveIt时再加`start_moveit:=false`，安全监控和地面节点也必须已运行。
 
-启动前确认轨迹沿途及机械臂运动空间可用。launch 后会检查真机外控、控制器、MoveIt 接口、TCP 坐标变换和循迹设备，就绪后自动开始，无需打开另一个终端调用服务。
+## 自动执行顺序
 
-观察初始点到位、底盘前进、底盘停稳、机械臂第二第四点运动的顺序。状态和反馈：
+1. 等待驱动、外控、轨迹控制器、MoveIt和循迹设备就绪，确认底盘连续停稳1秒。
+2. 按关节目标回到行驶姿态，核查实际关节到位，再开始循迹。关节轨迹控制器保持该姿态。
+3. 每条途中停止横线到位后锁住底盘速度输出，保留循迹节点、驱动和路线记录。再次确认轮速连续停稳1秒。
+4. 机械臂到中转姿态，再执行下表四个笛卡尔测试点，最后按关节目标回中转姿态。
+5. 途中站等待下一次开始消息。收到后先经中转回行驶姿态，确认实际关节到位，再放行底盘并继续原来的循迹。
+6. 重复处理每个途中站。最终横线同样执行一次机械臂动作，结束后保持中转姿态，底盘输出保持锁住。
+
+中转姿态仅用于过渡；四点目标保留各自方向，不把中转姿态当作拍照或触碰姿态。
+
+| 姿态 | 基座、肩部、肘部、手腕1、手腕2、手腕3（度） |
+|---|---|
+| 行驶 | -45, 15, -71, 4.4, 148, 75 |
+| 中转 | -45, 0, 0, 0, 90, 0 |
+
+两组关节角统一修改：`src/eli_cs_robot_moveit_config/config/arm_joint_postures.yaml`。
+
+| 点 | tool0 XYZ，base_link下，米 | 固定轴RPY，度 |
+|---|---|---|
+| P1 | -0.05, 0.2, 0.475 | 0, 0, 90 |
+| P2 | -0.13, 0.35, 0.8 | 0, 0, 90 |
+| P3 | 0.3, 0.165, 0.8 | 0, 0, 0 |
+| P4 | 0.3, 0.2, 0.6 | -160, 0, -77 |
+
+本站动作集中在`config/line_follow_arm_test.yaml`的`workflow.station_steps`；最终站用YAML锚点复用同一组动作。更换拍照/检测动作只需替换这一处，中转和行驶保护保留。这里是四点位置测试，不执行20N触碰；所有路径运行时仍须通过MoveIt碰撞检查，当前四点整段路径尚未完成真机验证，规划失败就停止，不跳过该站继续开车。
+
+## 途中站继续
+
+首次启动默认自动执行。途中站动作完成后，发一次新的开始：
 
 ```bash
-ros2 node info /task_controller
+ros2 service call /task_controller/start std_srvs/srv/Trigger '{}'
+```
+
+也兼容原来的`/line_follow/resume` Empty消息。本站动作进行中收到继续请求会排队，必须等机械臂回行驶位才放行。未进入站点的提前消息不保留。工控机`start_task.py`在途中站的含义同上；首次等待主机开始时使用：
+
+```bash
+ros2 launch robot_task_control line_follow_arm_test.launch.py remote_control:=true
+```
+
+最终站结束后的start是新的一轮，不是继续穿过终点。
+
+## 状态与停止
+
+```bash
+ros2 topic echo /task_controller/status
+ros2 topic echo /arm_joint_postures/status
 ros2 topic echo /line_follow/status
-ros2 topic echo /wheel_odom --once
-```
-
-终止工作流可调用：
-
-```bash
 ros2 service call /task_controller/stop std_srvs/srv/Trigger '{}'
 ```
 
-此服务停止工作流和底盘，不保证取消已提交的 MoveIt 轨迹；需要立即停止机械臂时使用机器人本身的停止/急停。
+关节任务返回排队成功不代表到位；工作流只接受本次request_id对应的DONE，关节误差要求小于0.01rad。关节状态、外控、安全状态、地面场景失效会取消本节点关节运动，工作流不放行底盘。关节任务失败后保持中止锁定，需要查明原因并重启该任务节点。STOP会取消关节姿态任务；已有笛卡尔MoveIt执行的停止行为沿用执行器，紧急情况使用设备停止/急停。
 
-## 修改轨迹
+路线记录不中途清空，不重启底盘、循迹或里程计节点。只有首次出发和最终站结束启停循迹控制。单独的`line_follow_only.launch.py`不增加机械臂姿态动作。
 
-编辑 YAML 中的 `position`、`orientation`；修改初始点就是修改第一个 `arm_move`。第一点的 `skip_if_at_target` 控制到位跳过，`arrival_tolerance` 单位米，`arrival_orientation_tolerance_deg` 单位度。`max_position_distance` 是相对当前 TCP 的位移保护，初始点默认 1 m，后三步 0.6 m，不是工作空间可达性保证。
+软件验证覆盖两个途中站、继续前实际到位门槛、最后一站以及路线连续性；模拟服务验证不代表四个笛卡尔点在现场可达。地面碰撞约束保留base_link下Z≤0.08m。实体空间中的桌面等障碍仍需建模。
 
-底盘结束方式由 `line_follow.until_untrusted` 控制，末端/丢线等待由 `boundary_wait_sec` 控制，总超时由 `step_timeout_sec` 控制；速度和缺口通过规则仍由原来的循迹配置控制。修改包内 YAML 后重新编译并重新启动。也可复制到外部文件后传入，避免每次修改重建：
+## 自动测试：首条横线到站、中转等待5秒、倒车返回充电
+
+复用同一个联合launch，选择`test_profile:=return_charge`，不新增重复入口：
+
+允许从充电桩出发：机械臂先到行驶位，再以不超过0.02m/s循迹离桩；连续3帧确认停止充电后恢复正常速度。仍充电时累计前进上限30cm、总等待25s，超限锁停。手动充电、急停、故障或传感数据失效仍禁止运动。
+
+```bash
+cd ~/project/robot_and_chassis_control/ros_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch robot_task_control line_follow_arm_test.launch.py \
+  test_profile:=return_charge line_show_window:=true launch_rviz:=true
+```
+
+此命令包含真机驱动，设备就绪后自动执行：
+
+1. 确认底盘停稳，机械臂按关节角到行驶位`[-45, 15, -71, 4.4, 148, 75]°`。
+2. 前进循迹；出发处已经存在、被离站逻辑忽略的横线不算目标。第一条有效横线到位即停车，即使它被识别成途中站，也不等待额外开始消息。
+3. 确认轮速停稳，封存刚才的前进路线。随后机械臂到中转位`[-45, 0, 0, 0, 90, 0]°`，服务核查实际关节到位后，工作流再等待完整5秒。
+4. 经中转按关节目标回行驶位，确认实际到位后才放行底盘。原进程内切换为倒车，不重启驱动、不清除路线；沿封存路线回到出发区域。
+5. 末段用倒车充电模式先摆正、横移回中，再直退；横线辅助定位，充电首帧停车、连续反馈确认后完成。横线后额外搜索最多10cm，偏离/超距/充电信号异常时锁停报错。原有充电模式的图像、里程计和安全保护仍有效。
+6. 等待底盘停稳，任务结束；机械臂保持行驶位，不循环、不自动再次出发。
+
+启动前仍须配置CAN（需要时执行`sudo bash scripts/setup_can.sh auto`），并退出重复驱动。该profile不执行原来的四个笛卡尔点，也不启动海康、深度相机、力传感器、笛卡尔点位执行器；默认加载9010状态监视/TCP桥，MoveIt与关节姿态任务仍运行以执行碰撞检查和关节轨迹。中转是过渡姿态，没有触碰/20N检测。
+
+当前默认充电位使用`charging_status_layout:=byte_flags`；若已实测确认固件使用整个0x204 uint32 bit3，改为`charging_status_layout:=bitfield32`。需要主机发首次开始时可加`remote_control:=true`，此时会加载既有TCP桥并等待主机start；后续中转、等待和返程全自动。
+
+流程配置：`src/robot_task_control/config/line_follow_arm_charge_test.yaml`；两组关节角共用`src/eli_cs_robot_moveit_config/config/arm_joint_postures.yaml`。`delay.seconds`控制到中转后的等待时间。`finish_at_first_marker: true`只用于显式forward步骤，要求停止横线确实到位，普通丢线不能代替到站。`arm_postures_before_chassis`在每个前进/倒车步骤前自动插入并确认行驶姿态，配置不重复写关节角。
+
+查看流程与充电阶段：
+
+```bash
+ros2 topic echo /task_controller/status
+ros2 topic echo /arm_joint_postures/status
+ros2 topic echo /line_follow/status
+```
+
+本测试已经用本机模拟服务验证首条途中横线可完成前进、封存不丢失、中转实际到位后至少等待5秒、回行驶位后才倒车及充电完成后停止。姿态往返和充电控制沿用各自已通过的仿真/模拟检查；完整流程尚未驱动实车验证。
+
+
+树莓派联合往返测试优先关闭RViz，保留循迹画面：
 
 ```bash
 ros2 launch robot_task_control line_follow_arm_test.launch.py \
-  workflow_file:=/绝对路径/my_test.yaml
+  test_profile:=return_charge line_show_window:=true launch_rviz:=false
 ```
 
-软件验证与真机验证分开记录：模拟消息测试只验证工作流顺序、停稳门槛、点位和方向转换；IK/规划检查也不能代替从真实关节初始状态、真实障碍物环境出发的试运行。规划失败时查看 MoveIt 原因，不能跳过碰撞检查来强行执行。
+该配置提前准备USB相机和识别，机械臂连接稳定5秒、设备检查及行驶姿态到位的条件仍保留；
+相机预热不会提前使能小车。`prepare_line_camera_early:=false` 可恢复相机原来的串行启动顺序。
+图像识别及后台横线检测各默认最多2个OpenCV计算线程；开启RViz时默认显示刷新率降为10Hz，降低竞争。
+速度选择器继续执行100ms输入超时停车，新增“输入超时/恢复”和“调度延迟”日志，
+用于区分识别主动停车与速度发送断流。速度话题使用只保留最新一条的队列，不积压旧命令。
 
-## 本次软件验证记录
 
-工作流模拟测试通过三种初始条件：不在 P1、已经在 P1、位置相同但角度不同；验证了初始准备先于循迹、旧零速数据和仍在移动的反馈不放行、后续点位及角度按顺序发送。未启动真机运动。
+联合往返 `return_charge` 使用关节姿态专用模式：不加载未使用的柔顺控制节点、
+笛卡尔执行器及力传感器（显式启用传感器时除外），也不等待柔顺使能服务。
+MoveIt、模型/碰撞规划及安全监视保留，机械臂关节动作只在对应步骤请求后执行。
+普通 `stations` 和实际柔顺/触碰任务仍保留原来的控制接口。
+机械臂控制器分为“激活组”和“仅配置组”，由两个spawner顺序加载；任一批失败取消启动。
+驱动、里程计与已封存返程路线在步骤切换间持续保留。
 
-原 P1～P3 三个目标分别通过碰撞感知 IK 检查；P1→P2 的完整路径规划在模拟检查中返回 FAILURE（99999），使用关节目标 5 秒和位姿目标 10 秒的检查均未成功。P2→P3 因前段未通过而尚未验证。分别存在逆解不等于整段路径可行，以上点位保留用户输入，未绕过碰撞检查。真机能否完成本轮任务仍需核对关节初始状态与规划场景；若同样失败，需要查看具体路径限制，再调整点位或增加中间点。
+关节姿态运动和站点等待期间，USB相机采集按需暂停，下游图像识别不再持续计算；
+恢复前进/倒车前先开启采集并等待有效视觉反馈，15秒仍未就绪则报错停车。
+底盘和机械臂驱动、安全监视、里程计保持常驻；相机暂停不清空返程路线。
+横线斜率计算改由NumPy执行，后台检测使用受限OpenCV并行，控制状态机仍保持单线程。
 
-新增 P4 的 XYZ 为 [0.3, 0.2, 0.6] m，RPY 为 [-160, 0, -77] 度，追加于 P3 后执行；该点及 P3→P4 路径尚未进行可达性或真机验证，运行时仍须由 MoveIt 规划成功才执行。
 
-## 途中站继续消息
+## 单独循迹：离桩、首条横线等待5秒、返程充电
 
-初次 launch 就绪后仍自动开始。途中站到位后，发布一次新的开始消息才能继续，提前发布的消息不保留，最终站不接受此消息继续：
+先退出其他底盘/联合任务，避免同时向速度话题发送指令。启动后自动执行，无需调用开始服务：
 
 ```bash
-ros2 topic pub --once /line_follow/resume std_msgs/msg/Empty '{}'
+source /opt/ros/jazzy/setup.bash
+source ~/project/robot_and_chassis_control/ros_ws/install/setup.bash
+ros2 launch robot_task_control line_follow_only.launch.py \
+  round_trip:=true charging_mode:=true \
+  line_show_window:=true line_stop_marker_target_ratio:=0.5
 ```
 
-恢复后对刚经过的横线去重，不会原地重复停车；后续横线仍需停车。查看 `/line_follow/status` 的 `stop_marker` 字段、`state=stop_marker_intermediate/final`，预览显示 STOP TARGET 和标记类别。中间位置以左上角单帧相机图像为准，不是四宫格预览整体高度的中间。参数位于 `masc_chassis_user_control/config/line_follow.yaml` 的 `stop_marker_*`。
+复用已有launch，选择 `config/line_follow_charge_test.yaml`：
+底盘停稳→前进循迹离桩→第一条有效横线停稳→封存路线→等待5秒→沿记录路线倒车充电→停稳结束。
+起步出发线按原规则忽略；到站横线既可以是途中横线，也可以是末端横线。
+前进离桩仍为最高0.02m/s、连续3帧不充电后恢复正常循迹；超过30cm或25秒仍充电则锁停。
+倒车保留视觉回中、横线定位、10cm额外搜索限制，连续充电反馈确认才完成。
+不会启动机械臂、MoveIt、RViz、TCP或其他相机；整个往返期间USB循迹相机和里程计保持工作。
+`round_trip:=true charging_mode:=false` 继续使用原来的“最终横线往返”流程。
 
-该目标是图像位置闭环，实际停车存在图像帧率和底盘刹车延迟，不能承诺恰好零像素。先看 `error_ratio` 再调整容差或目标比例；轻微越过图高2%以内按到达处理，超过该范围会停车报告，不自动倒车。最终横线后应有足够可见地面用于判断“没有继续主线”；画面边缘看不全时先显示 unknown。
-
-## 末尾拍照与传输配置
-
-配置文件：`robot_task_control/config/capture/final_capture.yaml`。树莓派默认169.254.199.100，工控机169.254.199.120。先在工控机保持 `./listen_robot.py` 运行，再用原来的 `line_follow_arm_test.launch.py` 启动任务，不需要额外调用拍照服务。不要同时手动启动HK、深度相机或另一个9002发送服务。
-
-默认每轮一张HK与一组RGB/深度。Pi根目录 `~/robot_data/task_final/`，麒麟根目录 `received/`；两端统一保存为 `2026.10.30.20.29/` 这样的年月日时分目录，下面直接为 `hk/` 和 `RGB/`。每轮海康、RGB、原始深度图用相同的时分秒毫秒文件名前缀配对；同一分钟重复采集不覆盖、不增加第三层目录。16位深度原始数值不变，内参、深度比例、原始采集清单哈希集中放在后台隐藏索引 `.capture_index.json`。临时ZIP/NPY和重复清单在正常发送后清理，失败临时数据保留在 `.pending`。深度通道收到校验ACK才完成；HK仍以接收端保存日志与照片为接收证据。
-
-`robot_settle_sec`、`camera_warmup_sec`、`stable_frames`、`frame_difference_threshold` 可按现场调整。稳定检查比较160×120灰度缩略图的相邻新帧平均绝对差，默认阈值3（0～255）；1秒内的新帧才参与，长时间丢帧清空连续计数。画面稳定不等于已验证清晰度或深度精度；30秒内不能稳定则失败，不强拍旧图。HK沿用驱动的曝光等配置，仅将采集帧率覆盖为10 FPS；深度沿用现有SDK兼容参数、关闭点云。两台拍照相机不并行，采完关闭再打包发送，编码工作线程数为1。
-
-循迹相机通过 `/line_camera/camera_node/streaming` 暂停并释放USB；循迹识别与控制节点保留但没有新图像处理，底盘和机器人驱动持续运行。再次通过任务start启动时恢复循迹相机。相机重开恢复失败会使后续就绪/图像检查不通过。不是结束整个ROS系统，也不会杀掉用户另外启动的程序。
-
-## 由麒麟发送开始的入口
-
-使用 `ros2 launch robot_task_control line_follow_arm_test.launch.py remote_control:=true`，一次加载同一套驱动、四点拍照工作流和9010通讯，`auto_start=false` 等待主机开始。此入口不启动常驻HK传输节点，9002留给末尾拍照临时使用。当前默认无密钥，两端同步更新即可。主机先 `python3 listen_robot.py`，确认 `control=connected` 与 `start_service=True`，再 `python3 start_task.py`。服务就绪不代表硬件已全通过，执行仍经过现有就绪检查；查看任务状态和树莓派日志。
+纯MoveIt站点测试现在默认 `launch_admittance:=false`，不加载导纳节点；关节姿态管理器及任务控制器
+也不再等待或调用导纳开关服务。旧独立阻抗入口保留；自定义任务确实含导纳步骤时须显式开启该参数。
+相机点触碰由camera_detection_real入口的MoveIt限力流程负责，本四点位联动测试不自动新增触碰步骤。

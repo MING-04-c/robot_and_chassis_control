@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check launch profiles and startup order without opening robot hardware."""
 import os
+import yaml
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -12,6 +13,7 @@ from launch.actions import ExecuteProcess, IncludeLaunchDescription, OpaqueFunct
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.utilities import evaluate_parameters, normalize_parameters
+from launch.utilities import normalize_to_list_of_substitutions, perform_substitutions
 
 root = Path(__file__).resolve().parents[2]
 shares = {
@@ -36,9 +38,21 @@ def fake_node(**kwargs):
         for item in params:
             if isinstance(item, dict):
                 values.update(item)
+            elif isinstance(item, Path) and kwargs.get('name') in ('camera_detection_task', 'detect_controller'):
+                configuration = yaml.safe_load(item.read_text()) or {}
+                values.update(configuration.get(kwargs['name'], {}).get('ros__parameters', {}))
+        if kwargs.get('executable') == 'spawner':
+            values['arguments'] = [perform_substitutions(context,
+                normalize_to_list_of_substitutions(value)) for value in kwargs.get('arguments', [])]
         seen.append((kwargs.get("executable"), values))
         return []
 
+    if kwargs.get('executable') == 'spawner':
+        class FakeSpawner(ExecuteProcess):
+            def execute(self, context):
+                inspect(context)
+                return super().execute(context)
+        return FakeSpawner(cmd=['/bin/true'])
     if kwargs.get('executable') == 'auto_power_on.py':
         class FakePowerGate(ExecuteProcess):
             def execute(self, context):
@@ -111,7 +125,8 @@ try:
     terminal_signatures = []
     for description in descriptions:
         signatures = []
-        for name in ("terminal_base_link", "terminal_link_1", "terminal_link_2"):
+        assert description.find("link[@name='terminal_base_link']") is not None
+        for name in ("terminal_assembly_link", "terminal_link_1", "terminal_link_2"):
             link = description.find(f"link[@name='{name}']")
             assert link is not None, name
             for kind in ("visual", "collision"):
@@ -120,6 +135,7 @@ try:
                 signatures.append((name, kind, tuple(sorted(mesh.attrib.items()))))
         for name in (
             "tool0-terminal_base_fixed",
+            "terminal_assembly_fixed",
             "terminal_joint_1",
             "terminal_joint_2",
         ):
@@ -318,6 +334,45 @@ try:
     assert 'ros2_control_node' not in round_trip and 'sensor_node' not in round_trip
     seen.clear()
     service = LaunchService()
+    service.include_launch_description(LaunchDescription([
+        IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+            root / 'robot_task_control/launch/line_follow_only.launch.py')),
+            launch_arguments={'round_trip': 'true', 'charging_mode': 'true'}.items()),
+    ]))
+    assert service.run() == 0
+    chassis_charge = {executable: values for executable, values in seen}
+    assert str(chassis_charge['task_controller']['workflow_file']).endswith('line_follow_charge_test.yaml')
+    assert chassis_charge['task_controller']['auto_start'] is True
+    assert chassis_charge['line_follow_node.py']['charging_mode'] is True
+    assert chassis_charge['line_follow_node.py']['charging_status_layout'] == 'byte_flags'
+    assert chassis_charge['line_follow_node.py']['drive_direction'] == 'forward'
+    assert 'masc_chassis_ros_driver_node' in chassis_charge and 'camera_node' in chassis_charge
+    assert not set(chassis_charge).intersection({'ros2_control_node', 'move_group', 'rviz2',
+        'arm_joint_postures', 'sensor_node', 'admittance_pose_controller', 'industrial_pc_node.py'})
+    for mode,speed,fps in [('teach',.03,0.),('replay',.05,8.)]:
+        seen.clear()
+        service=LaunchService()
+        service.include_launch_description(LaunchDescription([
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+                root/'robot_task_control/launch/line_follow_only.launch.py')),
+                launch_arguments={'navigation_mode':mode,'route_name':'route_test'}.items())]))
+        assert service.run()==0
+        profile={executable:values for executable,values in seen}
+        assert profile['line_follow_node.py']['reverse_route_lookahead']==.26
+        assert profile['line_follow_node.py']['route_finish_heading_gain']==.60
+        assert profile['line_follow_node.py']['forward_speed']==speed
+        assert profile['line_follow_node.py']['route_sample_distance']==(.01 if mode=='teach' else .02)
+        assert profile['line_follow_node.py']['navigation_mode']==('vision' if mode=='teach' else 'replay')
+        assert 'route_test' in profile['line_follow_node.py']['standard_route_file']
+        assert profile['line_tracker_node']['max_processing_fps']==fps
+        assert profile['line_follow_node.py']['charging_mode'] is True
+        assert bool(profile['task_controller']['standard_route_output'])==(mode=='teach')
+        assert str(profile['task_controller']['workflow_file']).endswith('line_follow_charge_test.yaml')
+        assert not set(profile).intersection({'ros2_control_node','move_group','arm_joint_postures','industrial_pc_node.py'})
+
+
+    seen.clear()
+    service = LaunchService()
     service.include_launch_description(
         LaunchDescription([
             IncludeLaunchDescription(
@@ -330,11 +385,68 @@ try:
     assert service.run() == 0
     formal = {executable: values for executable, values in seen}
     assert formal["task_controller"]["auto_start"] is True
-    assert "industrial_pc_node.py" not in formal
+    assert "industrial_pc_node.py" in formal
     assert formal["line_follow_node.py"]["stop_marker_target_ratio"] == .5
     assert formal["line_follow_node.py"]["stop_marker_mask_topic"] == (
         "/line_camera/line/stop_marker_mask"
     )
+    seen.clear()
+    service = LaunchService()
+    service.include_launch_description(LaunchDescription([
+        IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+            root / 'robot_task_control/launch/line_follow_arm_test.launch.py')),
+            launch_arguments={'test_profile': 'return_charge', 'launch_rviz': 'false'}.items()),
+    ]))
+    assert service.run() == 0
+    charge_test = {executable: values for executable, values in seen}
+    assert charge_test['task_controller']['auto_start'] is True
+    order = [executable for executable, _ in seen]
+    assert order.index('camera_node') < order.index('auto_admittance_start.py')
+    assert order.index('auto_admittance_start.py') < order.index('move_group')
+    assert order.index('auto_admittance_start.py') < order.index('task_controller')
+    assert charge_test['line_follow_node.py']['enabled'] is False
+    assert charge_test['velocity_mux']['enabled_on_startup'] is False
+    assert 'rviz2' not in charge_test
+    assert str(charge_test['task_controller']['workflow_file']).endswith('line_follow_arm_charge_test.yaml')
+    assert charge_test['line_follow_node.py']['charging_mode'] is True
+    assert charge_test['line_follow_node.py']['drive_direction'] == 'forward'
+    assert charge_test['task_controller']['manage_admittance'] is False
+    assert charge_test['arm_joint_postures']['simulation'] is False
+    assert charge_test['arm_joint_postures']['manage_admittance'] is False
+    assert charge_test['task_controller']['joint_posture_only'] is True
+    assert charge_test['task_controller']['manage_line_stream'] is True
+    assert 'admittance_pose_controller' not in charge_test and 'force_sensor_mount_tf' not in charge_test
+    batches = [values['arguments'] for executable, values in seen if executable == 'spawner']
+    assert len(batches) == 2, batches
+    active = next(args for args in batches if '--inactive' not in args)
+    inactive = next(args for args in batches if '--inactive' in args)
+    assert 'scaled_joint_trajectory_controller' in active
+    assert 'joint_state_broadcaster' in active and 'io_and_status_controller' in active
+    assert 'forward_position_controller' in inactive and 'freedrive_controller' in inactive
+    active_order = [args for args in batches]
+    assert '--inactive' not in active_order[0] and '--inactive' in active_order[1]
+    assert 'moveit_pose_executor' not in charge_test and 'sensor_node' not in charge_test
+    assert 'ros2_control_node' in charge_test and 'move_group' in charge_test
+    assert 'masc_chassis_ros_driver_node' in charge_test
+    assert 'industrial_pc_node.py' in charge_test and 'orbbec_camera_node' not in charge_test
+    seen.clear()
+    service = LaunchService()
+    service.include_launch_description(LaunchDescription([
+        IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+            root / 'robot_task_control/launch/line_follow_arm_test.launch.py')),
+            launch_arguments={'test_profile': 'return_charge', 'enable_status_monitor': 'false',
+                              'start_tcp': 'true', 'remote_control': 'false',
+                              'route_file': '/tmp/arm-chassis-test-route.json'}.items()),
+    ]))
+    assert service.run() == 0
+    tcp_only = {executable: values for executable, values in seen}
+    assert tcp_only['industrial_pc_node.py']['enable_status_monitor'] is False
+    assert tcp_only['task_controller']['auto_start'] is True
+    assert tcp_only['task_controller']['check_devices_on_startup'] is True
+    assert tcp_only['line_follow_node.py']['forward_speed'] == .03
+    assert tcp_only['line_follow_node.py']['route_file'] == '/tmp/arm-chassis-test-route.json'
+    assert tcp_only['line_follow_node.py']['reverse_route_max_curvature'] == 5.
+    assert 'sensor_node' not in tcp_only and 'admittance_pose_controller' not in tcp_only
     seen.clear()
     service = LaunchService()
     service.include_launch_description(LaunchDescription([
@@ -384,7 +496,8 @@ try:
     assert executables.index("auto_admittance_start.py") < executables.index("move_group")
     hardware = ET.fromstring(real_detection["ros2_control_node"]["robot_description"]).find("ros2_control/hardware")
     assert hardware.findtext("plugin") == "ELITE_CS_ROBOT_ROS_DRIVER/EliteCSPositionHardwareInterface"
-    assert real_detection["admittance_pose_controller"]["enabled_on_startup"] is False
+    assert "admittance_pose_controller" not in real_detection
+    assert real_detection["detect_controller.py"]["touch_control_mode"] == "moveit_force_guard"
     seen.clear()
     service = LaunchService()
     service.include_launch_description(LaunchDescription([
@@ -397,6 +510,36 @@ try:
     assert local_detection["camera_detection_task"]["target_source"] == "local"
     assert "industrial_pc_node.py" not in local_detection
     assert "orbbec_camera_node" not in local_detection and "hik_camera_ros2_driver_node" not in local_detection
+    seen.clear()
+    service = LaunchService()
+    service.include_launch_description(LaunchDescription([
+        IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+            root / "robot_task_control/launch/camera_detection_real.launch.py"
+        )), launch_arguments={"task_profile": "camera_probe_touch", "launch_rviz": "false"}.items()),
+    ]))
+    assert service.run() == 0
+    camera_touch = {executable: values for executable, values in seen}
+    assert camera_touch['camera_detection_task']['target_source'] == 'local'
+    assert camera_touch['camera_detection_task']['camera_frame'] == 'terminal_link_1'
+    expected_points = yaml.safe_load((root/'robot_task_control/config/camera_probe_touch.yaml').read_text())['camera_detection_task']['ros__parameters']['camera_points_mm']
+    assert list(camera_touch['camera_detection_task']['camera_points_mm']) == expected_points
+    assert camera_touch['detect_controller.py']['lock_tool_orientation'] is False
+    assert camera_touch['detect_controller.py']['approach_axis'] == 'tool_positive_z'
+    assert camera_touch['detect_controller.py']['continue_until_contact'] is True
+    assert 'industrial_pc_node.py' not in camera_touch
+    assert 'orbbec_camera_node' not in camera_touch and 'hik_camera_ros2_driver_node' not in camera_touch
+    seen.clear()
+    service = LaunchService()
+    service.include_launch_description(LaunchDescription([
+        IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+            root/'robot_task_control/launch/camera_detection_real.launch.py')),
+            launch_arguments={'target_source': 'local', 'touch_control_mode': 'admittance'}.items()),
+    ]))
+    assert service.run() == 0
+    explicit_admittance = {executable: values for executable, values in seen}
+    assert explicit_admittance['admittance_pose_controller']['enabled_on_startup'] is False
+    assert explicit_admittance['detect_controller.py']['touch_control_mode'] == 'admittance'
+
     seen.clear()
     gate_exit_code = 1
     service = LaunchService()

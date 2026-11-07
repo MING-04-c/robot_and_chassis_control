@@ -9,12 +9,15 @@ import json
 import math
 import signal
 from time import monotonic
+from uuid import uuid4
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_share_directory
+from eli_cs_robot_moveit_config.joint_postures import load_postures, joint_constraints
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from rclpy.time import Time
 from rclpy.signals import SignalHandlerOptions
 from action_msgs.msg import GoalStatus
@@ -54,6 +57,13 @@ JOINTS = [
 ]
 
 
+class RetryableApproachError(RuntimeError):
+    """仅表示预测点不可达或受限接近未接触；安全故障不使用此异常。"""
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 class DetectController(Node):
     def __init__(self):
         super().__init__("detect_controller")
@@ -62,14 +72,20 @@ class DetectController(Node):
             "tool_frame": "tool0",
             "probe_frame": "terminal_link_2",
             "planning_group": "cs_manipulator",
+            "lock_tool_orientation": False,
             "target_topic": "/geminipro_calibration/target_base",
             "targets_topic": "/geminipro_calibration/targets_base",
             "targets_file": "~/.ros/detect_control/targets.yaml",
             "measurement_results_file": "~/.ros/detect_control/thickness_results.jsonl",
             "max_targets": 100,
             "home_joint_tolerance": 0.01,
+            # admittance: 现有连续导纳接近；moveit_force_guard: 普通 MoveIt 单条直线接近，
+            # 仅用力传感器做 20N 停止保护。
+            "touch_control_mode": "moveit_force_guard",
             "admittance_namespace": "/admittance_controller",
             "raw_wrench_topic": "/sensor/wrench",
+            "force_filter_alpha": 0.25,
+            "force_bias_sample_count": 50,
             "target_source": "camera",
             "initial_position_enabled": False,
             "initial_position": [-0.4, 0.1, 0.4],
@@ -81,9 +97,17 @@ class DetectController(Node):
             "overload_force": 40.0,
             "initial_force_limit": 5.0,
             "hold_seconds": 5.0,
+            "approach_axis": "base_negative_z",
+            "continue_until_contact": False,
+            "joint_postures_enabled": False,
+            "recover_approach_failure": False,
+            "require_thickness_measurement": False,
+            "recovery_settle_seconds": 0.5,
+            "point_results_file": "~/.ros/detect_control/point_results.jsonl",
             "approach_clearance": 0.02,
             "max_penetration": 0.005,
             "approach_speed": 0.002,
+            "moveit_cartesian_step": 0.005,
             "max_tracking_error": 0.005,
             "lateral_tolerance": 0.002,
             "orientation_tolerance": 0.03,
@@ -99,6 +123,19 @@ class DetectController(Node):
             "workspace_max": [1.0, 1.0, 1.5],
         }
         self.cfg = {k: self.declare_parameter(k, v).value for k, v in defaults.items()}
+        if self.cfg["touch_control_mode"] not in ("admittance", "moveit_force_guard"):
+            raise ValueError("touch_control_mode 必须为 admittance 或 moveit_force_guard")
+        if not 0.0 < float(self.cfg["force_filter_alpha"]) <= 1.0:
+            raise ValueError("force_filter_alpha 必须在 (0, 1] 内")
+        if int(self.cfg["force_bias_sample_count"]) < 1:
+            raise ValueError("force_bias_sample_count 必须为正整数")
+        self.touch_control_mode = self.cfg["touch_control_mode"]
+        self.postures = load_postures(self.declare_parameter('joint_postures_file', str(
+            Path(get_package_share_directory('eli_cs_robot_moveit_config'))/'config/arm_joint_postures.yaml')).value)
+        self.ground_ready = False
+        self.ground_subscription = self.create_subscription(Bool, '/robot_control/ground_ready',
+            lambda message: setattr(self, 'ground_ready', message.data),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         # 未提供度制参数时兼容旧 YAML 的 orientation_tolerance（弧度）。
         degrees = self.declare_parameter(
             "orientation_tolerance_deg", math.degrees(self.cfg["orientation_tolerance"])
@@ -108,6 +145,9 @@ class DetectController(Node):
         self.cfg["orientation_tolerance"] = math.radians(degrees)
         if self.cfg["initial_orientation_mode"] not in ("current", "fixed"):
             raise ValueError("initial_orientation_mode 必须为 current 或 fixed")
+        if self.cfg['approach_axis'] not in ('base_negative_z', 'tool_positive_z'):
+            raise ValueError('approach_axis 必须为 base_negative_z 或 tool_positive_z')
+        self.axis = None
         self.fixed_initial_rotation = rpy_degrees_rotation(self.cfg["initial_rpy_deg"])
         for name, value in self.cfg.items():
             if isinstance(value, float) and (not math.isfinite(value) or value <= 0):
@@ -144,24 +184,36 @@ class DetectController(Node):
         self.goal_handle = None
         self.outstanding_actions = set()
         self.targets = []
+        self.target_rejection = None
         self.batch = []
         self.point_index = 0
         self.completed_points = 0
         self.recorded_home = None
+        self.capture_joints = None
         self.initial_position_ready = False
         self.initial_orientation_xyzw = None
+        self.initial_pose = None
         self.targets_file = Path(self.cfg["targets_file"]).expanduser()
         if not 1 <= self.cfg["max_targets"] <= 1000:
             raise ValueError("max_targets 必须在 1～1000 之间")
         self.joints = None
         self.joints_at = -math.inf
         self.force = None
+        self.force_filter = None
+        self.force_bias = None
+        self.force_bias_samples = []
+        self.bias_joint_reference = None
+        self.bias_stationary_since = None
         self.force_at = -math.inf
         self.raw_at = -math.inf
         self.stop_confirmed = True
         self.generation = 0
         self.last_status = 0.0
         self.stop_future = None
+        self.contact_stop_requested = False
+        self.moveit_stop_since = None
+        self.moveit_stop_reference = None
+        self.moveit_stop_joint_stamp = None
         namespace = self.cfg["admittance_namespace"].rstrip("/")
         self.target_pub = self.create_publisher(
             PoseStamped, namespace + "/tracking_target_pose", 10
@@ -171,6 +223,12 @@ class DetectController(Node):
         self.contact_pub = self.create_publisher(PoseStamped, "~/contact_pose", 10)
         self.measure_pub = self.create_publisher(Empty, "/detactor/acquire_trigger", 10)
         self.thickness_result = None
+        self.retry_context = None
+        self.batch_id = ""
+        self.recovery_reference = None
+        self.recovery_quiet_since = None
+        self.point_result_pub = self.create_publisher(String, "~/point_result",
+            QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.measurement_started_ns = None
         self.thickness_pub = self.create_publisher(String, "~/thickness_result", 10)
         self.create_subscription(String, "/detactor/measurement", self.on_thickness, 10)
@@ -200,9 +258,14 @@ class DetectController(Node):
             self.on_raw,
             qos_profile_sensor_data,
         )
+        self.safety_inhibited = False
+        self.create_subscription(Bool, "/robot_control/safety_inhibit", self.on_safety_inhibit,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_service(Trigger, "~/start", self.start)
         self.create_service(Trigger, "~/cancel", self.cancel)
         self.create_service(Trigger, "~/record_home", self.record_home)
+        self.create_service(Trigger, "~/prepare_detection", lambda req, response: self.prepare_posture('detection_ready', response))
+        self.create_service(Trigger, "~/prepare_travel", lambda req, response: self.prepare_posture('travel', response))
         self.create_service(Trigger, "~/prepare_initial", self.prepare_initial)
         self.create_service(Trigger, "~/clear_targets", self.clear_targets)
         self.create_service(Trigger, "~/load_targets", self.load_targets)
@@ -217,7 +280,7 @@ class DetectController(Node):
 
     @property
     def active(self):
-        return self.phase not in ("IDLE", "DONE", "FAULT")
+        return self.phase not in ("IDLE", "DONE", "FAULT", "RETRY_REQUIRED", "READY_DETECTION", "READY_TRAVEL")
 
     def state(self, phase, detail=""):
         if self.phase == "HOLD" and phase != "HOLD":
@@ -263,18 +326,35 @@ class DetectController(Node):
         self.thickness_pub.publish(String(data=json.dumps(result, ensure_ascii=False)))
         self.get_logger().info(f'检测点 {self.point_index + 1} 厚度：{value} {reading["unit"]}')
 
+    def on_safety_inhibit(self, message):
+        self.safety_inhibited = message.data
+        if message.data and self.active:
+            self.fail("机器人安全暂停；检测接触阶段取消，需要重新准备检测任务")
+
     def motion_readiness(self):
         """返回初始运动能否开始及等待原因；只读取状态，不触发运动。"""
+        if self.cfg.get('joint_postures_enabled', False) and (
+                not self.ground_ready or self.ground_subscription.get_publisher_count() == 0):
+            return False, "等待8cm地面碰撞场景确认"
+        if self.safety_inhibited:
+            return False, "安全恢复锁定中"
         if self.active or self.outstanding_actions:
             return False, "等待当前运动结束"
         if not self.stop_confirmed or self.stop_future is not None:
             return False, "等待上次停止确认"
         if not self.fresh():
             return False, "等待新鲜关节、原始力和零偏初始化后的滤波力数据"
+        if self.touch_control_mode == "moveit_force_guard" and self.force_bias is None:
+            return False, "等待普通 MoveIt 力保护完成传感器零偏采样"
         if np.linalg.norm(self.force) >= self.cfg["initial_force_limit"]:
             return False, "初始受力超过允许值，请检查探头接触或力零偏"
-        if not self.enable.service_is_ready() or not self.move.server_is_ready():
-            return False, "等待导纳服务和 MoveIt 运动接口"
+        if (self.touch_control_mode == "admittance" and
+                not self.enable.service_is_ready()):
+            return False, "等待导纳服务"
+        if (not self.move.server_is_ready() or
+                not self.cartesian.service_is_ready() or
+                not self.execute.server_is_ready()):
+            return False, "等待 MoveIt 规划和执行接口"
         return True, "关节、力数据和运动接口已就绪"
 
     def publish_status(self):
@@ -283,12 +363,23 @@ class DetectController(Node):
         message.data = json.dumps(
             {
                 "state": self.phase,
+                "batch_id": self.batch_id,
+                "retry_context": self.retry_context,
+                "returned_home": self.phase in ("DONE", "RETRY_REQUIRED"),
                 "motion_ready": motion_ready,
                 "readiness_message": readiness_message,
                 "message": self.detail,
+                "touch_control_mode": self.touch_control_mode,
+                "force_bias_ready": self.force_bias is not None if self.touch_control_mode == "moveit_force_guard" else None,
                 "force_z_N": None if self.force is None else float(self.force[2]),
+                "force_axial_N": None if self.force is None else self.axial_force(self.force),
+                "approach_axis": self.cfg['approach_axis'],
+                "approach_axis_base": None if self.axis is None else self.axis.tolist(),
+                "continue_until_contact": self.cfg['continue_until_contact'],
+                "max_extra_travel_m": self.cfg['max_penetration'],
                 "contact_force_N": self.cfg["contact_force"],
                 "queued_points": len(self.targets),
+                "target_rejection": self.target_rejection,
                 "batch_points": len(self.batch),
                 "current_point": self.point_index + 1 if self.batch else 0,
                 "completed_points": self.completed_points,
@@ -317,7 +408,7 @@ class DetectController(Node):
             raise ValueError("新检测点观测时间缺失或已过期")
         transform = pose_matrix(message.pose)
         if not self.in_workspace(transform):
-            raise ValueError("检测点超过工作空间")
+            raise ValueError("TARGET_UNREACHABLE: 检测点超过工作空间")
         return transform
 
     def store_targets(self, targets):
@@ -390,8 +481,12 @@ class DetectController(Node):
                 targets.append(item)
             self.store_targets(targets)
             self.targets = targets
+            self.target_rejection = None
             self.publish_status()
         except Exception as error:
+            self.target_rejection = {"message": str(error), "stamp": {
+                "sec": message.header.stamp.sec, "nanosec": message.header.stamp.nanosec}}
+            self.publish_status()
             self.get_logger().warning(f"整组检测点未存入：{error}")
 
     def record_home(self, request, response):
@@ -405,14 +500,23 @@ class DetectController(Node):
             ):
                 raise ValueError("关节数据未就绪")
             self.current_tool()
+            self.capture_joints = deepcopy(self.joints)
             self.recorded_home = deepcopy(self.joints)
-            response.success, response.message = True, "已记录当前六轴关节原位"
+            if self.cfg.get('joint_postures_enabled', False):
+                for name, value in zip(JOINTS, self.postures['travel']):
+                    self.recorded_home.position[self.recorded_home.name.index(name)] = value
+            response.success, response.message = True, (
+                "已保存拍照关节；返回位使用配置的行驶姿态" if self.cfg.get('joint_postures_enabled', False)
+                else "已记录当前六轴关节原位")
             self.publish_status()
         except Exception as error:
             response.success, response.message = False, str(error)
         return response
 
     def prepare_initial(self, request, response):
+        if self.safety_inhibited:
+            response.success, response.message = False, "安全恢复锁定中"
+            return response
         """规划 tool0 到初始 XYZ 与选定朝向，到位后记录实际关节原位。"""
         del request
         accepted = False
@@ -428,7 +532,8 @@ class DetectController(Node):
                 or np.linalg.norm(self.force) >= self.cfg["initial_force_limit"]
             ):
                 raise ValueError("初始移动前需要新鲜关节/力数据，且探头未接触")
-            if not self.enable.service_is_ready() or not self.move.server_is_ready():
+            if (self.touch_control_mode == "admittance" and
+                    not self.enable.service_is_ready()) or not self.move.server_is_ready():
                 raise ValueError("导纳或 MoveIt 尚未就绪")
             goal = self.current_tool()
             position = np.asarray(self.cfg["initial_position"], dtype=float)
@@ -445,6 +550,9 @@ class DetectController(Node):
             if not self.in_workspace(goal) or not self.in_workspace(goal @ mounting):
                 raise ValueError("初始 tool0 或探头位置超过工作空间")
             self.mounting = mounting
+            self.initial_pose = self.current_tool()
+            if self.cfg["lock_tool_orientation"] and not self.rotation_ok(goal, self.initial_pose):
+                raise ValueError("固定初始位置要求旋转，与保持当前朝向模式冲突")
             self.initial_cartesian_goal = goal
             self.initial_orientation_xyzw = components(goal)[1]
             self.initial_position_ready = False
@@ -455,8 +563,7 @@ class DetectController(Node):
             self.operation = None
             self.state("PREPARE_INITIAL", "关闭导纳，准备规划到固定初始 tool0 位置")
             accepted = True
-            self.set_enabled(
-                False,
+            self.set_enabled(False,
                 lambda: self.plan_pose(
                     goal, on_reached=self.verify_initial, phase="MOVE_INITIAL"
                 ),
@@ -544,6 +651,16 @@ class DetectController(Node):
         ):
             self.joints = deepcopy(message)
             self.joints_at = monotonic()
+            positions = np.array([
+                message.position[message.name.index(name)] for name in JOINTS
+            ])
+            moving = (len(message.velocity) == len(message.name) and any(
+                abs(message.velocity[message.name.index(name)]) > 0.01 for name in JOINTS))
+            changed = (self.bias_joint_reference is None or
+                       np.max(np.abs(positions - self.bias_joint_reference)) > 0.0005)
+            if moving or changed:
+                self.bias_joint_reference = positions
+                self.bias_stationary_since = monotonic()
 
     def on_raw(self, message):
         values = [
@@ -555,6 +672,56 @@ class DetectController(Node):
             message.header.stamp, self.cfg["data_timeout"]
         ):
             self.raw_at = monotonic()
+            if self.touch_control_mode == "moveit_force_guard":
+                try:
+                    transformed = self.raw_force_in_base(message)
+                    if self.force_bias is None:
+                        stationary = (self.bias_stationary_since is not None and
+                                      monotonic() - self.bias_stationary_since >= 0.5)
+                        if (not self.active and stationary and
+                                np.linalg.norm(transformed) < self.cfg["initial_force_limit"]):
+                            self.force_bias_samples.append(transformed)
+                            if len(self.force_bias_samples) >= int(self.cfg["force_bias_sample_count"]):
+                                self.force_bias = np.mean(self.force_bias_samples, axis=0)
+                                self.force_filter = None
+                                self.get_logger().info(
+                                    f"普通 MoveIt 力保护零偏已建立：{self.force_bias.tolist()} N")
+                        elif not self.active:
+                            self.force_bias_samples.clear()
+                    transformed = (transformed if self.force_bias is None
+                                   else transformed - self.force_bias)
+                    # 合力过载用去偏后的未滤波数据，不能被低通滤波压低而漏掉瞬时过载。
+                    if self.active and np.linalg.norm(transformed) >= self.cfg["overload_force"]:
+                        self.fail("原始去偏合力超过保护阈值")
+                        return
+                    alpha = float(self.cfg["force_filter_alpha"])
+                    self.force_filter = (
+                        transformed if self.force_filter is None
+                        else alpha * transformed + (1.0 - alpha) * self.force_filter
+                    )
+                    self.force = self.force_filter.copy()
+                    self.force_at = monotonic()
+                    self.handle_force_sample(self.force)
+                except Exception as error:
+                    if self.active:
+                        self.fail(f"原始力数据无法转换到基座坐标：{error}")
+
+    def raw_force_in_base(self, message):
+        """将传感器坐标系的力旋转到 base_frame；力的平移不影响三轴力。"""
+        values = np.array([
+            message.wrench.force.x,
+            message.wrench.force.y,
+            message.wrench.force.z,
+        ], dtype=float)
+        frame = message.header.frame_id
+        if not frame:
+            raise ValueError("原始 Wrench 的 frame_id 为空")
+        if frame == self.cfg["base_frame"]:
+            return values
+        transform = transform_matrix(
+            self.buffer.lookup_transform(self.cfg["base_frame"], frame, Time()).transform
+        )
+        return transform[:3, :3] @ values
 
     def on_force(self, message):
         values = np.array(
@@ -568,17 +735,30 @@ class DetectController(Node):
             if self.active:
                 self.fail("力数据无效、过期或坐标系不匹配")
             return
+        mode = self.cfg.get("touch_control_mode", "admittance")
+        if mode != "admittance":
+            return
         self.force, self.force_at = values, monotonic()
-        if self.active and np.linalg.norm(values) >= self.cfg["overload_force"]:
+        self.handle_force_sample(values)
+
+    def handle_force_sample(self, values):
+        if not self.active:
+            return
+        if np.linalg.norm(values) >= self.cfg["overload_force"]:
             self.fail("合力超过保护阈值")
-        elif (
-            self.phase in ("DESCEND", "COMPLIANT_HOLD")
-            and abs(values[2]) >= self.cfg["contact_force"]
-        ):
+            return
+        if self.axial_force(values) < self.cfg["contact_force"]:
+            return
+        mode = self.cfg.get("touch_control_mode", "admittance")
+        if mode == "admittance" and self.phase in ("DESCEND", "COMPLIANT_HOLD"):
             # 在收到力回调时立即停止，不等待下一次推进定时器。
             self.operation = None
-            self.state("STOP_CONTACT", "已达到 Z 向接触力阈值，停止导纳输出")
+            self.state("STOP_CONTACT", "已达到接近轴方向的接触力阈值，停止导纳输出")
             self.set_enabled(False, self.begin_hold)
+        elif mode == "moveit_force_guard" and self.phase in (
+                "MOVEIT_PLAN_DESCENT", "MOVEIT_DESCEND", "VERIFY_MOVEIT_SEGMENT",
+                "MOVEIT_WAIT_CONTACT"):
+            self.request_moveit_force_stop()
 
     def fresh(self):
         now = monotonic()
@@ -586,9 +766,7 @@ class DetectController(Node):
         return (
             self.joints is not None
             and self.force is not None
-            and all(
-                now - x <= limit for x in (self.joints_at, self.force_at, self.raw_at)
-            )
+            and all(now - x <= limit for x in (self.joints_at, self.force_at, self.raw_at))
         )
 
     def current_tool(self, after=None):
@@ -606,6 +784,21 @@ class DetectController(Node):
             raise ValueError("等待规划执行结束之后的机器人 TF")
         return transform_matrix(tf.transform)
 
+    def direction_for(self, transform):
+        """输入 tool0 基座位姿，输出单位接近向量（在基座坐标系中表达）。"""
+        if self.cfg['approach_axis'] == 'base_negative_z':
+            return np.array([0., 0., -1.])
+        direction = np.asarray(transform[:3, 2], dtype=float)
+        length = np.linalg.norm(direction)
+        if not np.isfinite(direction).all() or length < 1e-9:
+            raise ValueError('无法从 tool0 姿态得到有效局部+Z方向')
+        return direction / length
+
+    def axial_force(self, force):
+        """返回接近轴上的力绝对值，单位N；不把基座Fz误当作倾斜探头轴向力。"""
+        axis = self.axis if self.axis is not None else np.array([0., 0., -1.])
+        return abs(float(np.dot(force, axis)))
+
     def in_workspace(self, transform):
         p = transform[:3, 3]
         return bool(
@@ -614,6 +807,9 @@ class DetectController(Node):
         )
 
     def start(self, request, response):
+        if self.safety_inhibited:
+            response.success, response.message = False, "安全恢复锁定中"
+            return response
         del request
         try:
             if (
@@ -628,21 +824,29 @@ class DetectController(Node):
                 )
             if not self.stop_confirmed:
                 raise ValueError("上次停止尚未确认，请检查控制器后重新启动任务节点")
+            if self.cfg.get('joint_postures_enabled', False) and not self.motion_readiness()[0]:
+                raise ValueError(self.motion_readiness()[1])
             if not self.fresh():
                 raise ValueError(
-                    "等待新鲜关节、原始力和去零滤波力；先启动驱动、传感器和导纳"
+                    "等待新鲜关节、原始力和去零滤波力；先启动对应控制模式的驱动与传感器"
                 )
+            if self.touch_control_mode == "moveit_force_guard" and self.force_bias is None:
+                raise ValueError("普通 MoveIt 力保护尚未完成传感器零偏采样")
             if np.linalg.norm(self.force) >= self.cfg["initial_force_limit"]:
                 raise ValueError("启动前外力过大；请在探头未接触时正确清零")
+            planning_services = [self.cartesian]
+            if self.touch_control_mode == "admittance":
+                planning_services.append(self.ik)
             if (
-                not all(
-                    c.service_is_ready() for c in (self.enable, self.ik, self.cartesian)
-                )
+                (self.touch_control_mode == "admittance" and
+                 not self.enable.service_is_ready())
+                or not all(c.service_is_ready() for c in planning_services)
                 or not self.move.server_is_ready()
                 or not self.execute.server_is_ready()
             ):
                 raise ValueError("MoveIt/导纳服务尚未就绪")
-            if self.target_pub.get_subscription_count() == 0:
+            if (self.touch_control_mode == "admittance" and
+                    self.target_pub.get_subscription_count() == 0):
                 raise ValueError(
                     "导纳缺少 tracking_target_pose 接口；请先编译并重启更新后的控制节点"
                 )
@@ -668,13 +872,14 @@ class DetectController(Node):
             for item in targets:
                 target = self.check_target(item, check_age=False)
                 final = tool_goal(target, mounting)
+                direction = self.direction_for(final)
                 pre = final.copy()
-                pre[2, 3] += self.cfg["approach_clearance"]
+                pre[:3, 3] -= direction*self.cfg["approach_clearance"]
                 far = final.copy()
-                far[2, 3] -= self.cfg["max_penetration"]
-                if not all(self.in_workspace(t) for t in (target, final, pre, far)):
+                far[:3, 3] += direction*self.cfg["max_penetration"]
+                if not all(self.in_workspace(t) for t in (target, final, pre, far, pre @ mounting, far @ mounting)):
                     raise ValueError(
-                        "某检测点、预接近点或最大探入点超过工作空间；整组不执行"
+                        "TARGET_UNREACHABLE: 某检测点、预接近点或最大探入点超过工作空间；整组不执行"
                     )
                 batch.append((pre, final))
             self.mounting = mounting
@@ -682,13 +887,27 @@ class DetectController(Node):
                 self.recorded_home if self.recorded_home is not None else self.joints
             )
             self.initial_pose = self.current_tool()
+            if self.cfg["lock_tool_orientation"] and any(
+                    not self.rotation_ok(final, self.initial_pose) for _, final in batch):
+                raise ValueError("目标朝向与启动时 tool0 朝向不一致；保持朝向模式不执行旋转")
+            self.batch_id = uuid4().hex
+            self.retry_context = None
+            self.axis = None
+            self.thickness_result = None
+            self.contact_stop_requested = False
+            self.force_filter = None
             self.batch = batch
             self.point_index = 0
             self.completed_points = 0
-            self.pre, self.far = self.batch[0]
+            self.pre, self.final = self.batch[0]
             self.generation += 1
             self.operation = None
-            self.state("PREPARE", "关闭导纳输出后进行预接近规划")
+            self.state(
+                "PREPARE",
+                "关闭导纳输出后进行预接近规划"
+                if self.touch_control_mode == "admittance"
+                else "使用 MoveIt 碰撞检查规划到预接近点",
+            )
             self.set_enabled(False, self.begin_batch)
             response.success, response.message = (
                 True,
@@ -709,7 +928,9 @@ class DetectController(Node):
         )
 
     def begin_batch(self):
-        if self.home_reached():
+        if self.cfg.get('joint_postures_enabled', False):
+            self.plan_joints(self.postures['detection_ready'], lambda: self.plan_pose(self.pre), 'DETECTION_GATEWAY')
+        elif self.home_reached():
             self.plan_pose(self.pre)
         else:
             # 显式记录原位后机器人可能已被移动；先回同一原位再开始第一点。
@@ -721,6 +942,14 @@ class DetectController(Node):
         if initial:
             self.plan_pose(self.pre)
             return
+        if self.retry_context is not None:
+            self.state("RETRY_REQUIRED", "已停止、撤离并返回原位；等待新照片和新检测点")
+            return
+        self.publish_point_result()
+        if self.cfg.get("require_thickness_measurement", False) and self.thickness_result is None:
+            self.retry_context = {"code": "measurement_missing", "message": "本次接触未取得新测厚读数"}
+            self.state("RETRY_REQUIRED", "已回原位但本次测厚无有效回包；等待重拍")
+            return
         self.completed_points += 1
         if self.completed_points == len(self.batch):
             self.state("DONE", "全部检测点测完并返回同一原位；导纳输出保持关闭")
@@ -728,8 +957,81 @@ class DetectController(Node):
         if np.linalg.norm(self.force) >= self.cfg["initial_force_limit"]:
             raise RuntimeError("回原位后仍有较大外力，停止后续检测点")
         self.point_index += 1
-        self.pre, self.far = self.batch[self.point_index]
-        self.plan_pose(self.pre)
+        self.pre, self.final = self.batch[self.point_index]
+        if self.cfg.get('joint_postures_enabled', False):
+            self.plan_joints(self.postures['detection_ready'], lambda: self.plan_pose(self.pre), 'DETECTION_GATEWAY')
+        else:
+            self.plan_pose(self.pre)
+
+    def publish_point_result(self):
+        """实际回原位后发布本点冻结的读数，不用回位途中其他查询的全局最新值覆盖。"""
+        stamp = self.get_clock().now().to_msg()
+        result = {
+            "schema": "paint_detection_point_result_v1", "result_id": f"{self.batch_id}_{self.point_index + 1}",
+            "batch_id": self.batch_id, "point_index": self.point_index + 1,
+            "success": self.thickness_result is not None or not self.cfg.get("require_thickness_measurement", False),
+            "returned_home": True, "measurement": deepcopy(self.thickness_result),
+            "completed_at_ros": {"sec": stamp.sec, "nanosec": stamp.nanosec},
+        }
+        encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
+        self.point_result_pub.publish(String(data=encoded))
+        try:
+            path = Path(self.cfg["point_results_file"]).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(encoded + "\n")
+        except OSError as error:
+            self.get_logger().error(f"回位测厚结果保存失败：{error}")
+
+    def begin_recovery(self, error):
+        """仅可恢复的接近失败：取消旧增量，先确认停止，之后才可能撤离和返回。"""
+        if not self.cfg.get("recover_approach_failure", False) or self.safety_inhibited:
+            self.fail(str(error))
+            return
+        self.retry_context = {"code": error.code, "message": str(error),
+                              "point_index": self.point_index + 1,
+                              "from_approach": self.phase in (
+                                  "DESCEND", "COMPLIANT_HOLD", "MOVEIT_PLAN_DESCENT",
+                                  "MOVEIT_DESCEND", "VERIFY_MOVEIT_SEGMENT")}
+        self.generation += 1
+        self.operation = None
+        self.stop_confirmed = False
+        if self.goal_handle is not None:
+            self.goal_handle.cancel_goal_async()
+            self.goal_handle = None
+        self.state("RECOVERY_STOP", "接近受限，先关闭导纳并等待旧运动完全结束")
+        self.set_enabled(False, self.recovery_stopped)
+
+    def recovery_stopped(self):
+        self.stop_confirmed = True
+        self.recovery_reference = None
+        self.recovery_quiet_since = None
+        self.state("RECOVERY_WAIT_STOP", "确认实际静止与力数据有效后再撤离")
+
+    def recovery_step(self):
+        if self.safety_inhibited or not self.stop_confirmed:
+            raise RuntimeError("恢复期间安全锁定或停止尚未确认")
+        if monotonic()-self.since > self.cfg["service_timeout"]:
+            raise RuntimeError("旧运动结束/实际静止确认超时，不自动回位")
+        if self.outstanding_actions:
+            return
+        force_limit = self.cfg["contact_force"] if self.retry_context["from_approach"] else self.cfg["initial_force_limit"]
+        if np.linalg.norm(self.force) >= force_limit:
+            raise RuntimeError("恢复前外力超过允许范围，保持停止")
+        positions = np.array([self.joints.position[self.joints.name.index(j)] for j in JOINTS])
+        moving = len(self.joints.velocity) == len(self.joints.name) and any(
+            abs(self.joints.velocity[self.joints.name.index(j)]) > .01 for j in JOINTS)
+        if self.recovery_reference is None or moving or np.max(np.abs(positions-self.recovery_reference)) > .0005:
+            self.recovery_reference = positions
+            self.recovery_quiet_since = monotonic()
+            return
+        if monotonic()-self.recovery_quiet_since < self.cfg["recovery_settle_seconds"]:
+            return
+        self.current_tool()  # 仍必须具有新鲜TF，不能凭规划返回值推断当前位置。
+        if self.retry_context["from_approach"]:
+            self.retreat()
+        else:
+            self.return_home()
 
     def cancel(self, request, response):
         del request
@@ -748,6 +1050,11 @@ class DetectController(Node):
         )
 
     def set_enabled(self, enabled, callback):
+        if self.cfg.get("touch_control_mode", "admittance") == "moveit_force_guard":
+            if enabled:
+                raise RuntimeError("moveit_force_guard 模式不允许启用导纳")
+            callback()
+            return
         req = SetBool.Request()
         req.data = enabled
 
@@ -807,14 +1114,35 @@ class DetectController(Node):
                     result.status != GoalStatus.STATUS_SUCCEEDED
                     or result.result.error_code.val != MoveItErrorCodes.SUCCESS
                 ):
-                    raise RuntimeError(
-                        f"MoveIt 执行失败：{result.result.error_code.val}"
-                    )
+                    code = result.result.error_code.val
+                    if self.phase == "PREPOSITION" and code in (MoveItErrorCodes.NO_IK_SOLUTION, MoveItErrorCodes.PLANNING_FAILED):
+                        raise RetryableApproachError("target_unreachable", f"预接近点不可达：{code}")
+                    raise RuntimeError(f"MoveIt 执行失败：{code}")
                 callback()
 
             self.wait(observation["result"], finished, self.cfg["phase_timeout"])
 
         self.wait(future, accepted)
+
+    def orientation_path_constraints(self):
+        """返回启动时 tool0 朝向的路径约束；输入为当前任务快照，输出 MoveIt Constraints。"""
+        constraints = Constraints()
+        if not self.cfg.get("lock_tool_orientation", False):
+            return constraints
+        reference = getattr(self, 'initial_pose', None)
+        if reference is None:
+            reference = self.current_tool()
+        constraint = OrientationConstraint()
+        constraint.header.frame_id = self.cfg['base_frame']
+        constraint.link_name = self.cfg['tool_frame']
+        constraint.orientation = to_pose(reference).orientation
+        constraint.absolute_x_axis_tolerance = self.cfg['orientation_tolerance']
+        constraint.absolute_y_axis_tolerance = self.cfg['orientation_tolerance']
+        constraint.absolute_z_axis_tolerance = self.cfg['orientation_tolerance']
+        constraint.weight = 1.0
+        constraints.name = 'keep_initial_tool_orientation'
+        constraints.orientation_constraints = [constraint]
+        return constraints
 
     def motion_request(self):
         goal = MoveGroup.Goal()
@@ -827,6 +1155,7 @@ class DetectController(Node):
         req.max_acceleration_scaling_factor = self.cfg["acceleration_scaling"]
         req.start_state.joint_state = deepcopy(self.joints)
         req.start_state.is_diff = True
+        req.path_constraints = self.orientation_path_constraints()
         goal.planning_options.plan_only = False
         goal.planning_options.planning_scene_diff.is_diff = True
         goal.planning_options.planning_scene_diff.robot_state.is_diff = True
@@ -838,7 +1167,7 @@ class DetectController(Node):
             (
                 "MoveIt 规划到固定初始位置"
                 if phase == "MOVE_INITIAL"
-                else "MoveIt 规划到探头目标正上方"
+                else "MoveIt 规划到探头目标的预接近点"
             ),
         )
         goal = self.motion_request()
@@ -893,11 +1222,25 @@ class DetectController(Node):
             raise RuntimeError("预接近时实际探头坐标未到达，不能仅检查 tool0 位置")
         self.command = current.copy()
         self.line_start = current.copy()
-        self.hold_z = self.far[2, 3]
-        self.bottom_z = self.hold_z - self.cfg["max_penetration"]
-        self.publish_target(self.command)
-        # 单独的命令话题和服务之间可能跨通道乱序；先让控制器锁存当前点，再启用。
-        self.state("ARM_DESCEND", "锁存当前 tool0 位姿后启用导纳")
+        self.contact_stop_requested = False
+        self.moveit_stop_since = None
+        self.moveit_stop_reference = None
+        self.axis = self.direction_for(current)
+        delta = self.final[:3, 3]-current[:3, 3]
+        self.nominal_distance = float(np.dot(delta, self.axis))
+        lateral = delta-self.nominal_distance*self.axis
+        if self.nominal_distance <= 0 or np.linalg.norm(lateral) > self.cfg['pose_tolerance']:
+            raise RuntimeError('名义检测点不在当前接近轴前方，或预接近横向误差超限')
+        self.travel_limit = self.nominal_distance+self.cfg['max_penetration']
+        self.get_logger().info(
+            f"接近方向={self.cfg['approach_axis']}，基座单位向量={self.axis.tolist()}；"
+            f"名义行程={self.nominal_distance*1000.:.1f}mm，额外行程上限={self.cfg['max_penetration']*1000.:.1f}mm")
+        if self.cfg.get("touch_control_mode", "admittance") == "moveit_force_guard":
+            self.state("MOVEIT_WAIT_CONTACT", "准备一次性规划沿接近轴的无碰撞直线路径")
+        else:
+            self.publish_target(self.command)
+            # 单独的命令话题和服务之间可能跨通道乱序；先让控制器锁存当前点，再启用。
+            self.state("ARM_DESCEND", "锁存当前 tool0 位姿后启用导纳")
 
     def rotation_ok(self, a, b):
         cosine = np.clip((np.trace(a[:3, :3].T @ b[:3, :3]) - 1) / 2, -1.0, 1.0)
@@ -927,29 +1270,136 @@ class DetectController(Node):
                 "测厚采集节点未连接：本次仅执行接触保持，不会生成真实厚度读数"
             )
 
+    def request_moveit_force_stop(self):
+        """取消当前普通 MoveIt 轨迹；动作确认结束后进入保持阶段。"""
+        if self.contact_stop_requested or self.phase in ("HOLD", "STOP_CONTACT"):
+            return
+        self.contact_stop_requested = True
+        self.moveit_stop_joint_stamp = Time.from_msg(self.joints.header.stamp).nanoseconds
+        self.moveit_stop_since = None
+        self.moveit_stop_reference = None
+        self.generation += 1
+        self.operation = None
+        if self.goal_handle is not None:
+            self.goal_handle.cancel_goal_async()
+            self.goal_handle = None
+        self.state("STOP_CONTACT", f"达到{self.cfg['contact_force']:g}N，取消当前 MoveIt 轨迹并等待停止确认")
+
+    def moveit_stop_ready(self):
+        # 只使用取消之后的新关节反馈，不能把取消前的静止快照当成已经停稳。
+        if (self.moveit_stop_joint_stamp is None or
+                Time.from_msg(self.joints.header.stamp).nanoseconds <= self.moveit_stop_joint_stamp):
+            self.moveit_stop_since = None
+            return False
+        positions = np.array([
+            self.joints.position[self.joints.name.index(j)] for j in JOINTS
+        ])
+        moving = len(self.joints.velocity) == len(self.joints.name) and any(
+            abs(self.joints.velocity[self.joints.name.index(j)]) > 0.01 for j in JOINTS)
+        if (self.moveit_stop_reference is None or moving or
+                np.max(np.abs(positions - self.moveit_stop_reference)) > 0.0005):
+            self.moveit_stop_reference = positions
+            self.moveit_stop_since = monotonic()
+            return False
+        return self.moveit_stop_since is not None and monotonic() - self.moveit_stop_since >= 0.2
+
+    def verify_moveit_segment(self):
+        self.moveit_segment_finished = self.get_clock().now()
+        self.state("VERIFY_MOVEIT_SEGMENT", "等待接近轨迹结束后的新 TF")
+
+    def plan_moveit_descent(self):
+        """一次性规划受碰撞检查的直线接近轨迹，执行期间由力阈值取消。"""
+        if self.contact_stop_requested:
+            return
+        current = self.current_tool()
+        if self.axial_force(self.force) >= self.cfg['contact_force']:
+            self.begin_hold()
+            return
+        limit = self.travel_limit if self.cfg['continue_until_contact'] else self.nominal_distance
+        target = current.copy()
+        target[:3, 3] = self.line_start[:3, 3] + self.axis * limit
+        if not self.in_workspace(target) or not self.in_workspace(target @ self.mounting):
+            raise RetryableApproachError('target_unreachable', 'MoveIt 接近终点超出工作空间')
+        self.state('MOVEIT_PLAN_DESCENT', 'MoveIt 计算单条直线接近路径；避障检查覆盖整条路径')
+        req = GetCartesianPath.Request()
+        req.header.frame_id = self.cfg['base_frame']
+        req.start_state.joint_state = deepcopy(self.joints)
+        req.start_state.is_diff = True
+        req.group_name = self.cfg['planning_group']
+        req.link_name = self.cfg['tool_frame']
+        req.waypoints = [to_pose(target)]
+        req.max_step = float(self.cfg['moveit_cartesian_step'])
+        req.jump_threshold = 1.5
+        req.avoid_collisions = True
+        req.path_constraints = self.orientation_path_constraints()
+        req.cartesian_speed_limited_link = self.cfg['tool_frame']
+        req.max_cartesian_speed = float(self.cfg['approach_speed'])
+        req.max_velocity_scaling_factor = self.cfg['velocity_scaling']
+        req.max_acceleration_scaling_factor = self.cfg['acceleration_scaling']
+
+        def planned(result):
+            if result.error_code.val != MoveItErrorCodes.SUCCESS or result.fraction < 0.999:
+                raise RetryableApproachError(
+                    'target_unreachable',
+                    f'MoveIt 无法生成完整无碰撞接近路径，完成比例={result.fraction:.3f}')
+            goal = ExecuteTrajectory.Goal()
+            goal.trajectory = result.solution
+            self.state('MOVEIT_DESCEND',
+                       f'沿接近轴以 {self.cfg["approach_speed"]:g} m/s 执行无碰撞路径；{self.cfg["contact_force"]:g}N 时取消')
+            self.action(self.execute, goal, self.verify_moveit_segment)
+
+        self.wait(self.cartesian.call_async(req), planned, self.cfg['phase_timeout'])
+
+    def verify_moveit_descent(self):
+        current = self.current_tool(after=self.moveit_segment_finished)
+        delta = current[:3, 3] - self.line_start[:3, 3]
+        actual_distance = float(np.dot(delta, self.axis))
+        lateral = delta - actual_distance * self.axis
+        if np.linalg.norm(lateral) > self.cfg['lateral_tolerance'] or not self.rotation_ok(current, self.line_start):
+            raise RuntimeError('MoveIt 接近时发生横向偏移或姿态超限')
+        limit = self.travel_limit if self.cfg['continue_until_contact'] else self.nominal_distance
+        if actual_distance > limit + self.cfg['pose_tolerance']:
+            raise RuntimeError('实际探入行程超过限制')
+        if abs(actual_distance - limit) > self.cfg['pose_tolerance']:
+            raise RuntimeError('MoveIt 接近轨迹执行后未到达设定行程')
+        if self.axial_force(self.force) >= self.cfg['contact_force']:
+            self.begin_hold()
+            return
+        if self.cfg['continue_until_contact']:
+            raise RetryableApproachError(
+                'travel_exhausted',
+                f'额外接近行程已用完，轴向力仍未达到{self.cfg["contact_force"]:g}N')
+        raise RetryableApproachError(
+            'contact_not_reached', '到达名义检测点但轴向力未达到接触阈值')
+
     def descend_step(self):
         current = self.current_tool()
-        if np.linalg.norm(current[:2, 3] - self.line_start[:2, 3]) > self.cfg[
-            "lateral_tolerance"
-        ] or not self.rotation_ok(current, self.line_start):
-            raise RuntimeError("垂直接近时 XY 或姿态偏离限制")
-        if current[2, 3] < self.bottom_z - self.cfg["pose_tolerance"]:
-            raise RuntimeError("实际探入行程超过限制")
-        if (
-            np.linalg.norm(current[:3, 3] - self.command[:3, 3])
-            > self.cfg["max_tracking_error"]
-        ):
-            raise RuntimeError("导纳跟踪误差过大")
-        if self.phase == "COMPLIANT_HOLD":
+        delta = current[:3, 3]-self.line_start[:3, 3]
+        actual_distance = float(np.dot(delta, self.axis))
+        lateral = delta-actual_distance*self.axis
+        if np.linalg.norm(lateral) > self.cfg['lateral_tolerance'] or not self.rotation_ok(current, self.line_start):
+            raise RuntimeError('沿接近轴运动时横向偏移或姿态超限')
+        if actual_distance > self.travel_limit+self.cfg['pose_tolerance']:
+            raise RuntimeError('实际探入行程超过限制')
+        if not self.in_workspace(current) or not self.in_workspace(current @ self.mounting):
+            raise RuntimeError('实际 tool0 或探针触点超出工作空间')
+        if np.linalg.norm(current[:3, 3]-self.command[:3, 3]) > self.cfg['max_tracking_error']:
+            raise RuntimeError('导纳跟踪误差过大')
+        if self.phase == 'COMPLIANT_HOLD':
             return
-        if self.command[2, 3] <= self.hold_z + 1e-7:
-            self.state("COMPLIANT_HOLD", "已到检测目标，维持阻抗控制；等待接触力达到阈值")
+        commanded_distance = float(np.dot(self.command[:3, 3]-self.line_start[:3, 3], self.axis))
+        continuing = self.cfg['continue_until_contact']
+        limit = self.travel_limit if continuing else self.nominal_distance
+        if commanded_distance >= limit-1e-7:
+            if continuing:
+                raise RetryableApproachError("travel_exhausted", f'额外接近行程已用完，轴向力仍未达到{self.cfg["contact_force"]:g}N')
+            self.state('COMPLIANT_HOLD', '已到检测目标，维持阻抗控制；等待接触力达到阈值')
             return
         candidate = self.command.copy()
-        candidate[2, 3] = max(
-            self.hold_z,
-            candidate[2, 3] - self.cfg["approach_speed"] / self.cfg["rate"],
-        )
+        travel = min(limit, commanded_distance+self.cfg['approach_speed']/self.cfg['rate'])
+        candidate[:3, 3] = self.line_start[:3, 3]+self.axis*travel
+        if not self.in_workspace(candidate) or not self.in_workspace(candidate @ self.mounting):
+            raise RetryableApproachError('target_unreachable', '下一接近增量超出 tool0 或探针工作空间')
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.cfg["planning_group"]
         req.ik_request.ik_link_name = self.cfg["tool_frame"]
@@ -960,20 +1410,23 @@ class DetectController(Node):
         req.ik_request.timeout.nanosec = 100000000
 
         def checked(result):
+            if result.error_code.val == MoveItErrorCodes.NO_IK_SOLUTION:
+                raise RetryableApproachError("target_unreachable", "接近增量没有无碰撞IK解")
             if result.error_code.val != MoveItErrorCodes.SUCCESS:
-                raise RuntimeError("接近增量没有无碰撞 IK 解")
+                raise RuntimeError("接近增量IK服务发生异常")
             self.command = candidate
             self.publish_target(candidate)
 
         self.wait(self.ik.call_async(req), checked)
 
     def retreat(self):
-        self.state("RETRACT", "MoveIt 计算沿基座 +Z 的垂直撤离路径")
+        self.state("RETRACT", "MoveIt 计算沿接近轴反向撤离的路径")
         current = self.current_tool()
         retreat = current.copy()
-        retreat[2, 3] = self.pre[2, 3]
-        if retreat[2, 3] <= current[2, 3]:
-            raise RuntimeError("撤离目标不在当前位置上方")
+        distance = max(self.cfg['approach_clearance'], float(np.dot(current[:3, 3]-self.pre[:3, 3], self.axis)))
+        retreat[:3, 3] -= self.axis*distance
+        if not self.in_workspace(retreat) or not self.in_workspace(retreat @ self.mounting):
+            raise RuntimeError('反向撤离目标超出工作空间；保持停止，不强行返回')
         req = GetCartesianPath.Request()
         req.header.frame_id = self.cfg["base_frame"]
         req.start_state.joint_state = deepcopy(self.joints)
@@ -984,6 +1437,7 @@ class DetectController(Node):
         req.max_step = 0.001
         req.jump_threshold = 1.5
         req.avoid_collisions = True
+        req.path_constraints = self.orientation_path_constraints()
         req.cartesian_speed_limited_link = self.cfg["tool_frame"]
         req.max_cartesian_speed = 0.005
         # Jazzy 支持这些字段；限制撤离轨迹的关节速度和加速度。
@@ -995,33 +1449,82 @@ class DetectController(Node):
                 result.error_code.val != MoveItErrorCodes.SUCCESS
                 or result.fraction < 0.999
             ):
-                raise RuntimeError("垂直撤离路径不完整，保持当前位置")
+                raise RuntimeError("沿接近轴反向撤离路径不完整，保持当前位置")
             goal = ExecuteTrajectory.Goal()
             goal.trajectory = result.solution
             self.action(self.execute, goal, self.return_home)
 
         self.wait(self.cartesian.call_async(req), planned, self.cfg["phase_timeout"])
 
+    def prepare_posture(self, name, response):
+        """公开准备接口：只接受已配置关节目标，动作完成后有实际到位确认。"""
+        try:
+            if not self.cfg.get('joint_postures_enabled', False):
+                raise ValueError('本配置未启用双关节姿态')
+            ready, reason = self.motion_readiness()
+            if not ready:
+                raise ValueError(reason)
+            self.generation += 1
+            self.operation = None
+            def move():
+                if name == 'travel':
+                    self.plan_joints(self.postures['detection_ready'],
+                        lambda: self.plan_joints(self.postures['travel'],
+                            lambda: self.state('READY_TRAVEL', '已到行驶关节姿态'), 'TRAVEL_POSTURE'),
+                        'RETURN_GATEWAY')
+                else:
+                    def capture_ready():
+                        if self.capture_joints is None:
+                            self.state('READY_DETECTION', '已到检测准备关节姿态')
+                        else:
+                            positions = [self.capture_joints.position[self.capture_joints.name.index(j)] for j in JOINTS]
+                            self.plan_joints(positions,
+                                lambda: self.state('READY_DETECTION', '已恢复本轮原拍照关节姿态'),
+                                'CAPTURE_POSTURE')
+                    self.plan_joints(self.postures['detection_ready'], capture_ready, 'DETECTION_GATEWAY')
+            self.set_enabled(False, move)
+            response.success, response.message = True, '关节姿态任务已接受，等待实际到位'
+        except Exception as error:
+            response.success, response.message = False, str(error)
+        return response
+
+    def plan_joints(self, positions, callback, phase):
+        self.joint_stage_target = list(positions)
+        self.joint_stage_callback = callback
+        self.state(phase, '按六轴关节目标规划；不使用末端XYZ求逆解')
+        goal = self.motion_request()
+        goal.request.path_constraints = Constraints()
+        goal.request.goal_constraints = [joint_constraints(positions)]
+        def finished():
+            self.joint_stage_finished = self.get_clock().now()
+            self.state('VERIFY_JOINT_POSTURE', '确认实际关节到位及新鲜TF')
+        self.action(self.move, goal, finished)
+
+    def verify_joint_posture(self):
+        error = max(abs(self.joints.position[self.joints.name.index(name)]-value)
+                    for name, value in zip(JOINTS, self.joint_stage_target))
+        if error > self.cfg['home_joint_tolerance']:
+            raise RuntimeError('关节准备姿态尚未实际到位')
+        self.current_tool(after=self.joint_stage_finished)
+
     def return_home(self, initial=False):
         self.verify_initial_home = initial
-        self.state("RETURN", "规划返回任务开始时的六轴关节位置")
+        if self.cfg.get('joint_postures_enabled', False):
+            self.plan_joints(self.postures['detection_ready'],
+                lambda: self.return_home_joints(initial), 'RETURN_GATEWAY')
+        else:
+            self.return_home_joints(initial)
+
+    def return_home_joints(self, initial=False):
+        self.verify_initial_home = initial
+        self.state('RETURN', '按关节角度返回行驶原位' if self.cfg.get('joint_postures_enabled', False)
+                   else '规划返回任务开始时的六轴关节位置')
         goal = self.motion_request()
-        constraints = Constraints()
-        for joint in JOINTS:
-            jc = JointConstraint()
-            jc.joint_name = joint
-            jc.position = self.initial_joints.position[
-                self.initial_joints.name.index(joint)
-            ]
-            jc.tolerance_above = jc.tolerance_below = 0.005
-            jc.weight = 1.0
-            constraints.joint_constraints.append(jc)
-        goal.request.goal_constraints = [constraints]
-        self.action(
-            self.move,
-            goal,
-            lambda: self.state("VERIFY_HOME", "确认已返回记录原位且外力回落后再继续"),
-        )
+        goal.request.path_constraints = Constraints()
+        positions = [self.initial_joints.position[self.initial_joints.name.index(j)] for j in JOINTS]
+        goal.request.goal_constraints = [joint_constraints(positions)]
+        self.action(self.move, goal,
+            lambda: self.state('VERIFY_HOME', '确认实际返回关节原位且外力回落后再继续'))
 
     def fail(self, detail):
         self.stop_confirmed = False
@@ -1031,6 +1534,10 @@ class DetectController(Node):
             self.goal_handle.cancel_goal_async()
             self.goal_handle = None
         self.state("FAULT", detail)
+        if self.touch_control_mode == "moveit_force_guard":
+            # MoveIt 轨迹取消由 action handle 处理；此模式没有导纳停止服务。
+            self.stop_confirmed = not bool(self.outstanding_actions)
+            return
         if self.enable.service_is_ready():
             req = SetBool.Request()
             req.data = False
@@ -1055,10 +1562,15 @@ class DetectController(Node):
                     self.stop_future = None
             if not self.active:
                 return
+            if self.cfg.get('joint_postures_enabled', False) and (
+                    not self.ground_ready or self.ground_subscription.get_publisher_count() == 0):
+                raise RuntimeError('地面碰撞场景确认丢失')
             if not self.fresh():
                 raise RuntimeError("关节、原始力或滤波力数据超时")
+            if self.cfg["lock_tool_orientation"] and not self.rotation_ok(self.current_tool(), self.initial_pose):
+                raise RuntimeError("运动途中 tool0 朝向偏离启动姿态，已取消检测")
             if (
-                self.phase not in ("HOLD", "COMPLIANT_HOLD")
+                self.phase not in ("HOLD", "COMPLIANT_HOLD", "STOP_CONTACT")
                 and monotonic() - self.since > self.cfg["phase_timeout"]
             ):
                 raise RuntimeError("当前阶段超时")
@@ -1066,6 +1578,16 @@ class DetectController(Node):
                 # 等待增量 IK 或实际到位时，持续发送上一个已验证目标；不增加行程。
                 # 数据断流、超载和阶段超时仍由前面的检查和力回调立即停止。
                 self.publish_target(self.command)
+            if self.phase == "MOVEIT_DESCEND":
+                current = self.current_tool()
+                delta = current[:3, 3] - self.line_start[:3, 3]
+                distance = float(np.dot(delta, self.axis))
+                limit = self.travel_limit if self.cfg['continue_until_contact'] else self.nominal_distance
+                if (np.linalg.norm(delta-distance*self.axis) > self.cfg['lateral_tolerance']
+                        or not self.rotation_ok(current, self.line_start)):
+                    raise RuntimeError('MoveIt 接近过程中发生横向偏移或姿态超限')
+                if distance > limit + self.cfg['pose_tolerance']:
+                    raise RuntimeError('MoveIt 接近过程中实际探入行程超过限制')
             if self.operation:
                 future, callback, since, timeout, generation = self.operation
                 if future.done():
@@ -1075,9 +1597,17 @@ class DetectController(Node):
                 elif monotonic() - since > timeout:
                     raise RuntimeError("服务或动作响应超时")
                 return
+            if self.phase == "STOP_CONTACT" and self.touch_control_mode == "moveit_force_guard":
+                if monotonic() - self.since > self.cfg["service_timeout"]:
+                    raise RuntimeError("接触停止后的 MoveIt 轨迹取消或停稳确认超时")
+                if self.outstanding_actions:
+                    return
+                if self.moveit_stop_ready():
+                    self.begin_hold()
+                return
             if self.phase == "ARM_DESCEND" and monotonic() - self.since > 0.2:
                 self.set_enabled(
-                    True, lambda: self.state("DESCEND", "沿基座 −Z 低速导纳接近")
+                    True, lambda: self.state("DESCEND", f"沿 {self.cfg['approach_axis']} 低速导纳接近；达到接触力后停止推进")
                 )
             elif self.phase == "VERIFY_INITIAL":
                 try:
@@ -1091,6 +1621,16 @@ class DetectController(Node):
                 except Exception as error:
                     if monotonic() - self.since > self.cfg["service_timeout"]:
                         raise RuntimeError(f"预接近到位确认超时：{error}") from error
+            elif self.phase == "RECOVERY_WAIT_STOP":
+                self.recovery_step()
+            elif self.phase == "VERIFY_JOINT_POSTURE":
+                try:
+                    self.verify_joint_posture()
+                except Exception as error:
+                    if monotonic()-self.since > self.cfg['service_timeout']:
+                        raise RuntimeError(f'关节姿态到位确认超时：{error}') from error
+                else:
+                    self.joint_stage_callback()
             elif self.phase == "VERIFY_HOME":
                 if (
                     self.home_reached()
@@ -1101,11 +1641,17 @@ class DetectController(Node):
                     raise RuntimeError("返回后未确认原位或外力未回落，停止后续检测点")
             elif self.phase in ("DESCEND", "COMPLIANT_HOLD"):
                 self.descend_step()
+            elif self.phase == "MOVEIT_WAIT_CONTACT":
+                self.plan_moveit_descent()
+            elif self.phase == "VERIFY_MOVEIT_SEGMENT":
+                self.verify_moveit_descent()
             elif (
                 self.phase == "HOLD"
                 and monotonic() - self.since >= self.cfg["hold_seconds"]
             ):
                 self.retreat()
+        except RetryableApproachError as error:
+            self.begin_recovery(error)
         except Exception as error:
             self.fail(str(error))
 
@@ -1136,14 +1682,16 @@ def main():
                 node.tick_timer.cancel()
                 try:
                     # 不在信号处理函数中打断 ROS 锁；先取消并请求当前位置保持。
-                    if rclpy.ok() and node.active:
+                    if rclpy.ok() and (node.active or node.outstanding_actions):
                         node.get_logger().info('收到退出请求，取消检测并请求当前位置保持')
                         node.fail('节点退出')
                         deadline = monotonic()+1.
                         while (rclpy.ok() and not expedite and monotonic() < deadline
-                               and node.stop_future is not None and not node.stop_future.done()):
+                               and ((node.stop_future is not None and not node.stop_future.done())
+                                    or node.outstanding_actions)):
                             executor.spin_once(timeout_sec=.05)
-                        if node.stop_future is not None and not node.stop_future.done():
+                        if ((node.stop_future is not None and not node.stop_future.done())
+                                or node.outstanding_actions):
                             node.get_logger().warning('退出保持未确认；请检查机器人停止状态')
                 finally:
                     executor.remove_node(node)

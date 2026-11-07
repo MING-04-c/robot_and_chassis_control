@@ -28,26 +28,80 @@ from std_msgs.msg import String, Empty
 from std_srvs.srv import SetBool, Trigger
 
 from stop_marker import StopMarkerGate, detect_stop_markers
+from start_alignment import StartLineAligner
+from charging_dock import ChargingDock
 from line_follow_workers import LatestWorker
 from reverse_visual import GroundMapping, near_line, aligned as visually_aligned, strafe_command, AlignmentSequencer
 from recorded_route import write_route_document, RouteConfig, RouteRecorder, ReverseRouteFollower, ReverseFinishGuard, load_route, wrap
 from line_follow_control import (ControlConfig, SteeringDirectionGuard, coordinated_velocity,
-                                 line_command, motion_preview, tracking_geometry, straight_image_axis, reverse_visual_command, slew)
+                                 line_command, motion_preview, tracking_geometry,
+                                 straight_image_axis, reverse_visual_command, slew)
+
+
+from dock_departure import DockDeparture
+from recorded_route import StandardRouteFollower
+from forward_navigation import ForwardNavigationConfig, ForwardRouteNavigator, VisualCommand
 
 
 class LineFollowNode(Node):
     def __init__(self):
         super().__init__('line_follow_controller')
-        cv2.setNumThreads(1)  # 限制掩膜处理线程，避免和控制循环争抢所有 CPU。
+        cv_threads = self.declare_parameter('opencv_threads', 2, ParameterDescriptor(read_only=True)).value
+        if type(cv_threads) is not int or not 1 <= cv_threads <= 4:
+            raise ValueError('opencv_threads must be 1..4')
+        cv2.setNumThreads(cv_threads)  # 后台掩膜计算受限并行，控制状态机保持串行。
         fixed = ParameterDescriptor(read_only=True)
         defaults = ControlConfig()
         values = {name: self.declare_parameter(name, value).value
                   for name, value in vars(defaults).items()}
         self.config = ControlConfig(**values)
         self.config.validate()
+        self.navigation_mode = self.declare_parameter('navigation_mode', 'vision', fixed).value
+        if self.navigation_mode not in ('vision', 'replay'):
+            raise ValueError('navigation_mode must be vision or replay')
+        self.standard_file = self.declare_parameter('standard_route_file', '~/.ros/line_follow/standards/route_01/standard_route.json', fixed).value
+        self.standard_document = self.standard_follower = None
+        self.standard_fault = None
+        self.standard_correction = 0.
+        self.standard_finish = None
+        self.standard_visual_loss = None
+        self.standard_navigator = None
+        self.standard_visual_loss_timeout = float(self.declare_parameter('standard_visual_loss_timeout', 5., fixed).value)
+        self.standard_visual_loss_distance = float(self.declare_parameter('standard_visual_loss_distance', .30, fixed).value)
+        if not 0. <= self.standard_visual_loss_timeout <= 10. or not 0. <= self.standard_visual_loss_distance <= .50:
+            raise ValueError('标准重放丢线续行限制需为0..10s、0..0.50m，0表示丢线即停')
+        self.standard_finish_distance = float(self.declare_parameter('standard_visual_finish_distance', .15, fixed).value)
+        self.standard_extra = float(self.declare_parameter('standard_finish_extra_distance', .05, fixed).value)
+        if not .05 <= self.standard_finish_distance <= .3 or not 0. <= self.standard_extra <= .1:
+            raise ValueError('标准前进末段视觉距离需0.05..0.30m，额外找线范围需0..0.10m')
+        self.forward_navigation_config = ForwardNavigationConfig(
+            finish_distance=self.standard_finish_distance, finish_extra_distance=self.standard_extra,
+            loss_timeout=self.standard_visual_loss_timeout, loss_distance=self.standard_visual_loss_distance,
+            assist_gain=float(self.declare_parameter('standard_visual_assist_gain', .5, fixed).value),
+            assist_max_yaw=float(self.declare_parameter('standard_visual_assist_max_yaw', .06, fixed).value))
+        self.forward_navigation_config.validate()
         self.reverse_mode = self.declare_parameter('reverse_mode', 'recorded_route', fixed).value
         if self.reverse_mode not in ('recorded_route', 'camera'):
             raise ValueError('reverse_mode must be recorded_route or camera')
+        self.departure_enabled = self.declare_parameter('dock_departure_enabled', True, fixed).value
+        self.departure_speed = float(self.declare_parameter('dock_departure_speed', .02, fixed).value)
+        if not .01 <= self.departure_speed <= .03:
+            raise ValueError('离桩速度需为0.01..0.03m/s')
+        self.departure = DockDeparture(
+            float(self.declare_parameter('dock_departure_max_distance', .30, fixed).value),
+            float(self.declare_parameter('dock_departure_timeout', 25., fixed).value))
+        self.departure_charging = self.departure_base_safe = False
+        self.departure_logged_state = None
+        self.charging_mode = self.declare_parameter('charging_mode', False, fixed).value
+        self.charging_layout = self.declare_parameter('charging_status_layout', 'byte_flags', fixed).value
+        if self.charging_layout not in ('bitfield32', 'byte_flags'):
+            raise ValueError('充电状态布局必须是bitfield32或byte_flags')
+        self.dock_limit = float(self.declare_parameter('charging_search_distance', .10, fixed).value)
+        self.dock = None
+        self.charge_value, self.charge_at, self.charge_stamp = None, None, None
+        self.charge_frames = 0
+        self.charge_safe = False
+        self.charge_candidate_at = None
         self.route_camera_stop = self.declare_parameter('route_camera_stop', True, fixed).value
         self.route_visual_finish = self.declare_parameter('route_visual_finish', True, fixed).value
         self.return_finish = None
@@ -60,6 +114,8 @@ class LineFollowNode(Node):
         self.return_camera_stamp = -1
         self.record_route = self.declare_parameter('record_route', True, fixed).value
         self.route_file = self.declare_parameter('route_file', '~/.ros/line_follow/last_route.json', fixed).value
+        if Path(self.standard_file).expanduser().resolve() == Path(self.route_file).expanduser().resolve():
+            raise ValueError('标准路线与当次路线必须分别保存，防止重放时覆盖标准数据')
         self.frozen_route_file = None
         self.route_checkpoint = None
         self.checkpoint_invalid_reason = None
@@ -69,8 +125,29 @@ class LineFollowNode(Node):
         self.route_config = RouteConfig(**{name: self.declare_parameter('route_'+name, value, fixed).value
                                           for name, value in vars(RouteConfig()).items()})
         self.route_config.validate()
+        self.forward_route_config = replace(self.route_config, max_curvature=float(
+            self.declare_parameter('forward_route_max_curvature', 5., fixed).value))
+        self.forward_route_config.validate()
+        self.reverse_route_lookahead = float(self.declare_parameter(
+            'reverse_route_lookahead', .26, fixed).value)
+        self.reverse_route_max_curvature = float(self.declare_parameter(
+            'reverse_route_max_curvature', 5., fixed).value)
+        replace(self.route_config, lookahead=self.reverse_route_lookahead,
+                max_curvature=self.reverse_route_max_curvature).validate()
+        self.dock = ChargingDock(self.route_config, self.dock_limit)
+        if self.charging_mode and (self.reverse_mode != 'recorded_route' or not self.route_visual_finish
+                                   or not self.route_camera_stop or not self.route_config.visual_strafe):
+            raise ValueError('充电模式需要记录路线、末段视觉及横移回中功能')
         mapping_file = self.declare_parameter('reverse_ground_mapping_file', '', fixed).value
         self.ground_mapping = GroundMapping(mapping_file) if mapping_file else None
+        self.start_aligner = StartLineAligner(
+            self.config, self.ground_mapping,
+            max_distance_m=self.config.start_alignment_max_distance)
+        self.start_alignment_active = False
+        self.start_alignment_departing = False
+        self.start_alignment_state = 'inactive'
+        self.pending_recorder = None
+        self.start_alignment_context = None
         self.reverse_feedback = None
         self.reverse_vy = self.previous_vy = 0.
         self.visual_alignment_since = None
@@ -147,7 +224,7 @@ class LineFollowNode(Node):
         self.reason = None
         self.input_reason = 'waiting'
         self.last_blocked_reason = None
-        self.cmd_pub = self.create_publisher(Twist, topics['cmd_vel_topic'], 10)
+        self.cmd_pub = self.create_publisher(Twist, topics['cmd_vel_topic'], 1)
         self.state_pub = self.create_publisher(String, '/line_follow/status', 10)
         self.station_event_pub = self.create_publisher(String, '/line_follow/station_events', 10)
         self.debug_pub = self.create_publisher(Image, '/line_follow/debug_image', qos_profile_sensor_data)
@@ -181,6 +258,7 @@ class LineFollowNode(Node):
         self.preview_closed = Event()
         self.workers_closing = Event()
         self.window_created = False
+        self.last_marker_latency_log = float('-inf')
         self.marker_worker = LatestWorker(self.detect_marker_frame, 'line-marker')
         self.preview_worker = LatestWorker(self.draw_preview, 'line-preview')
         self.route_writer = LatestWorker(write_route_document, 'line-route-save')
@@ -188,9 +266,19 @@ class LineFollowNode(Node):
         self.create_timer(self.control_period, self.tick)
         if self.uses_recorded_route():
             self.load_return_route()
-        elif self.enabled and self.record_route:
-            self.recorder = RouteRecorder(self.route_config, 'odom', 'base_link')
-            self.flush_route(wait=True)
+        elif self.enabled and self.config.drive_direction == 'forward':
+            if self.record_route:
+                initial = RouteRecorder(self.route_config, 'odom', 'base_link')
+                if self.start_alignment_required(self.config):
+                    self.recorder = initial
+                    self.pending_recorder = initial
+                    self.begin_start_alignment(initial)
+                    self.invalidate_route(initial)
+                else:
+                    self.recorder = initial
+                    self.flush_route(wait=True)
+            elif self.navigation_mode == 'replay' and self.start_alignment_required(self.config):
+                self.begin_start_alignment()
         self.get_logger().info(
             f'Line following ready: enabled={self.enabled}, '
             f'direction={self.config.drive_direction}, reverse_steering_sign={self.config.reverse_steering_sign:+.0f}, '
@@ -198,10 +286,45 @@ class LineFollowNode(Node):
             f'visual_strafe={self.route_config.visual_strafe}, '
             f'geometry={"ground_meters" if self.ground_mapping else "image_uncalibrated"}, '
             f'forward_speed={self.config.forward_speed:.3f} m/s; '
+            f'reverse_max_speed={self.config.reverse_max_speed:.3f} m/s; '
             f'{topics["line_status_topic"]} -> {topics["cmd_vel_topic"]}')
 
     def uses_recorded_route(self):
         return self.reverse_mode == 'recorded_route' and self.config.drive_direction == 'reverse'
+
+    def start_alignment_required(self, config):
+        """Only align when establishing a recorded or standard-route origin."""
+        return (config.start_alignment_enabled and config.stop_marker_enabled
+                and config.drive_direction == 'forward'
+                and (self.record_route or self.navigation_mode == 'replay'))
+
+    def begin_start_alignment(self, recorder=None, config=None):
+        config = self.config if config is None else config
+        self.start_alignment_departing = False
+        self.pending_recorder = recorder
+        pose = self.latest_odom['pose'] if self.latest_odom is not None else None
+        self.start_aligner.reset(time.monotonic(), pose)
+        self.start_alignment_active = True
+        self.start_alignment_state = 'start_alignment_waiting_for_marker'
+        self.last_start_alignment_step = 0
+        self.last_start_alignment_log = float('-inf')
+        self.marker_gate.reset(allow_start_marker=False)
+        self.start_alignment_context = dict(
+            enabled=True, target_ratio=config.stop_marker_target_ratio,
+            strategy='stop_observe_single_axis_step', settle_sec=config.start_alignment_settle_sec,
+            step_distance_limit_m=config.start_alignment_step_distance,
+            coordinate_source=('ground_mapping' if self.ground_mapping else 'image_ratio'),
+            ground_mapping_fit_error_m=(self.ground_mapping.fit_error_m if self.ground_mapping else None),
+            correction_max_distance_m=config.start_alignment_max_distance,
+            correction_max_reverse_distance_m=config.start_alignment_max_reverse_distance)
+
+    def invalidate_route(self, recorder):
+        """Replace a stale previous route with an explicitly invalid empty recording."""
+        ticket = self.route_writer.submit((self.route_file, recorder.document()))
+        self.route_writer.wait(ticket)
+        result = self.route_writer.take()
+        if result is not None and result[2] is not None:
+            raise OSError(f'route_save_failed: {result[2]}')
 
     def return_camera_stop_enabled(self):
         return self.uses_recorded_route() and self.route_camera_stop and self.config.stop_marker_enabled
@@ -270,14 +393,12 @@ class LineFollowNode(Node):
                                 if self.return_geometry_reason is None else None)
             feedback = self.return_visual_feedback()
             # 提前接管允许可信近端线段；不能要求反光/横线分割后的整条胶带都拟合成功。
-            valid = (feedback is not None and abs(feedback['near_heading_rad']) <= self.route_config.finish_entry_heading
-                     and abs(feedback['error_normalized']) <= .35
+            valid = (self.route_config.visual_entry_ok(feedback)
                      and abs(self.return_geometry.get('bend_angle_rad', math.inf)) <= self.route_config.finish_entry_bend
                      and line_command(self.return_observation, self.config)[2] == 'tracking')
             self.finish_straight_frames = min(3, self.finish_straight_frames+1) if valid else 0
             if self.route_config.visual_strafe:
-                valid = (feedback is not None and abs(feedback['near_heading_rad']) <= self.route_config.finish_entry_heading
-                         and abs(feedback['error_normalized']) <= .35)
+                valid = (self.route_config.visual_entry_ok(feedback))
                 # 不让远处弯道或交叉处的原始中线斜率覆盖已去横线的局部估计。
                 self.finish_straight_frames = min(3, getattr(self, 'strafe_entry_frames', 0)+1) if valid else 0
                 self.strafe_entry_frames = self.finish_straight_frames
@@ -371,6 +492,8 @@ class LineFollowNode(Node):
             self.get_logger().warning(f'站点日志保存失败：{result[2]}')
 
     def load_return_route(self):
+        self.charge_candidate_at = None
+        self.dock = ChargingDock(self.route_config, self.dock_limit)
         self.return_tracker = None
         self.reverse_feedback = None
         self.reverse_vy = self.previous_vy = 0.
@@ -452,7 +575,8 @@ class LineFollowNode(Node):
                         or math.dist(pose[:2], checkpoint['pose'][:2]) > .025
                         or abs(wrap(pose[2]-checkpoint['pose'][2])) > .05):
                     self.checkpoint_invalid_reason = 'saved_route_endpoint_moved_or_odom_reset'
-            if (self.recorder is not None and self.config.drive_direction == 'forward'
+            if (self.recorder is not None and not self.start_alignment_active
+                    and self.config.drive_direction == 'forward'
                     and (self.enabled or (self.record_stop_at is not None and now < self.record_stop_at))):
                 if not self.recorder.points:
                     self.recorder.frame, self.recorder.child = message.header.frame_id, message.child_frame_id
@@ -461,7 +585,7 @@ class LineFollowNode(Node):
                     if (abs(values[-3]) >= .01 or abs(values[-2]) >= .01 or abs(values[-1]) >= .05
                             or self.enabled and not self.marker_gate.arrived):
                         self.recorder.finished = False
-                    self.recorder.add(pose)
+                    self.recorder.add(pose, stamp=stamp/1e9, velocity=values[-3:])
                     if (now-self.last_route_save >= 1. or was_finished and not self.recorder.finished
                             or (not self.enabled or self.marker_gate.arrived) and not self.recorder.finished):
                         self.flush_route()
@@ -510,7 +634,11 @@ class LineFollowNode(Node):
         guard = self.return_finish
         fault = guard.check(pose)
         if fault is not None:
+            if self.charging_mode:
+                self.return_fault = fault
             return 0., 0., fault
+        if self.charging_mode:
+            return self.charging_finish_command(pose)
         if self.route_config.visual_strafe:
             return self.strafe_finish_command()
         if self.marker_gate.arrived:
@@ -550,7 +678,7 @@ class LineFollowNode(Node):
             return 0., 0., 'reverse_finish_alignment_out_of_range'
         # 末段回中偏角有界；相机安装方向不因倒车而反转。
         control = replace(self.config, forward_speed=min(self.config.forward_speed, self.route_config.finish_speed),
-                          reverse_max_speed=self.route_config.finish_speed,
+                          reverse_max_speed=min(self.config.reverse_max_speed, self.route_config.finish_speed),
                           reverse_steering_sign=self.route_config.finish_lateral_sign,
                           steering_gain=self.route_config.finish_center_gain,
                           reverse_heading_gain=self.route_config.finish_heading_gain,
@@ -589,6 +717,26 @@ class LineFollowNode(Node):
         guard.curvature += dt/(.25+dt)*(target-guard.curvature)
         return v, v*guard.curvature, 'reverse_visual_finish_tracking'
 
+    def charging_signal(self, now):
+        if self.charge_at is None or now-self.charge_at > 1. or self.charge_stamp is None:
+            return None
+        age = (self.get_clock().now().nanoseconds-self.charge_stamp)/1e9
+        return self.charge_value if -.1 <= age <= 1. else None
+
+    def charging_finish_command(self, pose):
+        terminal = self.marker_gate.arrived and self.marker_gate.latched_kind == 'final'
+        if self.marker_gate.arrived and not terminal:
+            return 0., 0., 'stop_marker_intermediate'
+        stopped = (abs(self.latest_odom['v']) < .005 and abs(self.latest_odom['vy']) < .005
+                   and abs(self.latest_odom['w']) < .015)
+        feedback = self.return_visual_feedback()
+        v, self.reverse_vy, w, reason = self.dock.command(pose, feedback, self.return_camera_stamp,
+            time.monotonic(), self.config, stopped, terminal, self.marker_gate.error)
+        if reason.startswith('charging_dock_'):
+            self.return_fault = reason
+        self.return_finish.diagnostics['charging_dock'] = self.dock.snapshot()
+        return v, w, reason
+
     def strafe_finish_command(self):
         """先横移回中并摆正，再纵向靠横线；到横线后只锁住纵向。"""
         self.geometry = self.return_geometry
@@ -623,7 +771,7 @@ class LineFollowNode(Node):
             return 0., 0., 'reverse_route_complete'
         if phase == 'ready' and not terminal:
             self.visual_alignment_since = None
-            return -min(self.config.forward_speed, route.finish_speed), 0., 'reverse_visual_finish_tracking'
+            return -min(self.config.forward_speed, self.config.reverse_max_speed, route.finish_speed), 0., 'reverse_visual_finish_tracking'
         if self.visual_alignment_since is None:
             self.visual_alignment_since = time.monotonic()
         if time.monotonic()-self.visual_alignment_since > 20.:
@@ -636,7 +784,47 @@ class LineFollowNode(Node):
         self.reverse_vy = 0.
         self.geometry = None
         reason = self.return_fault or self.blocked_reason(now, check_enabled=False)
-        if self.return_finish is not None and self.return_finish.arrived:
+        dock_active = self.charging_mode and self.config.drive_direction == 'reverse'
+        charge = self.charging_signal(now) if dock_active else None
+        if dock_active and (self.return_fault or self.dock.fault):
+            reason = self.return_fault or self.dock.fault
+        elif dock_active and self.enabled and charge is True:
+            # 第一次充电位立即发零速，连续新CAN帧确认后才报告完成；不因图像超时漏停。
+            pose = self.latest_odom.get('pose') if self.latest_odom is not None else None
+            marker_near = (pose is not None and self.dock.marker_anchor is not None
+                           and math.dist(pose[:2], self.dock.marker_anchor) <= self.dock_limit
+                           and self.dock.travel-self.dock.marker_travel+
+                               math.dist(pose[:2], self.dock.previous) <= self.dock_limit)
+            route_near = (pose is not None and self.return_tracker is not None
+                          and math.dist(pose[:2], self.return_tracker.points[-1]) <= self.dock_limit
+                          and self.return_tracker.diagnostics.get('remaining_m', math.inf) <= self.dock_limit)
+            near = (marker_near or route_near) and self.odom_reason(now) is None
+            near = near and self.connected and self.comm_time is not None and now-self.comm_time <= self.input_timeout
+            if self.dock.done:
+                reason = 'reverse_route_complete'
+            elif not self.charge_safe:
+                self.return_fault = reason = 'charging_dock_unsafe_charge_state'
+            elif not near:
+                self.return_fault = reason = 'charging_dock_unexpected_charge_location'
+            elif self.charge_frames >= 3:
+                if self.dock.fault or self.return_fault or (self.return_finish and self.return_finish.fault):
+                    reason = self.dock.fault or self.return_fault or self.return_finish.fault
+                else:
+                    self.dock.done, self.dock.state = True, 'charged'
+                    reason = 'reverse_route_complete'
+            else:
+                reason = 'charging_dock_confirming'
+        elif dock_active and self.dock.done:
+            reason = 'reverse_route_complete'  # 已完成保持停车，充电位抖动不重新发车。
+        elif dock_active and self.charge_candidate_at is not None:
+            reason = 'charging_dock_confirming'
+            if now-self.charge_candidate_at > 2.:
+                self.return_fault = reason = 'charging_dock_charge_unstable'
+        elif dock_active and charge is None:
+            reason = 'charging_dock_status_unavailable'
+            if self.enabled and self.charge_at is not None:
+                self.return_fault = reason
+        if self.return_finish is not None and self.return_finish.arrived and not dock_active:
             reason = 'reverse_route_complete'
         v = w = 0.
         if reason is None:
@@ -645,13 +833,16 @@ class LineFollowNode(Node):
                 if abs(self.latest_odom['v']) > .01 or abs(self.latest_odom['vy']) > .01 or abs(self.latest_odom['w']) > .05:
                     reason = 'reverse_start_not_stationary'
                 else:
-                    self.return_tracker = ReverseRouteFollower(self.route_document, pose, self.route_config)
+                    self.return_tracker = ReverseRouteFollower(self.route_document, pose,
+                        replace(self.route_config, lookahead=self.reverse_route_lookahead,
+                                max_curvature=self.reverse_route_max_curvature))
                     self.get_logger().info(
                         f'记录路线倒车：{self.route_document["length_m"]:.3f}m，终点对齐当前里程计；'
+                        f'跟踪曲率上限={self.reverse_route_max_curvature:.2f}/m；'
                         '须保持前进停车后的实际位置和朝向，不使用相机倒车反号参数')
             if self.return_tracker is not None:
                 v, w, reason = self.return_tracker.command(self.latest_odom['pose'],
-                    min(self.config.forward_speed, self.route_config.max_speed))
+                    min(self.config.forward_speed, self.config.reverse_max_speed, self.route_config.max_speed))
                 if (self.return_finish is None and self.route_visual_finish and self.return_camera_stop_enabled()
                         and reason in ('reverse_route_tracking', 'reverse_route_complete')
                         and self.return_tracker.diagnostics['remaining_m'] <= self.route_config.finish_straight_distance
@@ -661,7 +852,9 @@ class LineFollowNode(Node):
                         and abs(self.latest_odom['w']) <= self.route_config.finish_entry_yaw_rate):
                     try:
                         self.finish_entry_reason = 'confirmed_visual_path'
-                        self.return_finish = ReverseFinishGuard(self.return_tracker, self.latest_odom['pose'], self.route_config)
+                        self.return_finish = ReverseFinishGuard(self.return_tracker, self.latest_odom['pose'],
+                            replace(self.route_config, max_tracking_error=.10,
+                                    finish_extra_distance=self.dock_limit) if dock_active else self.route_config)
                         if abs(self.previous_v) > .005:
                             cap = self.route_config.max_curvature
                             self.return_finish.curvature = max(-cap, min(cap, self.previous_w/self.previous_v))
@@ -691,14 +884,16 @@ class LineFollowNode(Node):
                     self.return_fault = reason
             elif reason is None:
                 reason = 'reverse_route_ready'
+        if dock_active and self.return_fault:
+            self.dock.state = self.dock.fault = self.return_fault
         self.input_reason = reason
         state = reason if self.enabled else 'disabled'
         moving = self.enabled and reason in ('reverse_route_tracking', 'reverse_visual_finish_tracking', 'reverse_visual_finish_aligning')
-        if self.enabled and self.return_camera_stop_enabled():
+        if self.enabled and self.return_camera_stop_enabled() and not (dock_active and self.return_finish is not None):
             if self.marker_gate.arrived and reason != 'reverse_route_complete' and self.return_finish is None:
                 state, moving = 'stop_marker_intermediate', False
             elif moving and reason != 'reverse_visual_finish_aligning':
-                limited, marker_state = self.marker_gate.limit(v, self.config, now=now)
+                limited, marker_state = self.marker_gate.limit(v, self.config, now=now, dt=dt)
                 w *= abs(limited/v) if v else 0.
                 v = limited
                 if marker_state != 'searching':
@@ -707,6 +902,11 @@ class LineFollowNode(Node):
         if not moving:
             v = w = 0.
         else:
+            # 途中允许跟随记录中的急弯，但不能超过底盘角速度上限。
+            # 同比例降低线/角速度，保持几何曲率；末段仍沿用原有小曲率限制。
+            if self.return_finish is None and abs(w) > self.config.max_angular_speed:
+                scale = self.config.max_angular_speed/abs(w)
+                v, w = v*scale, w*scale
             target_v = v
             if self.route_config.visual_strafe and self.return_finish is not None:
                 v = slew(self.previous_v, v, self.config.linear_acceleration, dt) if v else 0.
@@ -717,7 +917,9 @@ class LineFollowNode(Node):
                 w *= abs(target_v/v)
                 v = target_v
             if not (self.route_config.visual_strafe and self.return_finish is not None):
-                cap = abs(v)*self.route_config.max_curvature
+                curvature_cap = (self.return_tracker.config.max_curvature
+                                 if self.return_finish is None else self.route_config.max_curvature)
+                cap = abs(v)*curvature_cap
                 w = max(-cap, min(cap, w))
         if self.enabled and self.return_camera_stop_enabled():
             self.marker_gate.record_motion(v, dt, self.config)
@@ -747,6 +949,13 @@ class LineFollowNode(Node):
         if state != self.reason:
             self.reason = state
             self.get_logger().info(f'Line following state: {state}')
+            if state in ('reverse_route_deviation', 'reverse_target_not_behind'):
+                self.get_logger().error('倒车路径跟踪保护：'+json.dumps(
+                    self.return_tracker.diagnostics, ensure_ascii=False))
+            if dock_active and state.startswith('charging_dock_') and state != 'charging_dock_confirming':
+                self.get_logger().error('倒车充电已停止：'+state+'；诊断='+json.dumps(self.dock.snapshot(), ensure_ascii=False))
+            if dock_active and state == 'reverse_route_complete' and self.dock.done:
+                self.get_logger().info('连续新反馈确认已充电，保持停车，不因充电位抖动重新发车')
             if state == 'reverse_finish_goal_not_centered':
                 self.get_logger().warning(
                     '终点横线已到，但横向/朝向尚未连续3帧达标；保持停车，未报告返程完成。'
@@ -770,13 +979,21 @@ class LineFollowNode(Node):
                 'route_file': os.path.expanduser(self.route_file), 'route_snapshot_file': self.frozen_route_file,
                 'checkpoint_error': self.checkpoint_invalid_reason, 'route_error': self.route_load_error,
                 'route': detail, 'route_camera_stop': self.return_camera_stop_enabled(),
+                'standard_route': dict(mode=self.navigation_mode, file=self.standard_file,
+                    diagnostics=self.standard_follower.diagnostics if self.standard_follower else None,
+                    visual_correction_radps=self.standard_correction, visual_loss=self.standard_visual_loss,
+                    finish=self.standard_finish, fault=self.standard_fault,
+                    controller=self.standard_navigator.diagnostics if self.standard_navigator else None),
                 'station_counts': dict(self.marker_gate.ledger.counts),
                 'stop_marker': self.marker_gate.snapshot(self.config),
                 'stop_detection': self.stop_detection,
                 'visual_finish': self.return_finish.diagnostics if self.return_finish is not None else None,
+                'charging_mode': dock_active, 'charging_dock': self.dock.snapshot(),
+                'charging_signal': charge, 'charging_status_layout': self.charging_layout,
                 'visual_entry_reason': self.finish_entry_reason, 'visual_straight_frames': self.finish_straight_frames,
                 'visual_axis': self.return_visual_feedback(),
-                'completion_source': ('camera_stop_marker' if self.return_finish is not None and self.return_finish.arrived else None),
+                'completion_source': ('charging_signal' if dock_active and self.dock.done else
+                                      'camera_stop_marker' if self.return_finish is not None and self.return_finish.arrived else None),
                 'command_linear_x_mps': v, 'command_linear_y_mps': self.previous_vy, 'command_angular_z_radps': w,
                 'visual_geometry_mode': 'ground_meters' if self.ground_mapping else 'image_uncalibrated'})))
         if self.enabled and self.return_tracker is not None and now-self.last_steering_log >= 5.:
@@ -862,16 +1079,223 @@ class LineFollowNode(Node):
                     if self.marker_header is not None else -1)
         # 参数/使能切换后的旧结果不能重新武装停车状态；过期结果不刷新新鲜度。
         if config is not self.config or stamp <= previous or not -.1 <= age <= self.input_timeout:
+            now = time.monotonic()
+            if age > self.input_timeout and now-self.last_marker_latency_log > 5.:
+                self.last_marker_latency_log = now
+                self.get_logger().warning(
+                    f'横线结果已过期：源图到结果={age*1000:.0f}ms，'
+                    f'横线检测计算={diagnostics.get("detector_processing_ms", 0):.0f}ms；'
+                    '未使用过期结果，需检查上游处理/调度延迟')
             return
         diagnostics['result_age_ms'] = round(age*1000, 1)
         self.marker_candidates, self.stop_detection = candidates, diagnostics
         if self.return_camera_stop_enabled():
             self.marker_candidates = [dict(marker, kind='final' if self.finish_marker_is_final() else 'intermediate')
                                       for marker in candidates]
-        if self.enabled:
-            self.marker_gate.observe(self.marker_candidates, height, self.config)
+        if self.enabled and not self.start_alignment_active:
+            self.marker_gate.observe(self.marker_candidates, height, self.config,
+                                     start_alignment=False)
+        if self.start_alignment_active:
+            width = (self.status.get('image_width') if isinstance(self.status, dict) else None)
+            if isinstance(width, int):
+                stamp_ns = header.stamp.sec*10**9+header.stamp.nanosec
+                received_at = time.monotonic()
+                self.start_aligner.observe(self.marker_candidates, width, height,
+                                           stamp_ns, received_at, source_time=received_at-age)
         self.marker_header = header
         self.marker_time = time.monotonic()
+
+    def tick_start_alignment(self, now, dt, input_reason):
+        """Run stopped visual observations separated by bounded odometry steps.
+
+        The marker gate is still fed for diagnostics, but its normal stop output
+        is bypassed here.  The route origin is committed only after fresh visual
+        evidence and a stationary odometry sample agree.
+        """
+        departure_command = self.tick_alignment_departure(now, dt, input_reason)
+        if departure_command is not None:
+            return departure_command
+        pose = self.latest_odom['pose'] if self.latest_odom is not None else None
+        odom_fresh = self.odom_reason(now) is None
+        stopped = (self.latest_odom is not None
+                   and abs(self.latest_odom['v']) < .005
+                   and abs(self.latest_odom['vy']) < .005
+                   and abs(self.latest_odom['w']) < .015)
+        line_ready = (input_reason is None and self.status_time is not None
+                      and self.path_time is not None and self.marker_time is not None)
+        self.start_aligner.input_block_reason = input_reason
+        previous_state = self.start_alignment_state
+        state = self.start_aligner.command(now, pose, odom_fresh=odom_fresh,
+                                           line_ready=line_ready, stopped=stopped)
+        self.start_alignment_state = state
+        if (now-self.last_start_alignment_log >= 2.
+                or state.startswith('start_alignment_failed') and state != previous_state):
+            self.last_start_alignment_log = now
+            snapshot = self.start_aligner.snapshot()
+            velocity = ({key: self.latest_odom[key] for key in ('v', 'vy', 'w')}
+                        if self.latest_odom is not None else None)
+            self.get_logger().info('起步对齐诊断：'+json.dumps(dict(
+                state=state, axis=snapshot['axis'], phase=snapshot['phase'],
+                input_block=input_reason, odometry_reason=self.odom_reason(now),
+                stopped=stopped, actual_velocity=velocity,
+                last_command=dict(v=self.previous_v, vy=self.previous_vy, w=self.previous_w),
+                step_target_m=self.start_aligner.step_distance or self.start_aligner.step_lateral_m,
+                step_actual_m=snapshot['step_actual_m'], step_remaining_m=snapshot['step_remaining_m'],
+                step_actual_rad=snapshot['step_actual_rad'],
+                step_age_sec=(now-self.start_aligner.step_started_at
+                              if self.start_aligner.step_started_at is not None else None),
+                lateral_min_speed=self.config.start_alignment_min_lateral_speed,
+                marker_candidates=len(self.marker_candidates),
+                marker_rejected=self.stop_detection.get('rejected', {}),
+                detector_processing_ms=self.stop_detection.get('detector_processing_ms'),
+                marker_result_age_ms=self.stop_detection.get('result_age_ms'),
+                samples=snapshot['samples'], required_samples=snapshot['filter_frames'],
+                confirmations=snapshot['stable_frames'], required_confirmations=snapshot['confirmation_frames'],
+                longitudinal_error=(self.start_aligner.position_error_m if self.start_aligner.metric
+                                    else self.start_aligner.position_error),
+                longitudinal_unit='m' if self.start_aligner.metric else 'image_ratio',
+                lateral_error=self.start_aligner.lateral_error,
+                lateral_unit=snapshot['lateral_error_unit'],
+                heading_error_rad=self.start_aligner.heading_error,
+                observation_age_sec=snapshot['observation_age_sec']), ensure_ascii=False))
+        if self.start_aligner.step_count > self.last_start_alignment_step:
+            self.last_start_alignment_step = self.start_aligner.step_count
+            estimate = self.start_aligner.estimated_remaining_m
+            estimate_text = ('未建立可靠距离比例，先小步试探' if estimate is None else
+                             f'估计距目标={estimate*1000:.1f}mm')
+            if self.start_aligner.step_axis == 'heading':
+                estimate_text = '先修正朝向，再估计平移距离'
+            self.get_logger().info(
+                f'起步对齐第{self.start_aligner.step_count}步：'
+                f'轴={self.start_aligner.step_axis}，'
+                f'{estimate_text}，估计来源={self.start_aligner.distance_estimate_source}，'
+                f'比例检查={self.start_aligner.response_reason}，'
+                f'前后目标={self.start_aligner.step_distance*1000:.1f}mm，'
+                f'横移目标={self.start_aligner.step_lateral_m*1000:.1f}mm，'
+                f'目标转角={math.degrees(self.start_aligner.step_angle):.1f}deg；'
+                '里程计到位后停车，等待新画面稳定再复核')
+        if state.startswith('start_alignment_failed'):
+            self._latch_start_alignment_failure(state)
+            self.stop()
+            return 0., 0., 0., state
+        if state == 'start_alignment_complete' and stopped:
+            if self._complete_start_alignment(now):
+                return 0., 0., 0., 'start_alignment_complete'
+            self._latch_start_alignment_failure(
+                'start_alignment_failed_route_init: '+(self.standard_fault or 'route initialization failed'))
+            self.stop()
+            return 0., 0., 0., 'start_alignment_failed_route_init'
+        v, vy, w = self.start_aligner.velocity()
+        if self.start_aligner.phase != 'moving':
+            self.start_aligner.record_command(0.)
+            return 0., 0., 0., state
+        # Inactive axes go directly to zero. Never slew a previous axis into a
+        # newly selected one; every phase change already includes a stopped dwell.
+        v = slew(self.previous_v, v, self.config.linear_acceleration, dt) if v else 0.
+        vy = slew(self.previous_vy, vy, self.config.linear_acceleration, dt) if vy else 0.
+        w = slew(self.previous_w, w, self.config.angular_acceleration, dt) if w else 0.
+        v = max(-self.config.start_alignment_speed,
+                min(self.config.start_alignment_speed, v))
+        w = max(-self.config.start_alignment_max_angular_speed,
+                min(self.config.start_alignment_max_angular_speed, w))
+        vy = max(-self.config.start_alignment_lateral_speed,
+                 min(self.config.start_alignment_lateral_speed, vy))
+        self.start_aligner.record_command(v)
+        return v, vy, w, state
+
+    def tick_alignment_departure(self, now, dt, input_reason):
+        """Finish bounded straight undocking before starting the visual servo.
+
+        The existing departure gate supplies charging confirmation, distance and
+        time limits. Never use its charging exception for a lateral/yaw step.
+        """
+        if self.start_aligner.fault is not None:
+            return None
+        if self.departure.fault:
+            reason = 'start_alignment_failed_'+self.departure.fault
+            self._latch_start_alignment_failure(reason)
+            self.stop()
+            return 0., 0., 0., reason
+        if self.departure.state == 'active' and not self.start_alignment_departing:
+            self.start_alignment_departing = True
+            self.get_logger().info(
+                '起步仍在充电桩：先低速直线前进离桩，禁止横移和旋转；'
+                '连续3帧确认脱离后停车，再进行视觉对齐和路线记录')
+        if not self.start_alignment_departing:
+            return None
+        if self.departure.state == 'active':
+            self.start_alignment_state = 'start_alignment_departing_dock'
+            self.start_aligner.input_block_reason = input_reason
+            if input_reason is not None or not self.departure_permitted():
+                return 0., 0., 0., self.start_alignment_state
+            target = min(self.departure_speed, self.config.forward_speed)
+            v = max(0., min(target, slew(self.previous_v, target,
+                                       self.config.linear_acceleration, dt)))
+            return v, 0., 0., self.start_alignment_state
+        # Discard every pre-undocking observation and start the normal stopped
+        # dwell. Neither undocking nor its observation wait enters the route.
+        self.start_alignment_departing = False
+        pose = self.latest_odom['pose'] if self.latest_odom is not None else None
+        self.start_aligner.reset(now, pose)
+        self.start_alignment_context['dock_departure'] = self.departure.snapshot()
+        self.start_alignment_state = 'start_alignment_settling_after_departure'
+        self.get_logger().info('已连续3帧确认脱离充电桩：先停车，再等待新画面进行起步对齐')
+        return 0., 0., 0., self.start_alignment_state
+
+    def _latch_start_alignment_failure(self, reason):
+        self.start_alignment_active = True  # Keep publishing zero until explicit disable/re-enable.
+        self.start_alignment_state = reason
+        self.start_aligner.fault = reason
+        self.start_aligner.state = reason
+        if self.recorder is not None:
+            self.recorder.fault = reason
+            self.flush_route()
+        self.pending_recorder = None
+
+    def _complete_start_alignment(self, now):
+        """Latch the aligned odometry pose as the route origin."""
+        if self.latest_odom is None or self.odom_reason(now) is not None:
+            return False
+        pose = self.latest_odom['pose']
+        marker = self.start_aligner.marker
+        if self.navigation_mode == 'replay':
+            try:
+                reason = self.standard_start_reason(self.config)
+                if reason is not None:
+                    self.standard_fault = reason
+                    return False
+                tracker = StandardRouteFollower(self.standard_document, pose, self.forward_route_config)
+            except (OSError, ValueError, KeyError) as error:
+                self.standard_fault = 'standard_route_start: '+str(error)
+                return False
+        else:
+            tracker = None
+        if not self.marker_gate.complete_start_alignment(self.config, marker=marker):
+            return False
+        if self.pending_recorder is not None:
+            recorder = self.pending_recorder
+            recorder.frame = self.latest_odom['frame']
+            recorder.child = self.latest_odom['child']
+            recorder.context['start_alignment'] = self.start_aligner.snapshot()
+            recorder.context['start_alignment_context'] = self.start_alignment_context
+            observation = self.status if isinstance(self.status, dict) else {}
+            geometry, _ = tracking_geometry(self.path_points, observation.get('image_width'),
+                                            observation.get('image_height'), self.config)
+            if geometry is not None:
+                recorder.context['start_visual'] = {name: geometry[name] for name in
+                    ('error_normalized', 'near_heading_rad')}
+            recorder.add(pose, stamp=self.latest_odom['stamp']/1e9,
+                         velocity=(self.latest_odom['v'], self.latest_odom['vy'], self.latest_odom['w']))
+            self.recorder = recorder
+            self.pending_recorder = None
+        if tracker is not None:
+            self.standard_follower = tracker
+            self.standard_fault = None
+        self.start_alignment_active = False
+        self.start_alignment_state = 'start_alignment_complete'
+        self.start_alignment_context = None
+        self.route_saved_finished = False
+        return True
 
     def check_route_writer(self):
         result = self.route_writer.take()
@@ -929,9 +1353,47 @@ class LineFollowNode(Node):
         if (not self.enabled and enabled and candidate.drive_direction == 'reverse'
                 and self.checkpoint_invalid_reason is not None):
             return SetParametersResult(successful=False, reason=self.checkpoint_invalid_reason)
-        if not self.enabled and enabled and candidate.drive_direction == 'forward' and self.record_route:
+        align_start = self.start_alignment_required(candidate)
+        if (not self.enabled and enabled and candidate.drive_direction == 'forward'
+                and self.navigation_mode == 'replay'):
+            try:
+                document = self.read_standard()
+                if self.odom_reason(time.monotonic()) is not None:
+                    raise ValueError('重放需要有效里程计')
+                if (document['frame_id'] != self.latest_odom['frame']
+                        or document['child_frame_id'] != self.latest_odom['child']):
+                    raise ValueError('标准路线与当前里程计坐标系名称不一致')
+                if abs(self.latest_odom['v']) > .005 or abs(self.latest_odom['vy']) > .005 or abs(self.latest_odom['w']) > .015:
+                    raise ValueError('重放前必须停稳')
+                if not candidate.stop_marker_enabled:
+                    raise ValueError('标准重放必须保留横线检测')
+                if not align_start:
+                    reason = self.standard_start_reason(candidate)
+                    if reason is not None:
+                        raise ValueError(reason)
+                tracker = None if align_start else StandardRouteFollower(
+                    document, self.latest_odom['pose'], self.forward_route_config)
+            except (OSError, ValueError, KeyError) as error:
+                return SetParametersResult(successful=False, reason='standard_route_start: '+str(error))
+            self.standard_document, self.standard_follower, self.standard_fault = document, tracker, None
+            self.standard_finish = None
+            self.standard_visual_loss = None
+            self.standard_navigator = None
+            if align_start and not self.record_route:
+                self.begin_start_alignment(config=candidate)
+        if (not self.enabled and enabled and candidate.drive_direction == 'forward'
+                and self.record_route):
             self.frozen_route_file = self.route_checkpoint = self.checkpoint_invalid_reason = None
             recorder = RouteRecorder(self.route_config, 'odom', 'base_link')
+            recorder.context = dict(control=vars(candidate), route=vars(self.route_config),
+                image_size=[self.status.get('image_width'), self.status.get('image_height')]
+                    if isinstance(self.status, dict) else None)
+            if isinstance(self.status, dict) and not align_start:
+                initial_geometry, _ = tracking_geometry(self.path_points, self.status.get('image_width'),
+                                                        self.status.get('image_height'), candidate)
+                if initial_geometry is not None:
+                    recorder.context['start_visual'] = {name: initial_geometry[name] for name in
+                        ('error_normalized', 'near_heading_rad')}
             try:
                 ticket = self.route_writer.submit((self.route_file, recorder.document()))
                 self.route_writer.wait(ticket)
@@ -940,19 +1402,38 @@ class LineFollowNode(Node):
                     raise OSError(str(result[2]))
             except (OSError, ValueError, TimeoutError) as error:
                 return SetParametersResult(successful=False, reason=f'route_save_failed: {error}')
-            self.recorder = recorder
+            if align_start:
+                self.recorder = recorder
+                self.pending_recorder = recorder
+                self.begin_start_alignment(recorder, config=candidate)
+            else:
+                self.recorder = recorder
+                self.pending_recorder = None
+                self.start_alignment_active = False
             self.route_saved_finished = False
             self.record_stop_at = None
-            self.get_logger().info(f'开始记录前进路线：{os.path.expanduser(self.route_file)}')
+            self.get_logger().info(
+                ('起步视觉对齐已启用；对齐确认后才开始记录路线：' if align_start else '开始记录前进路线：')
+                + os.path.expanduser(self.route_file))
         if self.enabled and not enabled:
             self.record_stop_at = time.monotonic()+1.
+            if self.start_alignment_active and self.pending_recorder is not None:
+                self.pending_recorder.fault = 'start_alignment_cancelled'
+                self.pending_recorder.finished = False
+                self.recorder = self.pending_recorder
             self.flush_route(finish=True, wait=True)
+            self.start_alignment_active = False
+            self.pending_recorder = None
+            self.start_aligner.reset()
+            self.start_alignment_state = 'inactive'
         if (candidate.drive_direction == 'reverse' and
                 (not self.enabled and enabled or candidate.drive_direction != self.config.drive_direction)):
             self.flush_route(wait=True)
             self.load_return_route()
         marker_was_enabled = self.config.stop_marker_enabled
         self.config = candidate
+        self.start_aligner.config = candidate
+        self.start_aligner.max_distance_m = candidate.start_alignment_max_distance
         if ((candidate.stop_marker_enabled and not marker_was_enabled) or updates.keys() & {
                 'stop_marker_target_ratio', 'stop_marker_average_frames',
                 'stop_marker_average_max_age_sec', 'stop_marker_position_tolerance_ratio',
@@ -966,8 +1447,11 @@ class LineFollowNode(Node):
             self.return_axis = None
             self.return_camera_stamp = -1
         if enabled and not self.enabled:
+            self.departure.reset()
             self.marker_gate.reset()
             self.station_run_events = []
+            if self.start_alignment_active:
+                self.marker_gate.reset(allow_start_marker=False)
         if enabled != self.enabled or updates.keys() & {
                 "image_forward_direction", "drive_direction", "reverse_steering_sign",
                 "vehicle_reference_x_ratio", "vehicle_reference_y_ratio"}:
@@ -981,7 +1465,10 @@ class LineFollowNode(Node):
     def on_enable(self, request, response):
         results = self.set_parameters([rclpy.parameter.Parameter('enabled', value=request.data)])
         response.success = results[0].successful
-        response.message = 'enabled' if self.enabled else 'disabled'
+        response.message = (('enabled' if self.enabled else 'disabled') if response.success
+                            else results[0].reason or '循迹使能参数被拒绝，状态保持不变')
+        if not response.success:
+            self.get_logger().warning('循迹使能请求被拒绝：'+response.message)
         return response
 
     def on_save_route(self, request, response):
@@ -1016,19 +1503,66 @@ class LineFollowNode(Node):
             response.success, response.message = False, 'route checkpoint failed: '+str(error)
         return response
 
+    def read_standard(self):
+        document = load_route(self.standard_file)
+        info = document.get('standard_route', {})
+        if info.get('schema') != 'robot_standard_route_v1' or not info.get('quality', {}).get('accepted'):
+            raise ValueError('文件不是已通过质量检查的标准路线，请先运行teach模式')
+        self.standard_document = document
+        return document
+
+    def standard_start_reason(self, config):
+        status = self.status if isinstance(self.status, dict) else {}
+        geometry, reason = tracking_geometry(self.path_points,
+            status.get('image_width'), status.get('image_height'), config)
+        if reason is not None:
+            return reason
+        recorded = (self.standard_document or {}).get('recording_config', {})
+        reference = recorded.get('start_visual')
+        if reference is not None and (abs(geometry['error_normalized']-reference['error_normalized']) > .08
+                or abs(wrap(geometry['near_heading_rad']-reference['near_heading_rad'])) > .07):
+            return 'standard_start_differs_from_teach: 当前起步对线与录制时差异过大，请重新摆正'
+        for key in ('image_forward_direction', 'steering_sign', 'vehicle_reference_x_ratio', 'vehicle_reference_y_ratio'):
+            if key in recorded.get('control', {}) and getattr(config, key) != recorded['control'][key]:
+                return 'standard_camera_config_changed: 相机方向/安装参考已变化，请重新录制'
+        # A separate near-line fit cross-checks the bar aligner's filtered fit.
+        # Allow a small fit discrepancy, but reject the logged crooked departure.
+        if abs(geometry['error_normalized']) > .04 or abs(geometry['near_heading_rad']) > .07:
+            return 'standard_start_not_aligned: 近端主线复核未通过，请摆正或检查视觉拟合；横向需小于半图宽4%、图像切线约4度'
+        return None
+
     def on_ready(self, request, response):
         """Check real inputs without enabling the follower or issuing motion."""
         del request
         if self.uses_recorded_route():
             if self.route_document is None:
                 self.load_return_route()
-            reason = self.blocked_reason(time.monotonic(), check_enabled=False)
+            now = time.monotonic()
+            reason = self.blocked_reason(now, check_enabled=False)
+            if reason is None and self.charging_mode and self.charging_signal(now) is None:
+                reason = 'charging_dock_status_unavailable'
             response.success = reason is None
             response.message = ('recorded route and odometry ready' if reason is None else
                                 f'{reason}; route={self.route_file}; detail={self.route_load_error}')
             return response
         reason = self.blocked_reason(time.monotonic(), check_enabled=False)
-        if reason is None:
+        if reason is None and self.navigation_mode == 'replay' and not self.start_alignment_required(self.config):
+            try:
+                self.read_standard()
+                reason = self.standard_start_reason(self.config)
+            except (OSError, ValueError, KeyError) as error:
+                reason = 'standard_route_unavailable: '+str(error)
+        elif reason is None and self.navigation_mode == 'replay':
+            try:
+                document = self.read_standard()
+                if self.odom_reason(time.monotonic()) is not None:
+                    reason = 'route_odom_unavailable'
+                elif (document['frame_id'] != self.latest_odom['frame']
+                      or document['child_frame_id'] != self.latest_odom['child']):
+                    reason = 'standard_route_frame_mismatch'
+            except (OSError, ValueError, KeyError) as error:
+                reason = 'standard_route_unavailable: '+str(error)
+        if reason is None and not self.start_alignment_required(self.config):
             observation = dict(self.status) if isinstance(self.status, dict) else {}
             geometry, reason = tracking_geometry(
                 self.path_points, observation.get('image_width'),
@@ -1038,8 +1572,13 @@ class LineFollowNode(Node):
                 _, _, reason = line_command(observation, self.config)
                 if reason == 'tracking' and self.ready_frames < self.reacquire_frames:
                     reason = 'reacquiring'
-        response.success = reason == 'tracking'
-        response.message = 'chassis and USB tracking inputs ready' if response.success else str(reason)
+        if self.start_alignment_required(self.config):
+            response.success = reason is None
+            response.message = ('chassis, odometry and departure-bar alignment inputs ready'
+                                if response.success else str(reason))
+        else:
+            response.success = reason == 'tracking'
+            response.message = 'chassis and USB tracking inputs ready' if response.success else str(reason)
         return response
 
     @staticmethod
@@ -1110,10 +1649,11 @@ class LineFollowNode(Node):
         except (ValueError, TypeError):
             status = None
         if isinstance(status, dict) and self.stage_frame('status', status):
-            # 明确的丢线/超时不等待其他通道，立即零速。
+            # 处理超预算立即停车；重放中段的单纯丢线交给有界里程计续行。
             key = status['source_stamp_sec']*10**9+status['source_stamp_nanosec']
             if key >= self.committed_stamp and (
-                    status.get('lost') is True or status.get('processing_over_budget') is True):
+                    status.get('processing_over_budget') is True or
+                    status.get('lost') is True and not self.standard_middle_active()):
                 self.good_frames = self.ready_frames = 0
                 self.recovery_deadline = None
                 self.stop()
@@ -1157,7 +1697,8 @@ class LineFollowNode(Node):
             elif reason not in ('insufficient_rows', 'insufficient_forward_span', 'no_forward_line'):
                 self.recovery_deadline = None
             self.good_frames = 0
-            self.stop()
+            if not self.standard_middle_active():
+                self.stop()
 
     def on_path(self, message):
         if self.uses_recorded_route():
@@ -1176,7 +1717,8 @@ class LineFollowNode(Node):
             self.recovery_deadline = None
             self.ready_frames = 0
             self.good_frames = 0
-            self.stop()
+            if not self.standard_middle_active():
+                self.stop()
 
     def on_comm(self, message):
         self.connected = message.comm_state == CommStatus.COMM_STATE_CONNECTED
@@ -1188,6 +1730,24 @@ class LineFollowNode(Node):
             self.stop()
 
     def on_chassis(self, message):
+        stamp = message.header.stamp.sec*10**9+message.header.stamp.nanosec
+        now = time.monotonic()
+        current = (bool(message.system_status_flags & (1 << 3)) if self.charging_layout == 'bitfield32'
+                   else bool(message.manual_charging or message.dock_charging))
+        self.charge_safe = (message.chassis_fault == 0 and
+            (not (message.system_status_flags & 3) if self.charging_layout == 'bitfield32' else
+             message.chassis_state not in (ChassisStatus.CHASSIS_STATE_ESTOP,
+                 ChassisStatus.CHASSIS_STATE_FAULT, ChassisStatus.CHASSIS_STATE_TOW)
+             and not message.excessive_tilt and message.obstacle_status_flags == 0))
+        if stamp != self.charge_stamp:
+            continuous = (self.charge_at is not None and now-self.charge_at < 1.
+                          and self.charge_stamp is not None and 0 < stamp-self.charge_stamp <= 10**9)
+            self.charge_frames = self.charge_frames+1 if current and continuous and self.charge_value else int(current)
+            self.charge_value, self.charge_at, self.charge_stamp = current, now, stamp
+        if self.charging_mode and self.config.drive_direction == 'reverse' and current:
+            if self.enabled and self.charge_candidate_at is None:
+                self.charge_candidate_at = now
+            self.stop()
         # Park is allowed: the driver's auto_unlock_on_cmd releases it.
         self.chassis_allowed = (
             message.chassis_state in (
@@ -1198,12 +1758,24 @@ class LineFollowNode(Node):
             and not message.manual_charging
             and not message.dock_charging
         )
+        self.departure_charging = bool(message.dock_charging) or bool(current)
+        self.departure_base_safe = (
+            message.chassis_state in (ChassisStatus.CHASSIS_STATE_COMM_CONTROL, ChassisStatus.CHASSIS_STATE_PARK)
+            and message.chassis_fault == 0 and message.obstacle_status_flags == 0
+            and not message.excessive_tilt and not message.manual_charging)
+        self.departure.observe(self.departure_charging, stamp)
         self.chassis_time = time.monotonic()
-        if not self.chassis_allowed and not self.dry_run:
+        if not self.chassis_allowed and not self.departure_permitted() and not self.dry_run:
             self.recovery_deadline = None
             self.ready_frames = 0
             self.good_frames = 0
             self.stop()
+
+    def departure_permitted(self):
+        """只允许前进离桩；完成后再出现充电信号不重新豁免。"""
+        return (self.departure_enabled and self.config.drive_direction == 'forward'
+                and self.departure_base_safe and self.departure.state in ('idle', 'active')
+                and (self.departure_charging or self.departure.state == 'active'))
 
     def blocked_reason(self, now, check_enabled=True):
         if check_enabled and not self.enabled:
@@ -1214,13 +1786,15 @@ class LineFollowNode(Node):
                 not self.connected or self.comm_time is None
                 or now - self.comm_time > self.comm_timeout):
             return 'chassis_disconnected'
+        if self.departure.fault:
+            return self.departure.fault
         if not self.dry_run and (
-                not self.chassis_allowed or self.chassis_time is None
+                (not self.chassis_allowed and not self.departure_permitted()) or self.chassis_time is None
                 or now - self.chassis_time > self.input_timeout):
             return 'chassis_not_ready'
         if self.record_route and not self.uses_recorded_route() and self.recorder is not None and self.recorder.fault:
             return 'route_record_failed'
-        if self.uses_recorded_route() or self.record_route:
+        if self.uses_recorded_route() or self.record_route or self.departure_permitted() or self.navigation_mode == 'replay':
             odom_reason = self.odom_reason(now)
             if odom_reason is not None:
                 return odom_reason
@@ -1242,7 +1816,7 @@ class LineFollowNode(Node):
             age = (self.get_clock().now().nanoseconds-stamp.sec*10**9-stamp.nanosec)/1e9
             if not -0.1 <= age <= self.input_timeout:
                 return 'stop_marker_mask_stale'
-        if not self.path_valid or self.path_header is None:
+        if self.path_header is None or not self.path_valid and not self.standard_middle_active():
             return 'empty_centerline'
         if self.path_header.frame_id == 'synthetic_demo' and not self.dry_run:
             return 'synthetic_input'
@@ -1430,6 +2004,52 @@ class LineFollowNode(Node):
         self.steering_guard.reset()
         self.cmd_pub.publish(Twist())
 
+    def standard_middle_active(self):
+        """Line geometry may be absent only after anchoring and before final approach."""
+        return (self.enabled and self.navigation_mode == 'replay'
+                and self.config.drive_direction == 'forward' and not self.start_alignment_active
+                and self.standard_follower is not None and self.standard_fault is None
+                and self.standard_finish is None
+                and self.standard_follower.diagnostics.get('remaining_m', 0.) > self.standard_finish_distance)
+
+    def standard_forward_command(self, now, geometry_reason):
+        """ROS inputs/interlocks stay here; phase arbitration has one owner."""
+        if self.standard_fault or self.standard_follower is None:
+            return 0., 0., self.standard_fault or 'standard_route_not_initialized'
+        if (self.standard_navigator is None
+                or self.standard_navigator.follower is not self.standard_follower):
+            self.standard_navigator = ForwardRouteNavigator(
+                self.standard_follower, self.forward_navigation_config)
+        navigator = self.standard_navigator
+        observation = dict(self.status) if isinstance(self.status, dict) else {}
+        if self.geometry is not None:
+            observation = self.local_observation(observation, self.geometry)
+        vision_v, vision_w, visual_reason = line_command(observation, self.config)
+        if observation.get('processing_over_budget') is not False:
+            visual_reason = 'processing_over_budget'
+        elif geometry_reason is not None:
+            visual_reason = geometry_reason
+        geometry = self.geometry or {}
+        visual = VisualCommand(visual_reason, vision_v, vision_w,
+            geometry.get('error_normalized', 0.), geometry.get('near_heading_rad', 0.),
+            self.good_frames >= self.reacquire_frames)
+        old_phase, old_loss = navigator.phase, navigator.visual_loss
+        v, w, reason = navigator.command(now, self.latest_odom['pose'], self.config.forward_speed, visual)
+        self.standard_fault = navigator.fault
+        self.standard_finish = navigator.finish
+        self.standard_visual_loss = navigator.visual_loss
+        self.standard_correction = navigator.correction
+        if old_phase != navigator.phase:
+            self.get_logger().info('标准重放阶段：'+old_phase+' -> '+navigator.phase)
+        if old_loss is None and navigator.visual_loss is not None:
+            self.get_logger().info(
+                f'标准重放暂时丢线：里程计限速续行，最多{self.standard_visual_loss_timeout:g}秒/'
+                f'{self.standard_visual_loss_distance*100:g}厘米，末段仍需视觉确认')
+        elif old_loss is not None and navigator.visual_loss is None and navigator.phase == 'route':
+            self.get_logger().info('标准重放主线已稳定恢复，恢复视觉辅助')
+        self.control_curve_strength = min(1., abs(w/max(v, .005))/self.forward_route_config.max_curvature)
+        return v, w, reason
+
     def tick(self):
         self.collect_marker_result()
         self.drain_station_events()
@@ -1450,6 +2070,13 @@ class LineFollowNode(Node):
         if self.uses_recorded_route():
             self.tick_return_route(now, dt)
             return
+        if (self.enabled and self.config.drive_direction == 'forward'
+                and self.departure_enabled and self.odom_reason(now) is None):
+            self.departure.advance(now, self.latest_odom['pose'], self.departure_charging)
+        if self.departure.state != self.departure_logged_state:
+            self.departure_logged_state = self.departure.state
+            if self.departure.state != 'idle':
+                self.get_logger().info('充电桩离站状态：'+json.dumps(self.departure.snapshot(), ensure_ascii=False))
         observation = dict(self.status) if isinstance(self.status, dict) else {}
         self.geometry, geometry_reason = tracking_geometry(
             self.path_points, observation.get('image_width'),
@@ -1460,8 +2087,15 @@ class LineFollowNode(Node):
             geometry_reason = 'camera_timeout'
         # 独立计算输入是否可走，禁用后仍显示真实输入状态，便于区分识别与任务使能问题。
         input_reason = self.blocked_reason(now, check_enabled=False)
-        v = w = 0.0
-        if input_reason is None:
+        v = vy = w = 0.0
+        alignment_running = self.start_alignment_active
+        if alignment_running:
+            v, vy, w, input_reason = self.tick_start_alignment(now, dt, input_reason)
+        elif input_reason is None and self.navigation_mode == 'replay' and self.enabled:
+            v, w, input_reason = self.standard_forward_command(now, geometry_reason)
+            if self.geometry is not None:
+                observation = self.local_observation(observation, self.geometry)
+        elif input_reason is None:
             if geometry_reason is not None:
                 input_reason = geometry_reason
             else:
@@ -1479,25 +2113,35 @@ class LineFollowNode(Node):
         if self.enabled:
             if input_reason != 'tracking':
                 self.last_blocked_reason = input_reason
-            if reason == 'tracking' and self.good_frames < self.reacquire_frames:
+            if reason == 'tracking' and self.good_frames < self.reacquire_frames and not self.standard_middle_active():
                 v = w = 0.0
                 reason = 'reacquiring'
         else:
             self.good_frames = 0
-        if self.enabled and self.config.stop_marker_enabled and self.marker_gate.arrived:
+        if (self.enabled and self.config.stop_marker_enabled and self.marker_gate.arrived
+                and not alignment_running):
             # 停车状态锁定；输入诊断仍通过 input_state 报告，恢复视觉不自动开走。
-            v = w = 0.0
+            v = vy = w = 0.0
             self.steering_guard.reset()
             reason = 'stop_marker_'+self.marker_gate.state(self.config).removeprefix('stopped_')
         elif reason == 'tracking':
             stamp = self.path_header.stamp
             sample = (stamp.sec, stamp.nanosec)
-            curvature = self.steering_guard.update(w, self.config, sample, dt,
-                error_normalized=observation['error_normalized'],
-                curve_strength=self.control_curve_strength)
+            if self.standard_middle_active():
+                # The recorded metric path supplies curvature, independently of
+                # camera frame rate and image steering deadbands.
+                curvature = w/max(v, .005)
+                cap = self.forward_route_config.max_curvature
+                curvature = max(-cap, min(cap, curvature))
+                self.steering_guard.raw_curvature = self.steering_guard.curvature = curvature
+                self.steering_guard.state = 'standard_route'
+            else:
+                curvature = self.steering_guard.update(w, self.config, sample, dt,
+                    error_normalized=observation['error_normalized'],
+                    curve_strength=self.control_curve_strength)
             marker_state = 'searching'
             if self.config.stop_marker_enabled:
-                v, marker_state = self.marker_gate.limit(v, self.config, now=now)
+                v, marker_state = self.marker_gate.limit(v, self.config, now=now, dt=dt)
                 if marker_state != 'searching':
                     reason = 'stop_marker_'+marker_state.removeprefix('stopped_')
             target_v = v
@@ -1505,23 +2149,32 @@ class LineFollowNode(Node):
                 self.config.curve_max_angular_speed-self.config.max_angular_speed)
             if self.config.drive_direction == 'reverse':
                 yaw_limit = min(yaw_limit, self.config.max_angular_speed)
+            if self.standard_middle_active() and abs(curvature*target_v) > yaw_limit:
+                # RPP-style regulation: keep the requested radius when yaw is capped.
+                target_v = min(target_v, yaw_limit/abs(curvature))
             target_w = max(-yaw_limit, min(yaw_limit, curvature*target_v))
             v, w = coordinated_velocity(self.previous_v, self.previous_w,
                 target_v, target_w, self.config, dt, self.control_curve_strength)
-            if marker_state != 'searching' and abs(v) > abs(target_v):
+            if (marker_state != 'searching' or self.navigation_mode == 'replay') and abs(v) > abs(target_v):
                 # 停车接近限速是硬上限；同步缩小角速度，避免降线速度却突然打大轮向。
                 w *= abs(target_v/v)
                 v = target_v
+        elif reason.startswith('start_alignment_'):
+            # tick_start_alignment has already applied bounded velocity/turn rates.
+            pass
         else:
-            v = w = 0.0
+            v = vy = w = 0.0
             self.steering_guard.reset()
             if self.recovery_deadline is None or now > self.recovery_deadline:
                 self.control_curve_strength = 0.0
-        self.previous_v, self.previous_w = v, w
+        if self.departure.state == 'active' and v > self.departure_speed:
+            w *= self.departure_speed/v
+            v = self.departure_speed
+        self.previous_v, self.previous_vy, self.previous_w = v, vy, w
         if self.enabled:
             self.marker_gate.record_motion(v, dt, self.config)
         command = Twist()
-        command.linear.x, command.angular.z = v, w
+        command.linear.x, command.linear.y, command.angular.z = v, vy, w
         self.cmd_pub.publish(command)
         if (self.enabled and reason in ('tracking', 'stop_marker_approaching', 'stop_marker_missing_approaching')
                 and now-self.last_steering_log >= 5.):
@@ -1554,6 +2207,7 @@ class LineFollowNode(Node):
             self.state_pub.publish(String(data=json.dumps({
                 'state': reason, 'enabled': self.enabled,
                 'input_state': self.input_reason, 'last_blocked_reason': self.last_blocked_reason,
+                'dock_departure': self.departure.snapshot(),
                 'image_forward_direction': self.config.image_forward_direction,
                 'drive_direction': self.config.drive_direction,
                 'reverse_steering_sign': self.config.reverse_steering_sign,
@@ -1565,6 +2219,14 @@ class LineFollowNode(Node):
                 'filtered_curvature_per_m': self.steering_guard.curvature,
                 'frame_synchronized': self.frame_sync, 'source_stamp_ns': self.committed_stamp,
                 'geometry': self.geometry,
+                'start_alignment': (self.start_aligner.snapshot()
+                                    if self.start_alignment_active or
+                                    self.start_alignment_state != 'inactive' else None),
+                'standard_route': dict(mode=self.navigation_mode, file=self.standard_file,
+                    diagnostics=self.standard_follower.diagnostics if self.standard_follower else None,
+                    visual_correction_radps=self.standard_correction, visual_loss=self.standard_visual_loss,
+                    finish=self.standard_finish, fault=self.standard_fault,
+                    controller=self.standard_navigator.diagnostics if self.standard_navigator else None),
                 'station_counts': dict(self.marker_gate.ledger.counts),
                 'stop_marker': self.marker_gate.snapshot(self.config),
                 'stop_detection': self.stop_detection,

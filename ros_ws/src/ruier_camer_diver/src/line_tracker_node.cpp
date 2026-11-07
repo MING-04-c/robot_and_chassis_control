@@ -29,6 +29,17 @@ public:
   {
     rcl_interfaces::msg::ParameterDescriptor fixed;
     fixed.read_only = true;
+    max_processing_fps_ = declare_parameter<double>("max_processing_fps", 0.0, fixed);
+    if (!std::isfinite(max_processing_fps_) || max_processing_fps_ < 0.0 || max_processing_fps_ > 30.0) {
+      throw std::invalid_argument("max_processing_fps must be 0..30; 0 means unlimited");
+    }
+    const int opencv_threads = declare_parameter<int>("opencv_threads", 2, fixed);
+    if (opencv_threads < 1 || opencv_threads > 4) {
+      throw std::invalid_argument("opencv_threads must be 1..4");
+    }
+    // 树莓派同时运行ROS控制：限制图像算法线程，避免争抢控制回调CPU。
+    cv::setNumThreads(opencv_threads);
+    RCLCPP_INFO(get_logger(), "OpenCV processing threads: %d", cv::getNumThreads());
     const auto topic = declare_parameter<std::string>("input_topic", "image_raw", fixed);
     show_window_ = declare_parameter<bool>("show_window", false, fixed);
     timeout_ = declare_parameter<double>("frame_timeout_sec", 0.5, fixed);
@@ -238,6 +249,11 @@ private:
   void on_image(sensor_msgs::msg::Image::ConstSharedPtr message)
   {
     const auto start = std::chrono::steady_clock::now();
+    if (max_processing_fps_ > 0.0 && std::chrono::duration<double>(
+        start - last_processing_started_).count() < 1.0 / max_processing_fps_) {
+      return;  // 控制/里程计频率不变，只减少图像算法执行次数，不排队积压。
+    }
+    last_processing_started_ = start;
     last_receipt_ = start;
     received_ = true;
     last_header_ = message->header;
@@ -383,6 +399,8 @@ private:
   LineConfig config_;
   bool show_window_ = false, received_ = false;
   double timeout_ = 0.5;
+  double max_processing_fps_ = 0.0;
+  std::chrono::steady_clock::time_point last_processing_started_{};
   const std::string window_name_ = "Blue line tracking - live ROS2";
   std::chrono::steady_clock::time_point last_receipt_;
   std::chrono::steady_clock::time_point last_processing_finished_;

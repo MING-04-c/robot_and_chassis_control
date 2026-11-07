@@ -1,42 +1,87 @@
-"""整体联动：初始点、循迹、机械臂点位、采图发送；可选 TCP 远程开始。"""
+"""循迹各站点联动：行驶关节姿态、中转、机械臂点位、等待下一次开始。"""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, NotSubstitution, PathJoinSubstitution
+from launch.substitutions import EqualsSubstitution, IfElseSubstitution, LaunchConfiguration, NotSubstitution, OrSubstitution, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     share = FindPackageShare("robot_task_control")
     return LaunchDescription([
+        DeclareLaunchArgument('test_profile', default_value='stations', choices=['stations', 'return_charge'],
+                             description='stations逐站四点；return_charge首条有效横线到站后中转等待5秒并返程充电'),
+        DeclareLaunchArgument('charging_status_layout', default_value='byte_flags', choices=['bitfield32', 'byte_flags']),
+        DeclareLaunchArgument('enable_status_monitor', default_value='true', choices=['true', 'false'],
+                             description='启用额外只读状态汇总；与TCP通信、自动开始独立'),
         DeclareLaunchArgument("remote_control", default_value="false", choices=["true", "false"],
                              description="true: 加载TCP并等待主机开始；false: 就绪后自动执行"),
+        DeclareLaunchArgument('start_tcp', default_value=OrSubstitution(
+            LaunchConfiguration('remote_control'), LaunchConfiguration('enable_status_monitor')),
+            choices=['true', 'false'], description='启动9010 TCP桥；关闭状态汇总后仍可单独开启'),
+        DeclareLaunchArgument('line_follow_speed', default_value=IfElseSubstitution(
+            EqualsSubstitution(LaunchConfiguration('test_profile'), 'return_charge'), '0.03', '0.075')),
+        DeclareLaunchArgument('route_file', default_value='~/.ros/line_follow/last_route.json'),
+        DeclareLaunchArgument('reverse_route_max_curvature', default_value='5.0'),
         DeclareLaunchArgument("auto_start", default_value=NotSubstitution(
             LaunchConfiguration("remote_control"))),
         DeclareLaunchArgument("key_file", default_value=""),
+        DeclareLaunchArgument("launch_admittance", default_value="false"),
+        DeclareLaunchArgument("launch_rviz", default_value="false",
+                             description="树莓派默认关闭RViz；循迹画面由line_show_window单独控制"),
+        DeclareLaunchArgument("prepare_line_camera_early", default_value=EqualsSubstitution(
+            LaunchConfiguration('test_profile'), 'return_charge')),
+        DeclareLaunchArgument('launch_force_sensor', default_value=IfElseSubstitution(
+            EqualsSubstitution(LaunchConfiguration('test_profile'), 'return_charge'), 'false', 'true')),
         DeclareLaunchArgument("workflow_file", default_value=PathJoinSubstitution(
-            [share, "config", "line_follow_arm_test.yaml"])),
+            [share, "config", IfElseSubstitution(
+                EqualsSubstitution(LaunchConfiguration('test_profile'), 'return_charge'),
+                'line_follow_arm_charge_test.yaml', 'line_follow_arm_test.yaml')])),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution([
                 FindPackageShare("eli_cs_robot_serial"), "launch", "industrial_pc.launch.py",
             ])),
-            condition=IfCondition(LaunchConfiguration("remote_control")),
+            condition=IfCondition(OrSubstitution(LaunchConfiguration('remote_control'),
+                                                LaunchConfiguration('start_tcp'))),
             launch_arguments={"key_file": LaunchConfiguration("key_file"),
-                              "start_hk_transfer": "false"}.items(),
+                              "enable_status_monitor": LaunchConfiguration('enable_status_monitor'),
+                              "start_hk_transfer": "false",
+                              "charging_status_layout": LaunchConfiguration('charging_status_layout')}.items(),
         ),
+        Node(package='robot_task_control', executable='arm_joint_postures',
+             name='arm_joint_postures', output='screen', parameters=[{
+                 'simulation': False, 'manage_admittance': ParameterValue(LaunchConfiguration('launch_admittance'), value_type=bool),
+                 'velocity_scaling': .1, 'startup_timeout': 480.,
+                 'report_file': '~/.ros/robot_control/joint_postures.json',
+             }]),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(PathJoinSubstitution(
                 [share, "launch", "internal", "robot_system.launch.py"])),
             launch_arguments={
                 "workflow_file": LaunchConfiguration("workflow_file"),
+                "launch_admittance": LaunchConfiguration("launch_admittance"),
                 "auto_start": LaunchConfiguration("auto_start"),
                 "require_arm_ready": "true", "check_devices_on_startup": "true",
+                "joint_posture_only": EqualsSubstitution(LaunchConfiguration("test_profile"), "return_charge"),
+                "manage_line_stream": EqualsSubstitution(LaunchConfiguration("test_profile"), "return_charge"),
                 "chassis_pid_enabled": "false", "use_velocity_mux": "true",
-                "launch_arm_executor": "true", "arm_use_cartesian_path": "false",
+                "line_follow_speed": LaunchConfiguration('line_follow_speed'),
+                "line_route_file": LaunchConfiguration('route_file'),
+                "line_reverse_route_max_curvature": LaunchConfiguration('reverse_route_max_curvature'),
+                "launch_arm_executor": IfElseSubstitution(
+                    EqualsSubstitution(LaunchConfiguration('test_profile'), 'return_charge'), 'false', 'true'),
+                "arm_use_cartesian_path": "false",
+                'line_charging_mode': EqualsSubstitution(LaunchConfiguration('test_profile'), 'return_charge'),
+                'line_charging_status_layout': LaunchConfiguration('charging_status_layout'),
                 "start_hk_camera": "false", "start_image_transfer": "false",
                 "start_line_camera": "true",
+                "prepare_line_camera_early": LaunchConfiguration("prepare_line_camera_early"),
+                "launch_rviz": LaunchConfiguration("launch_rviz"),
+                'launch_force_sensor': LaunchConfiguration('launch_force_sensor'),
             }.items(),
         ),
     ])

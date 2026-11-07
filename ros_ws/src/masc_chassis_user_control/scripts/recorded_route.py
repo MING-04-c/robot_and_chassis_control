@@ -19,13 +19,18 @@ class RouteConfig:
     sample_distance: float = .02
     lookahead: float = .20
     max_speed: float = .08
+    lookahead_speed_reference: float = .10
+    min_lookahead: float = .08
+    max_lookahead: float = .36
+    max_lateral_accel: float = .025
     approach_distance: float = .10
     finish_distance: float = .30
     finish_straight_distance: float = .60
     finish_center_gain: float = .65
     finish_lateral_sign: float = 1.
-    finish_heading_gain: float = .80
+    finish_heading_gain: float = .60
     finish_entry_heading: float = .40
+    finish_entry_lateral: float = .65
     finish_exit_heading: float = .65
     finish_exit_lateral: float = .75
     finish_goal_lateral: float = .08
@@ -49,9 +54,12 @@ class RouteConfig:
 
     def validate(self):
         limits = {'sample_distance': (.005, .05), 'lookahead': (.05, .6),
-                  'max_speed': (.01, .10), 'approach_distance': (.05, .6),
+                  'max_speed': (.01, .20), 'lookahead_speed_reference': (.02, .3),
+                  'min_lookahead': (.05, .6), 'max_lookahead': (.05, .8),
+                  'max_lateral_accel': (.005, .2), 'approach_distance': (.05, .6),
                   'finish_distance': (.10, .60), 'finish_straight_distance': (.10, 1.),
                   'finish_center_gain': (.1, 1.), 'finish_heading_gain': (.1, 1.5),
+                  'finish_entry_lateral': (.1, .7),
                   'finish_entry_heading': (.12, .45), 'finish_exit_heading': (.4, .7),
                   'finish_exit_lateral': (.5, .95),
                   'finish_goal_lateral': (.02, .2), 'finish_goal_heading': (.03, .2),
@@ -70,14 +78,28 @@ class RouteConfig:
 
         if isinstance(self.finish_lateral_sign, bool) or self.finish_lateral_sign not in (-1., 1.):
             raise ValueError('route_finish_lateral_sign must be -1 or 1')
+        if self.min_lookahead > self.max_lookahead:
+            raise ValueError('route min lookahead must not exceed max lookahead')
         if type(self.visual_strafe) is not bool:
             raise ValueError('route_visual_strafe must be boolean')
         if self.visual_min_lateral_speed > self.visual_lateral_speed:
             raise ValueError('visual minimum lateral speed exceeds maximum')
+        if not self.finish_goal_lateral < self.finish_entry_lateral < self.finish_exit_lateral:
+            raise ValueError('visual lateral goal < entry < exit limits required')
         if self.finish_exit_heading-self.finish_entry_heading < .1:
             raise ValueError('visual heading exit limit must exceed entry limit by at least .1rad')
         if self.finish_straight_distance < self.finish_distance:
             raise ValueError('route_finish_straight_distance must be >= route_finish_distance')
+
+    def visual_entry_ok(self, feedback):
+        """仅判断近端线能否进入纠偏；最终到位另用更严格容差，不改变10cm搜索围栏。"""
+        if not isinstance(feedback, dict):
+            return False
+        error, heading = feedback.get('error_normalized'), feedback.get('near_heading_rad')
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+               for v in (error, heading)):
+            return False
+        return abs(error) <= self.finish_entry_lateral and abs(heading) <= self.finish_entry_heading
 
     def finish_alignment_ok(self, error, heading):
         """最终到位：半图宽归一化偏差及弧度朝向均合格；不改变途中恢复范围。"""
@@ -93,17 +115,21 @@ class RouteRecorder:
         self.points = []
         self.station_events = []
         self.latest = None
+        self.context = {}
+        self.samples, self.latest_sample = [], None
         self.fault = None
         self.finished = False
 
-    def add(self, pose):
+    def add(self, pose, stamp=None, velocity=None):
         self.latest = tuple(pose)
+        self.latest_sample = dict(stamp_sec=stamp, velocity=list(velocity) if velocity is not None else None)
         if (not self.points or math.dist(pose[:2], self.points[-1][:2]) >= self.config.sample_distance
                 or abs(wrap(pose[2]-self.points[-1][2])) >= .05):
             if len(self.points) >= 20000:
                 self.fault = 'route_point_limit'
             else:
                 self.points.append(tuple(pose))
+                self.samples.append(self.latest_sample)
 
     def record_station(self, event):
         """保存站点事件供返程核对；接收时里程计位置仅作追踪，不是横线的标定坐标。"""
@@ -112,15 +138,18 @@ class RouteRecorder:
 
     def document(self):
         points = list(self.points)
+        samples = list(self.samples)
         if self.latest is not None and (not points or self.latest != points[-1]):
             points.append(self.latest)
+            samples.append(self.latest_sample)
         length = sum(math.dist(a[:2], b[:2]) for a, b in zip(points, points[1:]))
         return {'version': 1, 'valid': self.fault is None and length >= .1 and self.finished,
                 'finished': self.finished,
                 'reason': self.fault or ('recording_in_progress' if not self.finished else
                                          'ready' if length >= .1 else 'route_too_short'),
                 'saved_at_unix': time(), 'frame_id': self.frame, 'child_frame_id': self.child,
-                'length_m': length, 'points': points, 'station_events': list(self.station_events)}
+                'length_m': length, 'points': points, 'point_samples': samples,
+                'recording_config': dict(self.context), 'station_events': list(self.station_events)}
 
     def save(self, filename):
         """原子替换最近一次路线；新任务不足10cm也写明无效，避免误用旧路线。"""
@@ -259,7 +288,8 @@ class ReverseRouteFollower:
         self.travel += math.dist(pose[:2], self.previous)
         self.previous = tuple(pose[:2])
         # 仅在当前弧长附近寻找投影，且进度不能跳过实际行驶距离；防交叉线跳段。
-        upper = min(self.arc[-1], self.progress+max(.3, 2*self.config.lookahead), self.travel+.05)
+        lookahead = self.adaptive_lookahead(speed)
+        upper = min(self.arc[-1], self.progress+max(.3, 2*lookahead), self.travel+.05)
         first = max(0, bisect.bisect_right(self.arc, max(0., self.progress-.03))-1)
         last = min(len(self.points)-1, bisect.bisect_right(self.arc, upper))
         best = (math.inf, self.progress)
@@ -284,20 +314,60 @@ class ReverseRouteFollower:
         if remaining <= self.config.goal_tolerance and goal_distance <= self.config.goal_tolerance:
             self.arrived = True
             return 0., 0., 'reverse_route_complete'
-        target = self.at(min(self.arc[-1], self.progress+self.config.lookahead))
+        target = self.at(min(self.arc[-1], self.progress+lookahead))
         dx, dy = target[0]-pose[0], target[1]-pose[1]
         c, s = math.cos(pose[2]), math.sin(pose[2])
         bx, by = c*dx+s*dy, -s*dx+c*dy
         self.diagnostics['target_body_xy_m'] = (bx, by)
+        self.diagnostics['target_rear_angle_rad'] = math.atan2(by, -bx)
         if bx >= -.001 or abs(math.atan2(by, -bx)) > .9:
             return 0., 0., 'reverse_target_not_behind'
+        requested_curvature = 2*by/(bx*bx+by*by)
         curvature = max(-self.config.max_curvature, min(self.config.max_curvature,
-                                                       2*by/(bx*bx+by*by)))
-        # 转向前瞻与终点减速独立配置，避免为转向选较长前瞻却让整段返程过早慢行。
+                                                       requested_curvature))
+        # Nav2 RPP-style regulation: use speed-scaled lookahead and cap lateral
+        # acceleration in bends, while keeping terminal approach deceleration separate.
         cruise = min(abs(speed), self.config.max_speed)
+        curvature_speed = (math.sqrt(self.config.max_lateral_accel/abs(curvature))
+                           if abs(curvature) > 1e-6 else self.config.max_speed)
+        cruise = min(cruise, curvature_speed)
         velocity = -min(cruise, max(.005, cruise*remaining/self.config.approach_distance))
-        self.diagnostics['curvature_per_m'] = curvature
+        self.diagnostics.update(curvature_per_m=curvature, lookahead_m=lookahead,
+                                requested_curvature_per_m=requested_curvature,
+                                curvature_limit_per_m=self.config.max_curvature,
+                                curvature_limited=abs(requested_curvature) > self.config.max_curvature,
+                                curvature_speed_limit_mps=curvature_speed,
+                                cruise_speed_mps=cruise)
         return velocity, velocity*curvature, 'reverse_route_tracking'
+
+    def adaptive_lookahead(self, speed):
+        """Scale the configured RPP lookahead with speed, then apply hard bounds."""
+        reference = max(.001, self.config.lookahead_speed_reference)
+        scaled = self.config.lookahead*abs(float(speed))/reference
+        return max(self.config.min_lookahead, min(self.config.max_lookahead, scaled))
+
+
+class StandardRouteFollower:
+    """标准路线前进Pure Pursuit；起点需由操作员放回同一实物基准并通过视觉对线。"""
+    def __init__(self, document, anchor, config):
+        transformed = dict(document, points=[[x, y, wrap(yaw+math.pi)]
+                           for x, y, yaw in reversed(document['points'])])
+        self.tracker = ReverseRouteFollower(transformed,
+            (anchor[0], anchor[1], wrap(anchor[2]+math.pi)), config)
+
+    @property
+    def diagnostics(self):
+        result = dict(self.tracker.diagnostics)
+        if 'curvature_per_m' in result:
+            result['curvature_per_m'] = -result['curvature_per_m']
+        if 'target_body_xy_m' in result:
+            result['target_body_xy_m'] = tuple(-v for v in result['target_body_xy_m'])
+        return result
+
+    def command(self, pose, speed):
+        v, w, state = self.tracker.command((pose[0], pose[1], wrap(pose[2]+math.pi)), speed)
+        return -v, w, ('standard_target_not_ahead' if state == 'reverse_target_not_behind'
+                       else state.replace('reverse_', 'standard_'))
 
 
 class ReverseFinishGuard:

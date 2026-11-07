@@ -24,6 +24,7 @@
   <depend>rclcpp_components</depend>
   <depend>rclcpp_action</depend>
   <depend>std_srvs</depend>
+  <exec_depend>action_msgs</exec_depend>
   <depend>eli_dashboard_interface</depend>
   <depend>eli_common_interface</depend>
   <depend>eli_cs_robot_description</depend>

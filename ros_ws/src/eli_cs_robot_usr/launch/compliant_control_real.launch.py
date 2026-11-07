@@ -4,7 +4,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import AndSubstitution, LaunchConfiguration, OrSubstitution, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -16,7 +16,8 @@ def generate_launch_description():
     auto_start = Node(
         package="eli_cs_robot_usr", executable="auto_admittance_start.py",
         name="auto_admittance_start", output="screen",
-        condition=IfCondition(LaunchConfiguration("auto_start_admittance")),
+        condition=IfCondition(AndSubstitution(LaunchConfiguration("auto_start_admittance"),
+                                             LaunchConfiguration("launch_admittance"))),
         parameters=[{"settle_seconds": ParameterValue(
             LaunchConfiguration("arm_control_start_delay"), value_type=float)}],
     )
@@ -35,6 +36,7 @@ def generate_launch_description():
     admittance = Node(
         package="eli_cs_robot_usr", executable="admittance_pose_controller",
         name="admittance_controller", output="screen",
+        condition=IfCondition(LaunchConfiguration("launch_admittance")),
         sigterm_timeout="3.0", sigkill_timeout="2.0",
         parameters=[PathJoinSubstitution([usr, "config", "compliant_real.yaml"]),
                     PathJoinSubstitution([moveit_cfg, "config", "kinematics.yaml"]),
@@ -103,6 +105,8 @@ def generate_launch_description():
         executable="static_transform_publisher",
         name="force_sensor_mount_tf",
         output="screen",
+        condition=IfCondition(OrSubstitution(LaunchConfiguration("launch_admittance"),
+                                            LaunchConfiguration("launch_sensor"))),
         arguments=[
             "--x", LaunchConfiguration("sensor_x"),
             "--y", LaunchConfiguration("sensor_y"),
@@ -117,6 +121,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("cs_type", default_value="ls65"),
         DeclareLaunchArgument("launch_rviz", default_value="true"),
+        DeclareLaunchArgument("launch_admittance", default_value="true"),
         DeclareLaunchArgument("auto_start_admittance", default_value="true"),
         DeclareLaunchArgument("arm_control_start_delay", default_value="5.0"),
         DeclareLaunchArgument("admittance_enabled_on_startup", default_value="false"),

@@ -19,6 +19,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/int64.hpp>
 #include <std_msgs/msg/u_int8_multi_array.hpp>
@@ -87,6 +88,11 @@ public:
         std::shared_ptr<eli_cs_robot_serial::srv::SendFile::Response> response) {
         send_file(request, response);
       });
+    const auto connected_topic = declare_parameter<std::string>("connected_topic", "");
+    if (!connected_topic.empty()) {
+      connected_pub_ = create_publisher<std_msgs::msg::Bool>(connected_topic, rclcpp::QoS(1).transient_local());
+      publish_connected(false);
+    }
     reader_ = std::thread([this]() { read_loop(); });
     RCLCPP_INFO(get_logger(), "Serial node ready: %s @ %d %d data bits, %d stop bit, parity=%s, flow_control=%s",
       device_.c_str(), baudrate_, data_bits_, stop_bits_, parity_.c_str(), flow_control_.c_str());
@@ -186,14 +192,22 @@ private:
     if (tcsetattr(fd, TCSANOW, &tty) != 0) { ::close(fd); return false; }
     std::lock_guard<std::mutex> lock(mutex_);
     fd_ = fd;
+    publish_connected(true);
     RCLCPP_INFO(get_logger(), "Opened %s", device_.c_str());
     return true;
+  }
+
+  void publish_connected(bool connected)
+  {
+    if (connected_pub_ && rclcpp::ok()) {
+      connected_pub_->publish(std_msgs::msg::Bool().set__data(connected));
+    }
   }
 
   void close_port()
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; publish_connected(false); }
   }
 
   void write_serial(
@@ -260,7 +274,13 @@ private:
     if (publish_text_) {
       std_msgs::msg::String text;
       text.data = format_rx(data);
-      text_pub_->publish(text);
+      // 原始字节已经发布；含NUL的块不能直接序列化为ROS String。
+      if (text.data.find('\0') == std::string::npos) {
+        text_pub_->publish(text);
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Serial RX contains NUL; raw bytes kept, text skipped");
+      }
     }
     if (publish_wrench_) publish_wrench(data);
   }
@@ -371,13 +391,14 @@ private:
               }
             }
           } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            ::close(fd_); fd_ = -1;
+            ::close(fd_); fd_ = -1; publish_connected(false);
           }
         }
       }
       if (!opened) {
-        open_port();
-        std::this_thread::sleep_for(std::chrono::duration<double>(reconnect_period_));
+        if (!open_port()) {
+          std::this_thread::sleep_for(std::chrono::duration<double>(reconnect_period_));
+        }
       } else std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
   }
@@ -401,6 +422,7 @@ private:
   std::atomic<bool> running_{true};
   std::mutex mutex_;
   std::thread reader_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr connected_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr text_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr bytes_pub_;
   rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_pub_;

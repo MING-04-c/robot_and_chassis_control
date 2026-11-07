@@ -12,4 +12,6 @@ install(DIRECTORY config launch rviz srdf
 ament_python_install_package(${PROJECT_NAME})
 ament_python_install_module(${PROJECT_NAME}/launch_common.py)
 
+install(PROGRAMS scripts/ground_scene.py DESTINATION lib/${PROJECT_NAME})
+
 ament_package()

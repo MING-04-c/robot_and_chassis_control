@@ -29,7 +29,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('start_driver', default_value='true',
                               description='一起启动底盘驱动；已有驱动时false'),
-        DeclareLaunchArgument('linear_speed', default_value='0.1', description='平移速度m/s，0.01～0.3'),
+        DeclareLaunchArgument('linear_speed', default_value='0.075', description='平移速度m/s，0.01～0.3'),
         DeclareLaunchArgument('angular_speed', default_value='0.2', description='旋转速度rad/s，0.05～0.8'),
         DeclareLaunchArgument('key_timeout', default_value='0.6', description='无移动按键后停车秒数'),
         DeclareLaunchArgument('terminal_device', default_value=terminal, description='自动取当前交互终端'),

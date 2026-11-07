@@ -1,0 +1,11 @@
+{
+  "accepted": true,
+  "issues": [],
+  "points": 107,
+  "length_m": 2.071197075945361,
+  "max_spacing_m": 0.02055144907476822,
+  "median_spacing_m": 0.020143865487745622,
+  "max_heading_step_rad": 0.05097454014624459,
+  "station_events": 5,
+  "note": "合格仅说明记录结构和连续性通过检查，不代表物理定位精度或已验证可重复行驶"
+}

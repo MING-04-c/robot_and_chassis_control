@@ -32,6 +32,7 @@
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 class MoveItPoseExecutor : public rclcpp::Node
 {
@@ -124,11 +125,27 @@ public:
         // 订阅回调和服务回调可能由不同线程执行。
         // 加锁后再写 latest_target_，避免两个线程同时读写同一份数据。
         std::lock_guard<std::mutex> lock(target_mutex_);
+        if (safety_inhibited_) { return; }
         latest_target_ = *message;
         RCLCPP_INFO(
           get_logger(), "Received %zu target pose(s) in frame '%s'",
           latest_target_.poses.size(), latest_target_.header.frame_id.c_str());
       });
+
+    safety_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions safety_options;
+    safety_options.callback_group = safety_group_;
+    safety_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/robot_control/safety_inhibit", rclcpp::QoS(1).reliable().transient_local(),
+      [this](const std_msgs::msg::Bool::SharedPtr message) {
+        safety_inhibited_.store(message->data);
+        if (message->data) {
+          ++safety_epoch_;
+          move_group_->stop();
+          std::lock_guard<std::mutex> lock(target_mutex_);
+          latest_target_.poses.clear();
+        }
+      }, safety_options);
 
     // 必须先创建目标订阅，再同步执行启动初始轨迹。真机回初始位可能需要数秒，
     // 如果订阅在这段运动结束后才创建，期间发布的 PoseArray 不会被 ROS 2 保存，
@@ -197,6 +214,12 @@ private:
 
   bool move_to_initial_joint_pose(std_srvs::srv::Trigger::Response::SharedPtr response)
   {
+    const auto safety_epoch = safety_epoch_.load();
+    if (safety_inhibited_) {
+      response->success = false;
+      response->message = "Safety recovery is latched";
+      return false;
+    }
     // 初始位姿在一次节点生命周期内只执行一次。也就是说，每次重新 launch
     // 都会先回初始位，但同一次 launch 中后续收到的新目标不会反复回初始位。
     if (!initialize_before_execution_ || initial_pose_executed_) {
@@ -279,6 +302,11 @@ private:
       return false;
     }
 
+    if (safety_inhibited_ || safety_epoch_.load() != safety_epoch) {
+      response->success = false;
+      response->message = "Plan discarded after safety pause";
+      return false;
+    }
     const auto execution_result = move_group_->execute(initial_plan);
     if (execution_result != moveit::core::MoveItErrorCode::SUCCESS) {
       response->success = false;
@@ -293,6 +321,12 @@ private:
 
   void execute_latest(std_srvs::srv::Trigger::Response::SharedPtr response)
   {
+    const auto safety_epoch = safety_epoch_.load();
+    if (safety_inhibited_) {
+      response->success = false;
+      response->message = "Safety recovery is latched";
+      return;
+    }
     // exchange(true) 会先返回旧值，再把 executing_ 设置为 true。
     // 如果旧值已经是 true，说明前一条轨迹仍在执行，拒绝重复执行。
     if (executing_.exchange(true)) {
@@ -355,6 +389,11 @@ private:
     move_group_->setPoseReferenceFrame(input_frame);
     move_group_->setStartStateToCurrentState();
 
+    if (safety_inhibited_ || safety_epoch_.load() != safety_epoch) {
+      response->success = false;
+      response->message = "Execution cancelled by safety pause";
+      return;
+    }
     if (!use_cartesian_path_ && target.poses.size() == 1) {
       execute_pose_plan(target.poses.front(), response);
       return;
@@ -368,6 +407,11 @@ private:
     //
     // 多点时，机械臂会按 waypoints 的顺序逐段做笛卡尔插值。
     // 规划过程仍然会检查碰撞、关节限制和逆运动学是否有解。
+    if (safety_inhibited_ || safety_epoch_.load() != safety_epoch) {
+      response->success = false;
+      response->message = "Execution cancelled by safety pause";
+      return;
+    }
     execute_cartesian_path(target.poses, response);
   }
 
@@ -375,6 +419,7 @@ private:
     const geometry_msgs::msg::Pose & pose,
     std_srvs::srv::Trigger::Response::SharedPtr response)
   {
+    const auto safety_epoch = safety_epoch_.load();
     move_group_->setPoseTarget(pose, end_effector_link_);
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     const auto planning_result = move_group_->plan(plan);
@@ -382,6 +427,11 @@ private:
       response->success = false;
       response->message = "MoveIt failed to plan the real-robot approach pose";
       move_group_->clearPoseTargets();
+      return;
+    }
+    if (safety_inhibited_ || safety_epoch_.load() != safety_epoch) {
+      response->success = false;
+      response->message = "Plan discarded after safety pause";
       return;
     }
     const auto execution_result = move_group_->execute(plan);
@@ -396,6 +446,7 @@ private:
     const std::vector<geometry_msgs::msg::Pose> & waypoints,
     std_srvs::srv::Trigger::Response::SharedPtr response)
   {
+    const auto safety_epoch = safety_epoch_.load();
     // RobotTrajectory 是 MoveIt 的轨迹消息，内部包含关节名称和每个轨迹点。
     moveit_msgs::msg::RobotTrajectory trajectory_message;
 
@@ -459,6 +510,11 @@ private:
 #endif
 
     // 时间参数完整后，执行整条笛卡尔轨迹。
+    if (safety_inhibited_ || safety_epoch_.load() != safety_epoch) {
+      response->success = false;
+      response->message = "Plan discarded after safety pause";
+      return;
+    }
     const auto execution_result = move_group_->execute(trajectory_message);
     response->success = execution_result == moveit::core::MoveItErrorCode::SUCCESS;
     response->message = response->success ?
@@ -491,6 +547,10 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr target_subscription_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr execute_service_;
   geometry_msgs::msg::PoseArray latest_target_;
+  std::atomic<bool> safety_inhibited_{false};
+  std::atomic<unsigned> safety_epoch_{0};
+  rclcpp::CallbackGroup::SharedPtr safety_group_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr safety_subscription_;
   std::mutex target_mutex_;  // 保护 latest_target_ 的并发访问。
   std::atomic_bool executing_{false};  // 防止同时执行两条轨迹。
 };

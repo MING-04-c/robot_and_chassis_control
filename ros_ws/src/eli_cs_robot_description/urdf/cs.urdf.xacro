@@ -56,7 +56,8 @@
    <xacro:arg name="terminal_mesh_base" default="package://eli_cs_robot_description/meshes/terminal"/>
    <xacro:arg name="terminal_x" default="0.0"/>
    <xacro:arg name="terminal_y" default="0.0"/>
-   <xacro:arg name="terminal_z" default="0.0"/>
+   <!-- 现场确认：整套末端沿tool0 -Z靠近法兰2.7mm，统一移动几何及检测坐标。 -->
+   <xacro:arg name="terminal_z" default="-0.0027"/>
    <xacro:arg name="terminal_roll" default="0.0"/>
    <xacro:arg name="terminal_pitch" default="0.0"/>
    <xacro:arg name="terminal_yaw" default="-1.5707963267948966"/>

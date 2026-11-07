@@ -12,3 +12,6 @@ __pycache__/
 
 # Shared TCP communication key
 industrial_pc.key
+
+# Local source/runtime baselines
+backups/

@@ -7,6 +7,8 @@
 #include <linux/videodev2.h>
 #include <memory>
 #include <functional>
+#include <filesystem>
+#include <cstdlib>
 #include <opencv2/imgcodecs.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -58,11 +60,27 @@ public:
         static_cast<int>(width), static_cast<int>(height), capture_.width(), capture_.height());
     }
     info_manager_ = std::make_unique<camera_info_manager::CameraInfoManager>(this, name);
-    if (!url.empty() && !info_manager_->loadCameraInfo(url)) {
-      throw std::runtime_error("Failed to load camera_info_url=" + url);
+    std::string calibration_url = url;
+    if (calibration_url.empty()) {
+      const char * ros_home = std::getenv("ROS_HOME");
+      const char * home = std::getenv("HOME");
+      const std::string directory = ros_home && *ros_home ? ros_home :
+        (home ? std::string(home) + "/.ros" : "");
+      const auto path = std::filesystem::path(directory) / "camera_info" / (name + ".yaml");
+      if (!directory.empty() && std::filesystem::is_regular_file(path)) {
+        calibration_url = "file://" + std::filesystem::absolute(path).string();
+      }
     }
-    if (!info_manager_->isCalibrated()) {
-      RCLCPP_WARN(get_logger(), "Camera is uncalibrated; CameraInfo K[0] will be zero");
+    if (!calibration_url.empty()) {
+      if (!info_manager_->loadCameraInfo(calibration_url)) {
+        throw std::runtime_error("Failed to load camera_info_url=" + calibration_url);
+      }
+      calibration_loaded_ = true;
+    }
+    if (!calibration_loaded_ || !info_manager_->isCalibrated()) {
+      RCLCPP_WARN(get_logger(), "USB camera has no measured calibration; publishing K[0]=0. "
+        "Pixel line following is available. Set camera_info_url to a measured calibration "
+        "or save camera calibration and restart; metric camera geometry is unavailable.");
     }
     const auto qos = rclcpp::SensorDataQoS();
     if (publish_raw_) {
@@ -144,7 +162,7 @@ private:
         "Dropping invalid frame: %s", error.what());
       return;
     }
-    auto info = info_manager_->getCameraInfo();
+    auto info = calibration_loaded_ ? info_manager_->getCameraInfo() : sensor_msgs::msg::CameraInfo{};
     if (info.k[0] != 0.0 && (info.width != frame_.width || info.height != frame_.height)) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "Calibration resolution does not match frame; publishing uncalibrated CameraInfo");
@@ -166,6 +184,7 @@ private:
   bool publish_compressed_;
   int jpeg_quality_;
   std::chrono::steady_clock::time_point last_frame_;
+  bool calibration_loaded_{false};
   std::unique_ptr<camera_info_manager::CameraInfoManager> info_manager_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr raw_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub_;

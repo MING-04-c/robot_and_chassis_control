@@ -11,6 +11,8 @@
 
 // Xlib defines None as a macro, while rclcpp uses None as an enum member.
 #undef None
+// Xlib 的 Bool 宏同样会展开 ROS 消息 std_msgs::msg::Bool。
+#undef Bool
 
 #include <atomic>
 #include <chrono>
@@ -26,6 +28,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/int8.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 using namespace std::chrono_literals;
@@ -54,6 +57,12 @@ public:
     twist_publisher_ = create_publisher<geometry_msgs::msg::TwistStamped>(
       twist_topic_, rclcpp::QoS(10).reliable());
     servo_start_client_ = create_client<std_srvs::srv::Trigger>(servo_start_service_);
+    safety_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/robot_control/safety_inhibit", rclcpp::QoS(1).reliable().transient_local(),
+      [this](const std_msgs::msg::Bool::SharedPtr message) {
+        const bool previous = safety_inhibited_.exchange(message->data);
+        if (previous != message->data) { clear_pressed_keys(); }
+      });
     servo_status_subscription_ = create_subscription<std_msgs::msg::Int8>(
       servo_status_topic_, rclcpp::QoS(10),
       [this](const std_msgs::msg::Int8::SharedPtr message) {
@@ -118,7 +127,7 @@ private:
     // 请求 X11 只在真正松键时发送 KeyRelease，过滤系统自动重复产生的
     // Release/Press 对。即使窗口系统不支持，pressed_keys_ 集合也不会
     // 把重复 KeyPress 累积成多个待执行动作。
-    Bool detectable_supported = False;
+    int detectable_supported = False;
     XkbSetDetectableAutoRepeat(display, True, &detectable_supported);
 
     XMapRaised(display, window);
@@ -282,7 +291,7 @@ private:
     message.header.frame_id = command_frame_;
     {
       std::lock_guard<std::mutex> lock(command_mutex_);
-      message.twist = current_command_;
+      if (!safety_inhibited_) { message.twist = current_command_; }
     }
     twist_publisher_->publish(message);
   }
@@ -377,6 +386,8 @@ private:
   rclcpp::TimerBase::SharedPtr start_timer_;
   rclcpp::TimerBase::SharedPtr connection_timer_;
 
+  std::atomic<bool> safety_inhibited_{false};
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr safety_subscription_;
   std::mutex command_mutex_;
   std::set<char> pressed_keys_;
   geometry_msgs::msg::Twist current_command_;

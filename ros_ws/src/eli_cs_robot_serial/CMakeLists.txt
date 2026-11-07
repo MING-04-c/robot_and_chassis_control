@@ -64,6 +64,9 @@ install(DIRECTORY config launch
 install(DIRECTORY device/detactor/config/
   DESTINATION share/${PROJECT_NAME}/device/detactor/config
 )
+install(FILES device/detactor/README.md
+  DESTINATION share/${PROJECT_NAME}/device/detactor
+)
 install(FILES device/detactor/launch/detactor.launch.py
   DESTINATION share/${PROJECT_NAME}/launch
 )
@@ -78,6 +81,9 @@ install(FILES
   device/sensor/launch/sensor_tcp.launch.py
   device/sensor/launch/sensor_plot.launch.py
   DESTINATION share/${PROJECT_NAME}/launch
+)
+install(PROGRAMS device/detactor/tools/detactor_tcp_probe.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 install(PROGRAMS device/sensor/src/sensor_plot.py
   DESTINATION lib/${PROJECT_NAME}
@@ -98,7 +104,8 @@ install(FILES device/industrial_pc/host_tools/capture_storage.py
 install(FILES device/industrial_pc/src/industrial_pc_hk_transfer.py
   DESTINATION ${PYTHON_INSTALL_DIR}
 )
-install(FILES device/industrial_pc/src/industrial_pc_protocol.py
+install(FILES device/industrial_pc/src/runtime_monitor.py
+  device/industrial_pc/src/industrial_pc_protocol.py
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY device/industrial_pc/config/

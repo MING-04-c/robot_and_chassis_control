@@ -17,7 +17,7 @@ from launch.events import Shutdown
 from launch.logging import get_logger
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EqualsSubstitution, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -87,6 +87,8 @@ def launch_setup(context):
                     executable="admittance_pose_controller",
                     name="admittance_controller",
                     output="screen",
+                    condition=IfCondition(EqualsSubstitution(
+                        LaunchConfiguration("touch_control_mode"), "admittance")),
                     parameters=[
                         PathJoinSubstitution(
                             [
@@ -144,6 +146,8 @@ def launch_setup(context):
                 "cs_type": config("cs_type"),
                 "launch_rviz": "false",
                 "auto_start_admittance": "false",
+                "launch_admittance": EqualsSubstitution(
+                    LaunchConfiguration("touch_control_mode"), "admittance"),
                 "admittance_enabled_on_startup": "false",
                 "launch_executor": "false",
                 "launch_coordinator": "false",
@@ -207,6 +211,7 @@ def launch_setup(context):
                     ),
                     profile,
                     {
+                        "touch_control_mode": config("touch_control_mode"),
                         "targets_file": ParameterValue(
                             config("targets_file"), value_type=str
                         )
@@ -308,6 +313,11 @@ def generate_launch_description():
                 "launch_force_sensor",
                 default_value="true",
                 description="Start the force sensor with start_arm_control; false reuses its driver.",
+            ),
+            DeclareLaunchArgument(
+                "touch_control_mode", default_value="admittance",
+                choices=["admittance", "moveit_force_guard"],
+                description="接触下探控制：导纳，或普通 MoveIt 直线规划+力阈值停止",
             ),
             DeclareLaunchArgument("sensor_host", default_value="169.254.199.80"),
             DeclareLaunchArgument("sensor_port", default_value="9001"),

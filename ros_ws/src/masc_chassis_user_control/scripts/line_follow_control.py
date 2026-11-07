@@ -10,7 +10,7 @@ class ControlConfig:
     forward_speed: float = 0.075
     max_forward_speed: float = 0.30
     drive_direction: str = 'forward'
-    reverse_max_speed: float = 0.04
+    reverse_max_speed: float = 0.05
     reverse_heading_gain: float = 1.0
     reverse_steering_sign: float = 1.0
     image_forward_direction: str = 'down'
@@ -59,6 +59,28 @@ class ControlConfig:
     bridge_intersection_angle_rad: float = 0.85
     bridge_speed_factor: float = 1.0
 
+    # 起步横线对齐：停车观察，分轴摆正、横移、纵向接近，
+    # 只在建立路线原点时使用，不替代正常循迹控制。
+    # Low-level unit/integration users opt in explicitly; the packaged launch
+    # profile enables this for repeatable physical departures.
+    start_alignment_enabled: bool = False
+    start_alignment_timeout_sec: float = 45.0
+    start_alignment_settle_sec: float = 0.6
+    start_alignment_step_distance: float = 0.015
+    start_alignment_speed: float = 0.03
+    start_alignment_lateral_speed: float = 0.03
+    start_alignment_min_lateral_speed: float = 0.02
+    start_alignment_min_linear_speed: float = 0.012
+    start_alignment_min_angular_speed: float = 0.02
+    start_alignment_max_angular_speed: float = 0.12
+    start_alignment_lateral_gain: float = 0.45
+    start_alignment_lateral_tolerance_ratio: float = 0.02
+    start_alignment_heading_tolerance_rad: float = 0.035
+    start_alignment_tolerance_ratio: float = 0.015
+    start_alignment_max_distance: float = 0.30
+    start_alignment_reverse_correction: bool = True
+    start_alignment_max_reverse_distance: float = 0.10
+
     stop_marker_enabled: bool = True
     forward_ignore_start_marker: bool = True
     reverse_ignore_start_marker: bool = True
@@ -68,7 +90,7 @@ class ControlConfig:
     stop_marker_target_ratio: float = 0.5
     stop_marker_position_tolerance_ratio: float = 0.03
     stop_marker_slowdown_ratio: float = 0.25
-    stop_marker_creep_speed: float = 0.008
+    stop_marker_creep_speed: float = 0.012
     stop_marker_dropout_grace_sec: float = 0.6
     stop_marker_dropout_max_distance: float = 0.005
     stop_marker_average_frames: int = 3
@@ -121,6 +143,40 @@ class ControlConfig:
         if not all(isinstance(value, bool) for value in (self.stop_marker_enabled,
                 self.forward_ignore_start_marker, self.reverse_ignore_start_marker, self.reverse_return_to_start)):
             raise ValueError('stop marker enable/start marker policy must be boolean')
+        if not all(isinstance(value, bool) for value in (
+                self.start_alignment_enabled, self.start_alignment_reverse_correction)):
+            raise ValueError('start alignment policies must be boolean')
+        if not 1.0 <= self.start_alignment_timeout_sec <= 120.0:
+            raise ValueError('start_alignment_timeout_sec must be 1..120')
+        if not 0.2 <= self.start_alignment_settle_sec <= 3.0:
+            raise ValueError('start_alignment_settle_sec must be 0.2..3.0')
+        if not 0.003 <= self.start_alignment_step_distance <= 0.03:
+            raise ValueError('start_alignment_step_distance must be 0.003..0.03m')
+        if not 0.005 <= self.start_alignment_speed <= self.max_forward_speed:
+            raise ValueError('start_alignment_speed must be 0.005..max_forward_speed')
+        if not 0.01 < self.start_alignment_min_linear_speed <= self.start_alignment_speed:
+            raise ValueError('start_alignment_min_linear_speed must be >0.01 and <=start_alignment_speed')
+        if not 0.01 < self.start_alignment_min_lateral_speed <= self.start_alignment_lateral_speed <= self.max_forward_speed:
+            raise ValueError('start alignment lateral speeds must satisfy 0.01 < min <= max <= max_forward_speed')
+        lateral_braking_distance = self.start_alignment_min_lateral_speed**2/(2.*self.linear_acceleration)
+        if self.start_alignment_step_distance < lateral_braking_distance+.001:
+            raise ValueError('start alignment step must allow nominal lateral braking distance plus 1mm tolerance')
+        if not 0.01 < self.start_alignment_min_angular_speed <= self.start_alignment_max_angular_speed:
+            raise ValueError('start_alignment_min_angular_speed must be >0.01 and <=max_angular_speed')
+        if not 0.01 <= self.start_alignment_max_angular_speed <= self.max_angular_speed:
+            raise ValueError('start_alignment_max_angular_speed must be 0.01..max_angular_speed')
+        if not 0.0 <= self.start_alignment_lateral_gain <= 2.0:
+            raise ValueError('start_alignment_lateral_gain must be 0..2')
+        if not 0.01 <= self.start_alignment_lateral_tolerance_ratio <= 0.25:
+            raise ValueError('start_alignment_lateral_tolerance_ratio must be 0.01..0.25')
+        if not 0.02 <= self.start_alignment_heading_tolerance_rad <= 0.5:
+            raise ValueError('start_alignment_heading_tolerance_rad must be 0.02..0.5')
+        if not 0.002 <= self.start_alignment_tolerance_ratio <= 0.05:
+            raise ValueError('start_alignment_tolerance_ratio must be 0.002..0.05')
+        if not 0.05 <= self.start_alignment_max_distance <= 1.0:
+            raise ValueError('start_alignment_max_distance must be 0.05..1.0m')
+        if not 0.01 <= self.start_alignment_max_reverse_distance <= 0.5:
+            raise ValueError('start_alignment_max_reverse_distance must be 0.01..0.5m')
         if not .001 <= self.reverse_start_marker_max_travel <= .05:
             raise ValueError('reverse start marker travel must be .001..0.05 m')
         if (isinstance(self.stop_marker_departure_hold_distance, bool)
@@ -144,7 +200,7 @@ class ControlConfig:
         if (not 0.1 <= self.stop_marker_target_ratio <= 0.9
                 or not 0.002 <= self.stop_marker_position_tolerance_ratio <= 0.05
                 or self.stop_marker_position_tolerance_ratio >= self.stop_marker_slowdown_ratio
-                or not 0.001 <= self.stop_marker_creep_speed <= self.max_forward_speed
+                or not 0.01 < self.stop_marker_creep_speed <= min(.03, self.max_forward_speed)
                 or not 0.05 <= self.stop_marker_angle_tolerance_rad <= 0.5
                 or not 0.0 <= self.curve_entry_time_sec <= 1.0):
             raise ValueError('invalid stop marker geometry/speed or curve entry time')
@@ -283,6 +339,65 @@ def line_command(status, config):
     return (-speed if reversing else speed) * factor, yaw, 'tracking'
 
 
+def start_alignment_command(marker, image_width, image_height, config, position_error=None,
+                            position_tolerance=None, lateral_error=None, heading_error=None,
+                            overshoot_tolerance=None):
+    """Return a bounded visual-servo command for centering the departure bar.
+
+    The sign convention follows ``StopMarkerGate``: a positive longitudinal error
+    means that the bar is still ahead in the current travel direction.  A negative
+    error means the vehicle has passed it; a short reverse correction is allowed
+    only when explicitly enabled.  The marker's x error is used only for a small
+    yaw correction, while the normal line geometry can provide a more stable yaw
+    estimate when available.
+
+    This is the same separation used by mature visual-servo/Pure-Pursuit
+    controllers: bounded position error, bounded heading correction, and no
+    unbounded pixel-to-metre extrapolation.
+    """
+    if not isinstance(marker, dict) or image_width <= 1 or image_height <= 1:
+        return 0.0, 0.0, 'start_marker_unavailable'
+    try:
+        x, y = float(marker['x']), float(marker['y'])
+    except (KeyError, TypeError, ValueError):
+        return 0.0, 0.0, 'start_marker_invalid'
+    if not all(math.isfinite(value) for value in (x, y)):
+        return 0.0, 0.0, 'start_marker_invalid'
+    target = config.stop_marker_target_ratio
+    forward = 1.0 if config.image_forward_direction == 'down' else -1.0
+    if position_error is None:
+        position_error = forward * (y / float(image_height) - target)
+    if isinstance(position_error, bool) or not isinstance(position_error, (int, float)) or not math.isfinite(position_error):
+        return 0.0, 0.0, 'start_marker_invalid'
+    tolerance = (config.stop_marker_position_tolerance_ratio
+                 if position_tolerance is None else float(position_tolerance))
+    overshoot = (config.stop_marker_overshoot_tolerance_ratio
+                 if overshoot_tolerance is None else float(overshoot_tolerance))
+    lateral = (2.0 * (x / float(image_width - 1) - config.vehicle_reference_x_ratio)
+               if lateral_error is None else float(lateral_error))
+    slope = float(marker.get('main_slope', 0.0))
+    heading = math.atan(forward * slope) if heading_error is None else float(heading_error)
+    if not all(math.isfinite(value) for value in (lateral, heading)):
+        return 0.0, 0.0, 'start_marker_invalid'
+    sign = config.steering_sign if config.image_forward_direction == 'up' else -config.steering_sign
+    center = math.atan(config.start_alignment_lateral_gain * lateral)
+    yaw = sign * (center + config.heading_gain * heading)
+    if position_error < -tolerance:
+        yaw = sign * (-center + config.reverse_heading_gain * heading) * config.reverse_steering_sign
+    yaw = max(-config.start_alignment_max_angular_speed,
+              min(config.start_alignment_max_angular_speed, yaw))
+    if position_error > tolerance:
+        return min(config.start_alignment_speed, config.forward_speed), yaw, 'start_alignment_approaching'
+    if position_error < -tolerance:
+        if config.start_alignment_reverse_correction:
+            return -min(config.start_alignment_speed, config.reverse_max_speed), yaw, 'start_alignment_reverse'
+        if position_error < -overshoot:
+            return 0.0, 0.0, 'start_alignment_overshoot'
+        # Without reverse correction, stop inside the bounded overshoot band.
+        return 0.0, yaw, 'start_alignment_settling'
+    return 0.0, yaw, 'start_alignment_centered'
+
+
 def reverse_visual_command(status, config, lateral_heading_limit=math.radians(6.)):
     """末段视觉倒车分项反馈：横向标定反号只作用横向项，朝向仍沿用前进相机映射。
 
@@ -363,7 +478,7 @@ class SteeringDirectionGuard:
             if side != self.center_direction:
                 self.center_direction, self.center_frames = side, 0
                 self.center_ready = False
-            if abs(error_normalized) >= 1.5*config.error_deadband:
+            if abs(error_normalized) >= 1.25*config.error_deadband:
                 self.center_frames += 1
                 self.center_ready = self.center_frames >= config.straight_center_confirmation_frames
             elif not self.center_ready:
@@ -555,8 +670,10 @@ def tracking_geometry(points, width, height, config):
         slope, intercept = fit
         path_heading = math.atan2(target_x - (intercept + slope * near_y), forward * (target_y - near_y))
         bend = path_heading - math.atan(forward * slope)
-        # 出弯后线条可能已是直线，但车身尚未对准；仍按实测走向优先转向。
-        turn_evidence = max(abs(bend), abs(path_heading))
+        # 斜直线表示车身尚未对准，不代表路径弯曲。将绝对航向当弯道会
+        # 放宽横向死区并削弱回中，摆正后又突然恢复强回中，引发反复转向。
+        # 航向反馈仍由 near_heading 保留；只有前后切线变化才放宽弯道余量。
+        turn_evidence = abs(bend)
         curve_strength = min(1.0, max(0.0,
             (turn_evidence - config.curve_detection_angle_rad) / config.curve_detection_angle_rad))
     near_heading = (math.atan(forward * fit[0]) if fit is not None and len(support) >= 3

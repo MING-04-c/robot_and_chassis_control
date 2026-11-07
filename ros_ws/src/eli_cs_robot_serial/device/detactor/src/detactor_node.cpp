@@ -16,8 +16,11 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/u_int8_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include "eli_cs_robot_serial/srv/write_serial.hpp"
@@ -51,6 +54,23 @@ public:
     }
     measurement_pub_ = create_publisher<std_msgs::msg::String>(
       "/detactor/measurement", rclcpp::QoS(1).transient_local());
+    // 单值话题只在新有效测量到达时更新；不定时重播旧值，也不发布默认零。
+    latest_value_pub_ = create_publisher<std_msgs::msg::Float64>(
+      declare_parameter<std::string>("latest_value_topic", "/detactor/latest_value"),
+      rclcpp::QoS(1).transient_local());
+    acquisition_timeout_ = declare_parameter<double>("acquisition_timeout", 3.0);
+    task_once_ = declare_parameter<bool>("task_once", false);
+    if (!std::isfinite(acquisition_timeout_) || acquisition_timeout_ <= 0.) {
+      throw std::invalid_argument("acquisition_timeout must be finite and positive");
+    }
+    task_result_pub_ = create_publisher<std_msgs::msg::String>(
+      "/detactor/task_result", rclcpp::QoS(1).transient_local());
+    // 延迟响应：服务只在新有效回包到达或超时后返回，不阻塞接收回调。
+    acquire_latest_srv_ = create_service<std_srvs::srv::Trigger>(
+      "/detactor/acquire_latest",
+      [this](std::shared_ptr<rmw_request_id_t> header,
+        std::shared_ptr<std_srvs::srv::Trigger::Request>) { begin_task(header); });
+    task_timer_ = create_wall_timer(std::chrono::milliseconds(50), [this]() { task_tick(); });
     latest_srv_ = create_service<std_srvs::srv::Trigger>(
       "/detactor/latest_measurement",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
@@ -59,6 +79,15 @@ public:
         response->message = response->success ? latest_measurement_ : "No valid detector reply received";
       });
 
+    require_connection_ = declare_parameter<bool>("require_transport_connection", false);
+    connection_sub_ = create_subscription<std_msgs::msg::Bool>(
+      declare_parameter<std::string>("connected_topic", "/detactor/connected"),
+      rclcpp::QoS(1).transient_local(), [this](const std_msgs::msg::Bool::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        connected_ = message->data;
+        // 不把断线前的半帧与新连接的数据拼成一次测量。
+        rx_buffer_.clear();
+      });
     frame_pub_ = create_publisher<std_msgs::msg::String>(frame_topic, 10);
     latest_pub_ = create_publisher<std_msgs::msg::String>(latest_topic, 10);
     values_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(values_topic, 10);
@@ -66,22 +95,31 @@ public:
 
     // 任意节点发布 Empty 即触发一次采集。
     trigger_sub_ = create_subscription<std_msgs::msg::Empty>(
-      trigger_topic, 10, [this](const std_msgs::msg::Empty::SharedPtr) { request_measurement(); });
+      trigger_topic, 10, [this](const std_msgs::msg::Empty::SharedPtr) { begin_task(nullptr); });
     trigger_srv_ = create_service<std_srvs::srv::Trigger>(
       trigger_service,
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
         std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
         response->success = request_measurement();
-        response->message = response->success ? "Measurement request sent" : "Serial write service is unavailable";
+        response->message = response->success ? "Measurement request queued; await measurement reply" : "Detector transport is disconnected or unavailable";
       });
-    rx_sub_ = create_subscription<std_msgs::msg::String>(
-      rx_topic, 100, [this](const std_msgs::msg::String::SharedPtr message) { consume(message->data); });
+    // 二选一订阅，避免同一回包经text/bytes两条话题重复测量。
+    if (declare_parameter<bool>("use_bytes_rx", false)) {
+      bytes_sub_ = create_subscription<std_msgs::msg::UInt8MultiArray>(
+        declare_parameter<std::string>("rx_bytes_topic", "/detactor/rx_bytes"), 100,
+        [this](const std_msgs::msg::UInt8MultiArray::SharedPtr message) {
+          consume(std::string(message->data.begin(), message->data.end()));
+        });
+    } else {
+      rx_sub_ = create_subscription<std_msgs::msg::String>(
+        rx_topic, 100, [this](const std_msgs::msg::String::SharedPtr message) { consume(message->data); });
+    }
 
-    if (auto_request_ && request_period_ > 0.0) {
+    if (auto_request_ && !task_once_ && request_period_ > 0.0) {
       timer_ = create_wall_timer(
         std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::duration<double>(request_period_)),
-        [this]() { request_measurement(); });
+        [this]() { if (!task_active_) request_measurement(); });
     }
     RCLCPP_INFO(get_logger(),
       "Detactor collector ready: auto_request=%s, every %.3f s, command='%s', write_service='%s', rx_topic='%s', latest_window_size=%d, data='%s'",
@@ -90,6 +128,73 @@ public:
   }
 
 private:
+  using Clock = std::chrono::steady_clock;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr acquire_latest_srv_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr task_result_pub_;
+  rclcpp::TimerBase::SharedPtr task_timer_;
+  std::shared_ptr<rmw_request_id_t> task_header_;
+  bool task_once_{false}, task_once_started_{false}, task_active_{false}, task_write_ok_{false};
+  uint64_t task_id_{0}, task_baseline_{0}, write_generation_{0};
+  double acquisition_timeout_{3.0};
+  Clock::time_point task_started_{}, request_started_{};
+  bool request_pending_{false};
+  std::string task_candidate_;
+
+  void task_reply(const std::shared_ptr<rmw_request_id_t> &header, bool success, const std::string &message)
+  {
+    if (!header) return;
+    std_srvs::srv::Trigger::Response response;
+    response.success = success;
+    response.message = message;
+    acquire_latest_srv_->send_response(*header, response);
+  }
+
+  void finish_task(bool success, std::string message)
+  {
+    std::ostringstream output;
+    output << "{\"schema\":\"paint_thickness_acquisition_task_v1\",\"task_id\":" << task_id_
+           << ",\"success\":" << (success ? "true" : "false") << ",\"measurement\":"
+           << (success ? message : "null") << ",\"reason\":\""
+           << (success ? "" : "No fresh valid reply or write failed") << "\"}";
+    task_result_pub_->publish(std_msgs::msg::String().set__data(output.str()));
+    const auto header = task_header_;
+    task_active_ = false;
+    task_header_.reset();
+    task_candidate_.clear();
+    task_reply(header, success, message);
+  }
+
+  void begin_task(const std::shared_ptr<rmw_request_id_t> &header)
+  {
+    if (task_active_ || request_pending_) {
+      task_reply(header, false, "Thickness acquisition task is busy");
+      return;
+    }
+    task_active_ = true;
+    task_write_ok_ = false;
+    task_header_ = header;
+    task_baseline_ = acquisition_count_;
+    task_candidate_.clear();
+    task_started_ = Clock::now();
+    ++task_id_;
+    if (!request_measurement(true)) finish_task(false, "Detector write service is unavailable");
+  }
+
+  void task_tick()
+  {
+    if (request_pending_ && std::chrono::duration<double>(Clock::now()-request_started_).count() > acquisition_timeout_) request_pending_ = false;
+    if (task_once_ && !task_once_started_ && write_client_->service_is_ready() &&
+      (!require_connection_ || connected_)) {
+      task_once_started_ = true;
+      begin_task(nullptr);
+    }
+    if (task_active_ && std::chrono::duration<double>(Clock::now()-task_started_).count() > acquisition_timeout_) {
+      finish_task(false, "No new valid detector reply before acquisition timeout");
+    }
+  }
+  rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr bytes_sub_;
+  bool require_connection_{false}, connected_{false};
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr connection_sub_;
   static std::string expand_home(const std::string &path)
   {
     if (path.rfind("~/", 0) != 0) return path;
@@ -97,19 +202,35 @@ private:
     return home == nullptr ? path : std::string(home) + path.substr(1);
   }
 
-  bool request_measurement()
+  bool request_measurement(bool for_task = false)
   {
-    if (!write_client_->service_is_ready()) {
+    if (request_pending_ || (task_active_ && !for_task)) return false;
+    if ((require_connection_ && !connected_) || !write_client_->service_is_ready()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "Waiting for serial write service; detector request not sent");
+        "Waiting for detector transport connection/write service; request not sent");
       return false;
     }
     auto request = std::make_shared<eli_cs_robot_serial::srv::WriteSerial::Request>();
     request->data = request_command_;
-    auto future = write_client_->async_send_request(request);
-    (void)future;
+    request_pending_ = true;
+    request_started_ = Clock::now();
+    const auto active_task = task_active_ ? task_id_ : 0;
+    const auto write_generation = ++write_generation_;
+    write_client_->async_send_request(request,
+      [this, active_task, write_generation](rclcpp::Client<eli_cs_robot_serial::srv::WriteSerial>::SharedFuture future) {
+        const auto response = future.get();
+        if (write_generation != write_generation_) return;
+        if (!response->success) {
+          request_pending_ = false;
+          RCLCPP_WARN(get_logger(), "Acquisition write failed: %s", response->message.c_str());
+          if (task_active_ && active_task == task_id_) finish_task(false, "Detector write failed");
+        } else if (task_active_ && active_task == task_id_) {
+          task_write_ok_ = true;
+          if (!task_candidate_.empty()) finish_task(true, task_candidate_);
+        }
+      });
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-      "Acquisition command sent: '%s'", request_command_.c_str());
+      "Acquisition command queued: '%s'", request_command_.c_str());
     return true;
   }
 
@@ -117,8 +238,13 @@ private:
   {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     rx_buffer_ += chunk;
+    if (rx_buffer_.size() > 65536) {
+      rx_buffer_.clear();
+      RCLCPP_WARN(get_logger(), "Detector frame buffer overflow; incomplete frame discarded");
+      return;
+    }
 
-    // 一次串口 read 可能只收到半帧，也可能包含多帧，因此按头尾循环取完整帧。
+    // 串口或TCP一次read可能只收到半帧，也可能包含多帧，按头尾循环取完整帧。
     while (true) {
       const auto start = rx_buffer_.find(frame_start_);
       if (start == std::string::npos) {
@@ -198,7 +324,6 @@ private:
     }
     ++acquisition_count_;
 
-    frame_pub_->publish(std_msgs::msg::String().set__data(frame));
     if (tokens.size() < static_cast<size_t>(latest_window_size_)) {
       RCLCPP_WARN(get_logger(), "Received %zu values, fewer than latest_window_size=%d",
         tokens.size(), latest_window_size_);
@@ -216,6 +341,9 @@ private:
       }
     }
 
+    // 帧外NUL填充已由头尾组帧自然丢弃；帧内NUL等异常字符必须拒绝，不能删除后拼数。
+    // 完成数值校验后再发布文本，避免畸形帧再次触发ROS String序列化崩溃。
+    frame_pub_->publish(std_msgs::msg::String().set__data(frame));
     // 设备帧末尾为最新值；直接取末尾，避免历史窗口显示顺序影响本次读数。
     // 即使与上次值相同，新有效回包仍更新序号和接收时间。
     const builtin_interfaces::msg::Time stamp = now();
@@ -227,9 +355,15 @@ private:
       << ",\"value\":" << latest_value << ",\"unit\":\"" << measurement_unit_
       << "\",\"received_at_ros\":{\"sec\":" << stamp.sec
       << ",\"nanosec\":" << stamp.nanosec << "}}";
+    request_pending_ = false;
     latest_measurement_ = measurement.str();
     measurement_pub_->publish(std_msgs::msg::String().set__data(latest_measurement_));
+    latest_value_pub_->publish(std_msgs::msg::Float64().set__data(latest_value));
     save_latest(latest_tokens, acquisition_count_);
+    if (task_active_ && acquisition_count_ > task_baseline_) {
+      task_candidate_ = latest_measurement_;
+      if (task_write_ok_) finish_task(true, task_candidate_);
+    }
   }
 
   static std::string timestamp_for_filename()
@@ -293,8 +427,9 @@ private:
           latest_tokens[changed_begin] == last_saved_latest_tokens_[changed_begin]) {
           ++changed_begin;
         }
-        for (size_t i = latest_tokens.size(); i > changed_begin; --i) {
-          latest_display_tokens_.insert(latest_display_tokens_.begin(), latest_tokens[i - 1]);
+        // 设备窗口从旧到新；按此顺序依次头插，最终最新值才会排在最前。
+        for (size_t i = changed_begin; i < latest_tokens.size(); ++i) {
+          latest_display_tokens_.insert(latest_display_tokens_.begin(), latest_tokens[i]);
         }
         if (latest_display_tokens_.size() > static_cast<size_t>(latest_window_size_)) {
           latest_display_tokens_.resize(static_cast<size_t>(latest_window_size_));
@@ -347,6 +482,7 @@ private:
   std::string measurement_unit_;
   std::string latest_measurement_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr measurement_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr latest_value_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr latest_srv_;
   std::string frame_start_;
   std::string frame_end_;

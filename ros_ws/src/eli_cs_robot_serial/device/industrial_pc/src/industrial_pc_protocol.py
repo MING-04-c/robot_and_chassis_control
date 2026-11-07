@@ -26,9 +26,11 @@ def validate_command(payload):
         raise ProtocolError("message_id 缺失或无效")
     schema = payload.get("schema")
     if schema == "paint_robot_status_request_v1":
-        if set(payload) != {"schema", "message_id"}:
-            raise ProtocolError("状态查询包含未知字段")
-        return "status"
+        if set(payload) == {"schema", "message_id"}:
+            return 'status'
+        if set(payload) == {'schema', 'message_id', 'channel'} and payload['channel'] in ('normal', 'abnormal'):
+            return 'status_'+payload['channel']
+        raise ProtocolError('状态查询channel仅支持normal/abnormal')
     if (schema != "paint_robot_task_request_v1" or
             set(payload) != {"schema", "message_id", "action"} or
             payload.get("action") not in ("start", "stop", "resume", "capture")):
@@ -53,6 +55,23 @@ def validate_thickness(reading):
     # 只取约定字段，禁止顺带传入历史窗口。
     return {"schema": reading["schema"], "value": value, "unit": reading["unit"],
             "sequence": sequence, "received_at_ros": dict(stamp)}
+
+
+def validate_detection_result(result):
+    """逐点回位结果；拒绝未回原位的事件，不用全局缓存补齐本次缺失读数。"""
+    if (not isinstance(result, dict) or result.get('schema') != 'paint_detection_point_result_v1'
+            or result.get('returned_home') is not True or type(result.get('success')) is not bool
+            or type(result.get('point_index')) is not int or result['point_index'] < 1):
+        raise ProtocolError('逐点检测结果格式或回位确认无效')
+    for key in ('result_id', 'batch_id', 'point_id', 'run_id'):
+        if not isinstance(result.get(key), str) or not 1 <= len(result[key]) <= 256:
+            raise ProtocolError('逐点检测结果身份缺失')
+    output = dict(result)
+    if result.get('measurement') is not None:
+        output['measurement'] = validate_thickness(result['measurement'])
+    elif result['success']:
+        raise ProtocolError('逐点成功结果必须包含本次有效测厚值')
+    return output
 
 
 def validate_thickness_request(payload):

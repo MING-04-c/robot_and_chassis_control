@@ -5,6 +5,9 @@ industrial_pc:
     bind_host: 0.0.0.0
     port: 9010
     socket_timeout: 5.0
+    # 本次截图：0x204的uint32状态码bit3充电、bit2低电量。
+    # 若底盘实际固件使用现有SDK的Byte1手动/桩充电位，改为byte_flags。
+    charging_status_layout: bitfield32
     use_shared_key: false
     key_file: ""
     output_dir: ~/robot_data/industrial_pc/results

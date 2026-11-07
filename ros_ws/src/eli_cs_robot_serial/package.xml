@@ -17,6 +17,8 @@
   <depend>std_srvs</depend>
   <depend>builtin_interfaces</depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>masc_chassis_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
   <exec_depend>python3-opencv</exec_depend>

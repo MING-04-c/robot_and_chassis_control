@@ -422,3 +422,17 @@ ROS_DOMAIN_ID=137 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST python3 src/ruier_came
 `line/mask` 为供循迹使用的筛选后主线；`line/stop_marker_mask` 为形态处理后的完整蓝线证据，供停车识别使用。`line/status` 中 `separated_stop_bars` 表示本帧分离数量。控制端的 `stop_marker_mask_topic` 必须指向后一话题：独立相机命名空间为 `/camera`，任务入口为 `/line_camera`。停车仍按原图高度中间定位，不规划横线之后的路线。
 
 任务末尾可调用USB相机 `~/streaming`（`std_srvs/srv/SetBool`）：false取消采集定时器并关闭设备，true按原参数重新打开。正式任务自动调用，用户不需要手动操作；此接口不影响底盘或机械臂驱动，识别节点在没有新图像时不继续处理旧图。
+
+### 未标定的循迹相机
+
+未提供 `camera_info_url` 时，驱动先检查 `${ROS_HOME:-$HOME/.ros}/camera_info/usb_camera.yaml`
+（实际文件名由 `camera_name` 决定）。文件不存在时发布未标定的 `CameraInfo`（K[0]=0），
+并明确提示不支持相机米制几何；不创建虚假内参，也不读取不存在的文件。
+显式指定的标定文件读取失败仍会报错退出。
+
+要补齐真实内参，需要用当前USB相机、固定焦距/对焦状态及当前640×480采集分辨率拍摄棋盘格，
+获得ROS相机标定YAML。把实测文件保存到上述默认位置，或在 `config/camera.yaml` 的
+`camera_info_url` 中填写 `file:///绝对路径/usb_camera.yaml`，然后重启相机。
+在线通过 `set_camera_info` 服务保存标定后也需重启加载。海康/深度相机的内参不能用于此USB相机。
+
+循迹识别节点 `opencv_threads` 默认为2（允许1..4，启动参数），限制OpenCV内部线程数以减少与机械臂控制竞争；算法阈值和相机采集帧率不因此改变。
