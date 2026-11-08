@@ -176,6 +176,7 @@ def generate_launch_description():
             "camera_frame": "line_camera_optical_frame",
             "max_processing_fps": LaunchConfiguration("line_processing_fps"),
             "opencv_threads": LaunchConfiguration("line_opencv_threads"),
+            "publish_compressed": LaunchConfiguration("line_publish_compressed"),
         }.items(),
     )
     line_follower = Node(
@@ -209,6 +210,9 @@ def generate_launch_description():
                     LaunchConfiguration("line_reverse_steering_sign"), value_type=float),
                 "show_window": ParameterValue(
                     LaunchConfiguration("line_show_window"), value_type=bool
+                ),
+                "debug_preview_enabled": ParameterValue(
+                    LaunchConfiguration("line_debug_preview"), value_type=bool
                 ),
                 "image_forward_direction": LaunchConfiguration(
                     "line_image_forward_direction"
@@ -284,7 +288,11 @@ def generate_launch_description():
         name="chassis_velocity_mux",
         output="screen",
         condition=IfCondition(LaunchConfiguration("use_velocity_mux")),
-        parameters=[{"enabled_on_startup": False}],
+        parameters=[{
+            "enabled_on_startup": False,
+            "command_timeout_sec": ParameterValue(
+                LaunchConfiguration("velocity_mux_timeout_sec"), value_type=float),
+        }],
     )
 
     workflow_controller = Node(
@@ -375,6 +383,8 @@ def generate_launch_description():
             DeclareLaunchArgument("line_processing_fps", default_value="0.0"),
             DeclareLaunchArgument("line_opencv_threads", default_value="2"),
             DeclareLaunchArgument("line_marker_opencv_threads", default_value=LaunchConfiguration("line_opencv_threads")),
+            DeclareLaunchArgument("line_publish_compressed", default_value="false",
+                                  description="发布循迹USB相机压缩图；生产控制默认关闭"),
             DeclareLaunchArgument("line_route_sample_distance", default_value="0.02"),
             DeclareLaunchArgument("joint_posture_only", default_value="false"),
             DeclareLaunchArgument("launch_admittance", default_value=NotSubstitution(
@@ -413,6 +423,8 @@ def generate_launch_description():
             DeclareLaunchArgument("line_drive_direction", default_value="forward", choices=["forward", "reverse"]),
             DeclareLaunchArgument("line_stop_marker_target_ratio", default_value="0.5"),
             DeclareLaunchArgument("line_show_window", default_value="false"),
+            DeclareLaunchArgument("line_debug_preview", default_value=LaunchConfiguration("line_show_window"),
+                                  description="订阅循迹调试大图并发布控制预览；默认跟随窗口开关"),
             DeclareLaunchArgument("line_adaptive_exposure", default_value="true"),
             DeclareLaunchArgument("line_image_forward_direction", default_value="down"),
             DeclareLaunchArgument(
@@ -424,6 +436,7 @@ def generate_launch_description():
             DeclareLaunchArgument("arm_control_start_delay", default_value="5.0"),
             DeclareLaunchArgument("start_chassis", default_value="true"),
             DeclareLaunchArgument("use_velocity_mux", default_value="true"),
+            DeclareLaunchArgument("velocity_mux_timeout_sec", default_value="0.15"),
             DeclareLaunchArgument("chassis_pid_enabled", default_value="true"),
             DeclareLaunchArgument("launch_arm_executor", default_value="true"),
             DeclareLaunchArgument("arm_use_cartesian_path", default_value="true"),

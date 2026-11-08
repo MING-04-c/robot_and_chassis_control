@@ -21,11 +21,14 @@ def generate_launch_description():
         DeclareLaunchArgument("show_window", default_value="true", description="Local desktop OpenCV window"),
         DeclareLaunchArgument("max_processing_fps", default_value="0.0"),
         DeclareLaunchArgument("opencv_threads", default_value="2"),
+        DeclareLaunchArgument("publish_compressed", default_value="false",
+                              description="Publish /image_raw/compressed; disabled by default for control runs"),
         DeclareLaunchArgument("demo", default_value="false", description="Synthetic images, not a real camera"),
         Node(
             package="ruier_camer_diver", executable="camera_node", name="camera_node",
             namespace=namespace, condition=UnlessCondition(LaunchConfiguration("demo")),
             parameters=[LaunchConfiguration("camera_params"), {"publish_raw": True, "video_device": LaunchConfiguration("video_device"),
+                         "publish_compressed": ParameterValue(LaunchConfiguration("publish_compressed"), value_type=bool),
                          "frame_id": LaunchConfiguration("camera_frame")}], output="screen",
         ),
         Node(

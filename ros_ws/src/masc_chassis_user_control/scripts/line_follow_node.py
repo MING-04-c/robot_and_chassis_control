@@ -168,6 +168,8 @@ class LineFollowNode(Node):
         self.enabled = self.declare_parameter('enabled', True).value
         self.dry_run = self.declare_parameter('dry_run', False, fixed).value
         self.show_window = self.declare_parameter('show_window', False, fixed).value
+        self.debug_preview_enabled = self.declare_parameter(
+            'debug_preview_enabled', bool(self.show_window), fixed).value
         self.bridge = CvBridge()
         self.window_name = 'MASC line following - body reference'
         self.geometry = None
@@ -233,9 +235,10 @@ class LineFollowNode(Node):
         self.debug_pub = self.create_publisher(Image, '/line_follow/debug_image', qos_profile_sensor_data)
         debug_image_topic = self.declare_parameter(
             'debug_image_topic', '/camera/line/debug_image', fixed).value
-        self.create_subscription(
-            Image, debug_image_topic, self.on_debug_image,
-            QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
+        if self.debug_preview_enabled:
+            self.create_subscription(
+                Image, debug_image_topic, self.on_debug_image,
+                QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
         marker_mask_topic = self.declare_parameter('stop_marker_mask_topic', '/camera/line/stop_marker_mask', fixed).value
         self.create_subscription(Image, marker_mask_topic, self.on_marker_mask,
                                  QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))

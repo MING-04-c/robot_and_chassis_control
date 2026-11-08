@@ -37,6 +37,10 @@ public:
     if (opencv_threads < 1 || opencv_threads > 4) {
       throw std::invalid_argument("opencv_threads must be 1..4");
     }
+    force_debug_publish_ = declare_parameter<bool>("publish_debug_image", false, fixed);
+    force_mask_publish_ = declare_parameter<bool>("publish_mask_image", false, fixed);
+    force_marker_mask_publish_ = declare_parameter<bool>("publish_stop_marker_mask", false, fixed);
+    force_edges_publish_ = declare_parameter<bool>("publish_edges_image", false, fixed);
     // 树莓派同时运行ROS控制：限制图像算法线程，避免争抢控制回调CPU。
     cv::setNumThreads(opencv_threads);
     RCLCPP_INFO(get_logger(), "OpenCV processing threads: %d; processing limit: %.1f fps (0=unlimited)",
@@ -264,20 +268,32 @@ private:
       last_sample_image_ = result.image;
       const double milliseconds = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
-      const bool demo = message->header.frame_id == "synthetic_demo";
-      cv::putText(result.debug, demo ? "SYNTHETIC DEMO" : "CAMERA INPUT", {result.debug.cols - 180, 23},
-        cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 200, 255), 1, cv::LINE_AA);
-      if (!sample_text_.empty()) {
-        cv::rectangle(result.debug, {result.debug.cols / 2, result.debug.rows - 25,
-          result.debug.cols / 2, 25}, cv::Scalar(20, 20, 20), cv::FILLED);
-        cv::putText(result.debug, sample_text_, {result.debug.cols / 2 + 8, result.debug.rows - 7},
+      const bool need_debug = force_debug_publish_ || show_window_ || debug_pub_->get_subscription_count() > 0;
+      const bool need_mask = force_mask_publish_ || mask_pub_->get_subscription_count() > 0;
+      const bool need_marker_mask =
+        force_marker_mask_publish_ || marker_mask_pub_->get_subscription_count() > 0;
+      const bool need_edges =
+        config_.show_canny && (force_edges_publish_ || edges_pub_->get_subscription_count() > 0);
+      if (need_debug) {
+        const bool demo = message->header.frame_id == "synthetic_demo";
+        cv::putText(result.debug, demo ? "SYNTHETIC DEMO" : "CAMERA INPUT", {result.debug.cols - 180, 23},
           cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 200, 255), 1, cv::LINE_AA);
+        if (!sample_text_.empty()) {
+          cv::rectangle(result.debug, {result.debug.cols / 2, result.debug.rows - 25,
+            result.debug.cols / 2, 25}, cv::Scalar(20, 20, 20), cv::FILLED);
+          cv::putText(result.debug, sample_text_, {result.debug.cols / 2 + 8, result.debug.rows - 7},
+            cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 200, 255), 1, cv::LINE_AA);
+        }
+        debug_pub_->publish(*cv_bridge::CvImage(message->header, "bgr8", result.debug).toImageMsg());
       }
-      debug_pub_->publish(*cv_bridge::CvImage(message->header, "bgr8", result.debug).toImageMsg());
-      mask_pub_->publish(*cv_bridge::CvImage(message->header, "mono8", result.mask).toImageMsg());
-      marker_mask_pub_->publish(
-        *cv_bridge::CvImage(message->header, "mono8", result.marker_mask).toImageMsg());
-      if (config_.show_canny) {
+      if (need_mask) {
+        mask_pub_->publish(*cv_bridge::CvImage(message->header, "mono8", result.mask).toImageMsg());
+      }
+      if (need_marker_mask) {
+        marker_mask_pub_->publish(
+          *cv_bridge::CvImage(message->header, "mono8", result.marker_mask).toImageMsg());
+      }
+      if (need_edges) {
         edges_pub_->publish(*cv_bridge::CvImage(message->header, "mono8", result.edges).toImageMsg());
       }
       geometry_msgs::msg::PolygonStamped path;
@@ -300,7 +316,9 @@ private:
       path_pub_->publish(path);
       estimated_pub_->publish(estimates);
       publish_state(&result, result.state, milliseconds);
-      last_debug_ = result.debug;
+      if (need_debug || show_window_) {
+        last_debug_ = result.debug;
+      }
       if (show_window_) {display(result.debug);}
       last_processing_finished_ = std::chrono::steady_clock::now();
     } catch (const std::exception & error) {
@@ -314,7 +332,9 @@ private:
       last_sample_image_.release();
       cv::putText(last_debug_, "PROCESSING ERROR - LOST", {15, 40},
         cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(40, 40, 255), 2);
-      debug_pub_->publish(*cv_bridge::CvImage(last_header_, "bgr8", last_debug_).toImageMsg());
+      if (force_debug_publish_ || show_window_ || debug_pub_->get_subscription_count() > 0) {
+        debug_pub_->publish(*cv_bridge::CvImage(last_header_, "bgr8", last_debug_).toImageMsg());
+      }
       if (show_window_) {display(last_debug_);}
       last_processing_finished_ = std::chrono::steady_clock::now();
     }
@@ -388,17 +408,23 @@ private:
     empty.header = last_header_;
     path_pub_->publish(empty);
     estimated_pub_->publish(empty);
-    cv::Mat stale = last_debug_.empty() ? cv::Mat::zeros(480, 900, CV_8UC3) : last_debug_.clone();
-    cv::rectangle(stale, {0, 0, stale.cols, 64}, cv::Scalar(20, 20, 20), cv::FILLED);
-    cv::putText(stale, received_ ? "STALE FRAME - LOST" : "WAITING FOR CAMERA IMAGE - LOST",
-      {10, 35}, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(40, 40, 255), 2);
-    // Preserve the original image timestamp: stale imagery must not look newly acquired.
-    debug_pub_->publish(*cv_bridge::CvImage(last_header_, "bgr8", stale).toImageMsg());
-    if (show_window_) {display(stale);}
+    if (force_debug_publish_ || show_window_ || debug_pub_->get_subscription_count() > 0) {
+      cv::Mat stale = last_debug_.empty() ? cv::Mat::zeros(480, 900, CV_8UC3) : last_debug_.clone();
+      cv::rectangle(stale, {0, 0, stale.cols, 64}, cv::Scalar(20, 20, 20), cv::FILLED);
+      cv::putText(stale, received_ ? "STALE FRAME - LOST" : "WAITING FOR CAMERA IMAGE - LOST",
+        {10, 35}, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(40, 40, 255), 2);
+      // Preserve the original image timestamp: stale imagery must not look newly acquired.
+      debug_pub_->publish(*cv_bridge::CvImage(last_header_, "bgr8", stale).toImageMsg());
+      if (show_window_) {display(stale);}
+    }
   }
 
   LineConfig config_;
   bool show_window_ = false, received_ = false;
+  bool force_debug_publish_ = false;
+  bool force_mask_publish_ = false;
+  bool force_marker_mask_publish_ = false;
+  bool force_edges_publish_ = false;
   double timeout_ = 0.5;
   double max_processing_fps_ = 0.0;
   std::chrono::steady_clock::time_point last_processing_started_{};

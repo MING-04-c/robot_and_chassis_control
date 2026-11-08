@@ -11,7 +11,7 @@ from std_srvs.srv import SetBool
 class VelocityMux(Node):
     def __init__(self):
         super().__init__("chassis_velocity_mux")
-        self.timeout = float(self.declare_parameter("command_timeout_sec", 0.1).value)
+        self.timeout = float(self.declare_parameter("command_timeout_sec", 0.15).value)
         if not 0.02 <= self.timeout <= 0.5:
             raise ValueError("command_timeout_sec must be 0.02..0.5")
         self.enabled = bool(self.declare_parameter("enabled_on_startup", True).value)

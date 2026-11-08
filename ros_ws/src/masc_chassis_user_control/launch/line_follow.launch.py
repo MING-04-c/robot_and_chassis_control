@@ -122,6 +122,7 @@ def generate_launch_description():
                 'vehicle_reference_y_ratio': ParameterValue(
                     LaunchConfiguration('vehicle_reference_y_ratio'), value_type=float),
                 'show_window': ParameterValue(LaunchConfiguration('show_window'), value_type=bool),
+                'debug_preview_enabled': ParameterValue(LaunchConfiguration('show_window'), value_type=bool),
                 'enabled': ParameterValue(LaunchConfiguration('enabled'), value_type=bool),
                 'require_bottom_connected': ParameterValue(
                     LaunchConfiguration('require_bottom_connected'), value_type=bool),
@@ -148,6 +149,7 @@ def generate_launch_description():
                 'vehicle_reference_y_ratio': ParameterValue(
                     LaunchConfiguration('vehicle_reference_y_ratio'), value_type=float),
                 'show_window': ParameterValue(LaunchConfiguration('show_window'), value_type=bool),
+                'debug_preview_enabled': ParameterValue(LaunchConfiguration('show_window'), value_type=bool),
                 'enabled': ParameterValue(LaunchConfiguration('enabled'), value_type=bool),
                 'require_bottom_connected': ParameterValue(
                     LaunchConfiguration('require_bottom_connected'), value_type=bool),

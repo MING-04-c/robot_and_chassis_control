@@ -12,7 +12,7 @@
     # 速度命令周期、超时和最大速度限制。
     command:
       period_ms: 20
-      timeout_ms: 100
+      timeout_ms: 150
       stamped_control: false
       max_linear_x: 1.5
       max_linear_y: 1.0
