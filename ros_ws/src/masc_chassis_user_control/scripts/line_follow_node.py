@@ -33,7 +33,7 @@ from charging_dock import ChargingDock
 from line_follow_workers import LatestWorker
 from reverse_visual import GroundMapping, near_line, aligned as visually_aligned, strafe_command, AlignmentSequencer
 from recorded_route import write_route_document, RouteConfig, RouteRecorder, ReverseRouteFollower, ReverseFinishGuard, load_route, wrap
-from line_follow_control import (ControlConfig, SteeringDirectionGuard, coordinated_velocity,
+from line_follow_control import (ControlConfig, SteeringDirectionGuard, coordinated_velocity, cruise_velocity,
                                  line_command, motion_preview, tracking_geometry,
                                  straight_image_axis, reverse_visual_command, slew)
 
@@ -50,6 +50,7 @@ class LineFollowNode(Node):
         if type(cv_threads) is not int or not 1 <= cv_threads <= 4:
             raise ValueError('opencv_threads must be 1..4')
         cv2.setNumThreads(cv_threads)  # 后台掩膜计算受限并行，控制状态机保持串行。
+        self.get_logger().info(f'横线/预览 OpenCV线程数={cv2.getNumThreads()}；控制状态机串行执行')
         fixed = ParameterDescriptor(read_only=True)
         defaults = ControlConfig()
         values = {name: self.declare_parameter(name, value).value
@@ -78,6 +79,7 @@ class LineFollowNode(Node):
             finish_distance=self.standard_finish_distance, finish_extra_distance=self.standard_extra,
             loss_timeout=self.standard_visual_loss_timeout, loss_distance=self.standard_visual_loss_distance,
             assist_gain=float(self.declare_parameter('standard_visual_assist_gain', .5, fixed).value),
+            curve_min_speed=float(self.declare_parameter('standard_curve_min_speed', .05, fixed).value),
             assist_max_yaw=float(self.declare_parameter('standard_visual_assist_max_yaw', .06, fixed).value))
         self.forward_navigation_config.validate()
         self.reverse_mode = self.declare_parameter('reverse_mode', 'recorded_route', fixed).value
@@ -142,7 +144,8 @@ class LineFollowNode(Node):
         self.ground_mapping = GroundMapping(mapping_file) if mapping_file else None
         self.start_aligner = StartLineAligner(
             self.config, self.ground_mapping,
-            max_distance_m=self.config.start_alignment_max_distance)
+            max_distance_m=self.config.start_alignment_max_distance,
+            decision_frames=self.config.start_alignment_observation_frames)
         self.start_alignment_active = False
         self.start_alignment_departing = False
         self.start_alignment_state = 'inactive'
@@ -237,9 +240,9 @@ class LineFollowNode(Node):
         self.create_subscription(Image, marker_mask_topic, self.on_marker_mask,
                                  QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
         self.create_subscription(Empty, '/line_follow/resume', self.on_resume_marker, 10)
-        self.create_subscription(String, topics['line_status_topic'], self.on_status, 10)
+        self.create_subscription(String, topics['line_status_topic'], self.on_status, 1)
         self.create_subscription(PolygonStamped, topics['centerline_topic'],
-                                 self.on_path, qos_profile_sensor_data)
+                                 self.on_path, QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability))
         self.create_subscription(CommStatus, topics['comm_status_topic'], self.on_comm, 10)
         self.create_subscription(ChassisStatus, topics['chassis_status_topic'],
                                  self.on_chassis, 10)
@@ -311,7 +314,10 @@ class LineFollowNode(Node):
         self.marker_gate.reset(allow_start_marker=False)
         self.start_alignment_context = dict(
             enabled=True, target_ratio=config.stop_marker_target_ratio,
-            strategy='stop_observe_single_axis_step', settle_sec=config.start_alignment_settle_sec,
+            strategy='stop_observe_adaptive_odometry_step', settle_sec=config.start_alignment_settle_sec,
+            recheck_settle_sec=config.start_alignment_recheck_settle_sec,
+            decision_frames=config.start_alignment_observation_frames,
+            coarse_step_distance_limit_m=config.start_alignment_coarse_step_distance,
             step_distance_limit_m=config.start_alignment_step_distance,
             coordinate_source=('ground_mapping' if self.ground_mapping else 'image_ratio'),
             ground_mapping_fit_error_m=(self.ground_mapping.fit_error_m if self.ground_mapping else None),
@@ -908,12 +914,26 @@ class LineFollowNode(Node):
                 scale = self.config.max_angular_speed/abs(w)
                 v, w = v*scale, w*scale
             target_v = v
-            if self.route_config.visual_strafe and self.return_finish is not None:
+            normal_cruise = self.return_finish is None and state == 'reverse_route_tracking'
+            if normal_cruise:
+                hard_limit = min(self.config.forward_speed, self.config.reverse_max_speed, self.route_config.max_speed)
+                curvature = w/v if v else 0.
+                if abs(curvature) > 1e-9:
+                    hard_limit = min(hard_limit, self.config.max_angular_speed/abs(curvature),
+                        math.sqrt(self.route_config.max_lateral_accel/abs(curvature)))
+                if self.return_tracker.diagnostics['remaining_m'] <= self.route_config.finish_distance:
+                    hard_limit = min(hard_limit, abs(target_v))
+                v, w = cruise_velocity(self.previous_v, self.previous_w, v, w,
+                    self.config, dt, hard_speed_limit=hard_limit)
+                if abs(w) > self.config.max_angular_speed:
+                    scale = self.config.max_angular_speed/abs(w)
+                    v, w = v*scale, w*scale
+            elif self.route_config.visual_strafe and self.return_finish is not None:
                 v = slew(self.previous_v, v, self.config.linear_acceleration, dt) if v else 0.
                 w = slew(self.previous_w, w, self.config.angular_acceleration, dt) if w else 0.
             else:
                 v, w = coordinated_velocity(self.previous_v, self.previous_w, v, w, self.config, dt)
-            if abs(v) > abs(target_v):
+            if not normal_cruise and abs(v) > abs(target_v):
                 w *= abs(target_v/v)
                 v = target_v
             if not (self.route_config.visual_strafe and self.return_finish is not None):
@@ -1041,14 +1061,18 @@ class LineFollowNode(Node):
 
     @staticmethod
     def detect_marker_frame(request):
-        message, points, config, reference, shape = request
+        message, points, config, reference, shape, submitted_at, upstream_age_ms, tracker_ms = request
+        started = time.monotonic()
         mask = CvBridge().imgmsg_to_cv2(message, desired_encoding='mono8')
         if shape is not None and mask.shape != shape:
             raise ValueError('stop mask resolution mismatch')
         diagnostics = {}
-        started = time.monotonic()
         candidates = detect_stop_markers(mask, points, config, reference, diagnostics=diagnostics)
+        diagnostics['upstream_age_ms'] = upstream_age_ms
+        diagnostics['tracker_processing_ms'] = tracker_ms
+        diagnostics['worker_wait_ms'] = round((started-submitted_at)*1000, 1)
         diagnostics['detector_processing_ms'] = round((time.monotonic()-started)*1000, 1)
+        diagnostics['worker_finished_at'] = time.monotonic()
         return message.header, config, candidates, diagnostics, mask.shape[0]
 
     def accept_marker_mask(self, message):
@@ -1060,8 +1084,15 @@ class LineFollowNode(Node):
         self.marker_stamp = stamp
         shape = ((self.status.get('image_height'), self.status.get('image_width'))
                  if isinstance(self.status, dict) else None)
+        stamp_ns = message.header.stamp.sec*10**9+message.header.stamp.nanosec
+        upstream_age_ms = round((self.get_clock().now().nanoseconds-stamp_ns)/1e6, 1)
+        # 不占用后台槽处理已过期的源图；过期结果仍由原来的新鲜度检查拦截。
+        if not -100. <= upstream_age_ms <= self.input_timeout*1000:
+            return
         self.marker_worker.submit((message, list(self.path_points), self.config,
-                                   copy.deepcopy(self.marker_gate.reference_marker), shape))
+                                   copy.deepcopy(self.marker_gate.reference_marker), shape,
+                                   time.monotonic(), upstream_age_ms,
+                                   self.status.get('processing_ms') if isinstance(self.status, dict) else None))
 
     def collect_marker_result(self):
         result = self.marker_worker.take()
@@ -1073,6 +1104,8 @@ class LineFollowNode(Node):
             self.get_logger().warning(f'横线检测失败：{error}')
             return
         header, config, candidates, diagnostics, height = observation
+        finished_at = diagnostics.pop('worker_finished_at')
+        diagnostics['result_collect_ms'] = round((time.monotonic()-finished_at)*1000, 1)
         stamp = header.stamp.sec*10**9+header.stamp.nanosec
         age = (self.get_clock().now().nanoseconds-stamp)/1e9
         previous = (self.marker_header.stamp.sec*10**9+self.marker_header.stamp.nanosec
@@ -1084,7 +1117,10 @@ class LineFollowNode(Node):
                 self.last_marker_latency_log = now
                 self.get_logger().warning(
                     f'横线结果已过期：源图到结果={age*1000:.0f}ms，'
-                    f'横线检测计算={diagnostics.get("detector_processing_ms", 0):.0f}ms；'
+                    f'上游={diagnostics["upstream_age_ms"]:.0f}ms，'
+                    f'后台等待={diagnostics["worker_wait_ms"]:.0f}ms，'
+                    f'横线检测计算={diagnostics.get("detector_processing_ms", 0):.0f}ms，'
+                    f'结果回收={diagnostics["result_collect_ms"]:.0f}ms；'
                     '未使用过期结果，需检查上游处理/调度延迟')
             return
         diagnostics['result_age_ms'] = round(age*1000, 1)
@@ -1105,6 +1141,17 @@ class LineFollowNode(Node):
         self.marker_header = header
         self.marker_time = time.monotonic()
 
+    def alignment_marker_pending(self, now, input_reason):
+        """Only a marker-result wait with a fresh synchronized mainline qualifies."""
+        if (input_reason not in ('stop_marker_mask_timeout', 'stop_marker_mask_stale')
+                or not self.frame_sync or not self.path_valid or self.path_header is None
+                or any(t is None or now-t > self.input_timeout
+                       for t in (self.status_time, self.path_time))):
+            return False
+        stamp = self.path_header.stamp
+        path_age = (self.get_clock().now().nanoseconds-stamp.sec*10**9-stamp.nanosec)/1e9
+        return -.1 <= path_age <= self.input_timeout
+
     def tick_start_alignment(self, now, dt, input_reason):
         """Run stopped visual observations separated by bounded odometry steps.
 
@@ -1123,10 +1170,15 @@ class LineFollowNode(Node):
                    and abs(self.latest_odom['w']) < .015)
         line_ready = (input_reason is None and self.status_time is not None
                       and self.path_time is not None and self.marker_time is not None)
+        # Do not move the capture cutoff forward merely because the previous
+        # asynchronous marker result expired. A fresh mainline and a stopped
+        # chassis can still contribute new, individually fresh marker samples.
+        marker_pending = self.alignment_marker_pending(now, input_reason)
         self.start_aligner.input_block_reason = input_reason
         previous_state = self.start_alignment_state
         state = self.start_aligner.command(now, pose, odom_fresh=odom_fresh,
-                                           line_ready=line_ready, stopped=stopped)
+                                           line_ready=line_ready, stopped=stopped,
+                                           marker_pending=marker_pending)
         self.start_alignment_state = state
         if (now-self.last_start_alignment_log >= 2.
                 or state.startswith('start_alignment_failed') and state != previous_state):
@@ -1137,19 +1189,28 @@ class LineFollowNode(Node):
             self.get_logger().info('起步对齐诊断：'+json.dumps(dict(
                 state=state, axis=snapshot['axis'], phase=snapshot['phase'],
                 input_block=input_reason, odometry_reason=self.odom_reason(now),
+                marker_pending=snapshot['marker_pending'],
                 stopped=stopped, actual_velocity=velocity,
                 last_command=dict(v=self.previous_v, vy=self.previous_vy, w=self.previous_w),
                 step_target_m=self.start_aligner.step_distance or self.start_aligner.step_lateral_m,
                 step_actual_m=snapshot['step_actual_m'], step_remaining_m=snapshot['step_remaining_m'],
                 step_actual_rad=snapshot['step_actual_rad'],
+                step_limit_m=snapshot['step_limit_m'], step_timeout_sec=snapshot['step_timeout_sec'],
+                distance_estimate_source=snapshot['distance_estimate_source'],
+                estimated_remaining_m=snapshot['estimated_remaining_m'],
                 step_age_sec=(now-self.start_aligner.step_started_at
                               if self.start_aligner.step_started_at is not None else None),
                 lateral_min_speed=self.config.start_alignment_min_lateral_speed,
                 marker_candidates=len(self.marker_candidates),
                 marker_rejected=self.stop_detection.get('rejected', {}),
                 detector_processing_ms=self.stop_detection.get('detector_processing_ms'),
+                upstream_age_ms=self.stop_detection.get('upstream_age_ms'),
+                tracker_processing_ms=self.stop_detection.get('tracker_processing_ms'),
+                worker_wait_ms=self.stop_detection.get('worker_wait_ms'),
+                result_collect_ms=self.stop_detection.get('result_collect_ms'),
                 marker_result_age_ms=self.stop_detection.get('result_age_ms'),
-                samples=snapshot['samples'], required_samples=snapshot['filter_frames'],
+                samples=snapshot['samples'], required_samples=snapshot['decision_frames'],
+                observation_stability=snapshot['observation_stability'],
                 confirmations=snapshot['stable_frames'], required_confirmations=snapshot['confirmation_frames'],
                 longitudinal_error=(self.start_aligner.position_error_m if self.start_aligner.metric
                                     else self.start_aligner.position_error),
@@ -1433,6 +1494,7 @@ class LineFollowNode(Node):
         marker_was_enabled = self.config.stop_marker_enabled
         self.config = candidate
         self.start_aligner.config = candidate
+        self.start_aligner.decision_frames = candidate.start_alignment_observation_frames
         self.start_aligner.max_distance_m = candidate.start_alignment_max_distance
         if ((candidate.stop_marker_enabled and not marker_was_enabled) or updates.keys() & {
                 'stop_marker_target_ratio', 'stop_marker_average_frames',
@@ -2153,12 +2215,26 @@ class LineFollowNode(Node):
                 # RPP-style regulation: keep the requested radius when yaw is capped.
                 target_v = min(target_v, yaw_limit/abs(curvature))
             target_w = max(-yaw_limit, min(yaw_limit, curvature*target_v))
-            v, w = coordinated_velocity(self.previous_v, self.previous_w,
-                target_v, target_w, self.config, dt, self.control_curve_strength)
-            if (marker_state != 'searching' or self.navigation_mode == 'replay') and abs(v) > abs(target_v):
-                # 停车接近限速是硬上限；同步缩小角速度，避免降线速度却突然打大轮向。
-                w *= abs(target_v/v)
-                v = target_v
+            if self.navigation_mode == 'replay':
+                hard_limit = min(self.config.forward_speed, self.forward_route_config.max_speed)
+                if abs(curvature) > 1e-9:
+                    hard_limit = min(hard_limit, yaw_limit/abs(curvature),
+                        math.sqrt(self.forward_route_config.max_lateral_accel/abs(curvature)))
+                if self.standard_visual_loss is not None:
+                    hard_limit = min(hard_limit, self.forward_navigation_config.loss_speed)
+                if marker_state != 'searching' or self.standard_finish is not None:
+                    hard_limit = min(hard_limit, abs(target_v))
+                v, w = cruise_velocity(self.previous_v, self.previous_w,
+                    target_v, target_w, self.config, dt, self.control_curve_strength, hard_limit)
+                if abs(w) > yaw_limit:
+                    scale = yaw_limit/abs(w)
+                    v, w = v*scale, w*scale
+            else:
+                v, w = coordinated_velocity(self.previous_v, self.previous_w,
+                    target_v, target_w, self.config, dt, self.control_curve_strength)
+                if marker_state != 'searching' and abs(v) > abs(target_v):
+                    w *= abs(target_v/v)
+                    v = target_v
         elif reason.startswith('start_alignment_'):
             # tick_start_alignment has already applied bounded velocity/turn rates.
             pass

@@ -54,8 +54,18 @@ class AutoAdmittanceStart(Node):
         self.last_wrench = monotonic()
 
     def on_controllers(self, future):
+        if future.cancelled():
+            self.controllers_active = False
+            self.ready_since = None
+            return
         try:
-            states = {item.name: item.state for item in future.result().controller}
+            response = future.result()
+            if response is None:
+                self.controllers_active = False
+                self.ready_since = None
+                self.get_logger().warn('Controller readiness query returned no response; still waiting')
+                return
+            states = {item.name: item.state for item in response.controller}
             required = ('scaled_joint_trajectory_controller', 'joint_state_broadcaster',
                         'speed_scaling_state_broadcaster', 'tcp_pose_broadcaster')
             if self.wait_for_all_controllers:

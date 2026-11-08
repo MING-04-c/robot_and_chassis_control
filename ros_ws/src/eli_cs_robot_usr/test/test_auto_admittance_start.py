@@ -28,6 +28,23 @@ spec.loader.exec_module(module)
 
 
 class AutoStartTest(unittest.TestCase):
+    def test_cancelled_or_empty_query_never_marks_controllers_ready(self):
+        for cancelled in (True, False):
+            with self.subTest(cancelled=cancelled):
+                start = Mock()
+                start.controllers_active = True
+                start.ready_since = 100.
+                future = Mock()
+                future.cancelled.return_value = cancelled
+                future.result.return_value = None
+                module.AutoAdmittanceStart.on_controllers(start, future)
+                self.assertFalse(start.controllers_active)
+                self.assertIsNone(start.ready_since)
+                if cancelled:
+                    future.result.assert_not_called()
+                else:
+                    start.get_logger().warn.assert_called_once()
+
     def test_waits_and_starts_once_without_manual_services(self):
         rclpy.init(args=['--ros-args', '-p', 'settle_seconds:=0.0'])
         fake = Node('fake_standalone_arm')

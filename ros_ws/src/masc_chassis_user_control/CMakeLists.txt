@@ -17,6 +17,8 @@ if(BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_forward_navigation.py)
   add_test(NAME line_follow_control
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_line_follow_control.py)
+  add_test(NAME marker_latency
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_marker_latency.py)
   add_test(NAME line_follow_ros
     COMMAND ${CMAKE_COMMAND} -E env
       ROS_DOMAIN_ID=178 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
@@ -38,7 +40,7 @@ if(BUILD_TESTING)
     COMMAND ${CMAKE_COMMAND} -E env
       ROS_DOMAIN_ID=184 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
       ${Python3_EXECUTABLE} -c
-      "import sys; sys.path.insert(0, '${CMAKE_CURRENT_SOURCE_DIR}/test'); from test_line_follow_ros import standard_route_ros; standard_route_ros(); [standard_route_ros(check_loss=case) for case in ('recover', 'timeout', 'distance', 'finish', 'odom', 'deviation', 'curve')]")
+      "import sys; sys.path.insert(0, '${CMAKE_CURRENT_SOURCE_DIR}/test'); from test_line_follow_ros import standard_route_ros; standard_route_ros(); [standard_route_ros(check_loss=case) for case in ('recover', 'timeout', 'distance', 'finish', 'odom', 'deviation', 'curve', 'ramp')]")
   set_tests_properties(standard_odom_replay_ros PROPERTIES TIMEOUT 80)
   add_test(NAME standard_visual_finish_ros
     COMMAND ${CMAKE_COMMAND} -E env

@@ -32,6 +32,10 @@ def generate_launch_description():
                 ['~/.ros/line_follow/standards', LaunchConfiguration('route_name'), 'standard_route.json'])),
             DeclareLaunchArgument('line_processing_fps', default_value=IfElseSubstitution(
                 EqualsSubstitution(LaunchConfiguration('navigation_mode'), 'replay'), '8.0', '0.0')),
+            DeclareLaunchArgument('line_opencv_threads', default_value='2',
+                                 description='主线图像处理的OpenCV线程数'),
+            DeclareLaunchArgument('line_marker_opencv_threads', default_value=LaunchConfiguration('line_opencv_threads'),
+                                 description='横线检测OpenCV线程数，可独立于主线设置'),
             DeclareLaunchArgument('round_trip', default_value=NotSubstitution(
                 EqualsSubstitution(LaunchConfiguration('navigation_mode'), 'vision')),
                                  description='自动往返；配合charging_mode=true时首条有效横线停5秒后返程充电'),
@@ -91,6 +95,8 @@ def generate_launch_description():
                     "line_route_sample_distance": IfElseSubstitution(
                         EqualsSubstitution(LaunchConfiguration('navigation_mode'), 'teach'), '0.01', '0.02'),
                     "line_processing_fps": LaunchConfiguration('line_processing_fps'),
+                    "line_opencv_threads": LaunchConfiguration('line_opencv_threads'),
+                    "line_marker_opencv_threads": LaunchConfiguration('line_marker_opencv_threads'),
                     "line_drive_direction": IfElseSubstitution(LaunchConfiguration('round_trip'),
                                                                'forward', LaunchConfiguration("drive_direction")),
                     'line_charging_mode': LaunchConfiguration('charging_mode'),

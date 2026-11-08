@@ -18,7 +18,7 @@ def wrap(angle):
 class RouteConfig:
     sample_distance: float = .02
     lookahead: float = .20
-    max_speed: float = .08
+    max_speed: float = .10
     lookahead_speed_reference: float = .10
     min_lookahead: float = .08
     max_lookahead: float = .36

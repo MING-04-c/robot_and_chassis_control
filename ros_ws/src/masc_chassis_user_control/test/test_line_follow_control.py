@@ -129,6 +129,98 @@ class StartLineAlignmentTests(unittest.TestCase):
                             int(now*1e9), now, source_time=source_time)
         return now
 
+    def test_three_frame_decision_still_requires_five_frame_completion(self):
+        config = ControlConfig(image_forward_direction='down')
+        aligner = self.ready_aligner(config, decision_frames=3)
+        for i in range(3):
+            now = .1+i*.1
+            aligner.observe([dict(x=50., y=65.)], 101, 101, i+1, now)
+        self.assertEqual(aligner.command(now, (0., 0., 0.), stopped=True),
+                         'start_alignment_moving_forward')
+        self.assertAlmostEqual(aligner.step_distance, .005, msg='unknown scale must probe')
+        done = self.ready_aligner(config, decision_frames=3)
+        for i in range(5):
+            now = .1+i*.1
+            done.observe([dict(x=50., y=50.)], 101, 101, i+1, now)
+            state = done.command(now, (0., 0., 0.), stopped=True)
+            self.assertEqual(state == 'start_alignment_complete', i == 4)
+
+    def test_sparse_detections_keep_only_fresh_stationary_evidence(self):
+        aligner = self.ready_aligner(ControlConfig(), decision_frames=3)
+        for i in range(5):
+            now = .1+i*.25
+            aligner.observe([dict(x=50., y=50.)], 101, 101, int(now*1e9), now)
+            state = aligner.command(now, (0., 0., 0.), stopped=True)
+            if i < 4:
+                gap = now+.1
+                aligner.observe([], 101, 101, int(gap*1e9), gap)
+                self.assertNotEqual(aligner.command(gap, (0., 0., 0.), stopped=True),
+                                    'start_alignment_complete')
+        self.assertEqual(state, 'start_alignment_complete')
+        aligner.command(3., (0., 0., 0.), stopped=True)
+        self.assertEqual(len(aligner.samples), 0)
+        aligner.observe([dict(x=50., y=50.)], 101, 101, int(3.1e9), 3.1)
+        self.assertNotEqual(aligner.command(3.1, (0., 0., 0.), stopped=True),
+                            'start_alignment_complete')
+
+    def test_stability_diagnostic_identifies_longitudinal_jitter(self):
+        aligner = self.ready_aligner(ControlConfig(), decision_frames=3)
+        for i, y in enumerate((76., 79., 76.)):
+            aligner.observe([dict(x=50., y=y)], 101, 101, i+1, .1+i*.1)
+        diagnostic = aligner.snapshot()['observation_stability']
+        self.assertEqual(diagnostic['sample_count'], 3)
+        self.assertFalse(diagnostic['stable'])
+        self.assertFalse(diagnostic['axes']['longitudinal_ratio']['within_limit'])
+        self.assertTrue(diagnostic['axes']['lateral']['within_limit'])
+        self.assertTrue(diagnostic['axes']['heading_rad']['within_limit'])
+        self.assertEqual(aligner.command(.3, (0., 0., 0.), stopped=True),
+                         'start_alignment_waiting_for_stable_image')
+
+    def test_coarse_step_requires_consistent_scale_and_respects_budget(self):
+        for error_sign in (-1., 1.):
+            for samples, expected in (([2.], .015), ([2., 2.1], .05)):
+                aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'), decision_frames=3)
+                aligner.image_response_per_m = 2.
+                aligner.response_samples['longitudinal'] = samples.copy()
+                now = self.frames(aligner, .1, y=50.+30.*error_sign)
+                aligner.command(now, (0., 0., 0.), stopped=True)
+                self.assertAlmostEqual(aligner.step_distance, error_sign*expected)
+                # Odometry, not more image commands, finishes the move.
+                aligner.command(now+.2, (aligner.step_distance, 0., 0.), stopped=False)
+                self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
+        aligner.travelled_m = aligner.max_distance_m-.012
+        aligner.image_response_per_m = 2.
+        aligner.response_samples['longitudinal'] = [2., 2.]
+        now = self.frames(aligner, .1, y=80.)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        self.assertAlmostEqual(aligner.step_distance, .012)
+
+    def test_completed_step_rechecks_faster_but_rejects_motion_frames(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'), decision_frames=3)
+        now = self.frames(aligner, .1)
+        aligner.command(now, (0., 0., 0.), stopped=True)
+        distance = aligner.step_distance
+        aligner.command(.4, (distance, 0., 0.), stopped=False)
+        aligner.command(.45, (distance+.0002, 0., 0.), stopped=False)
+        aligner.command(.5, (distance+.0002, 0., 0.), stopped=True)
+        self.assertAlmostEqual(aligner.accept_after, .75)
+        aligner.command(.8, (distance, 0., 0.), stopped=True)
+        self.assertFalse(aligner.observe([dict(x=50., y=50.)], 101, 101, 1_000_000_000,
+                                         1., source_time=.7))
+        self.assertTrue(aligner.observe([dict(x=50., y=50.)], 101, 101, 1_100_000_000,
+                                        1.1, source_time=.8))
+
+    def test_new_alignment_config_bounds(self):
+        for update in ({'start_alignment_observation_frames': 2},
+                       {'start_alignment_observation_frames': 3.5},
+                       {'start_alignment_coarse_step_distance': .2},
+                       {'start_alignment_coarse_step_distance': .001},
+                       {'start_alignment_coarse_max_angle': .3},
+                       {'start_alignment_recheck_settle_sec': .01}):
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                replace(ControlConfig(), **update).validate()
+
     def test_filtered_image_error_direction_and_duplicate_frame(self):
         config = ControlConfig(image_forward_direction='down')
         aligner = self.ready_aligner(config, confirmation_frames=3, filter_frames=5)
@@ -175,7 +267,7 @@ class StartLineAlignmentTests(unittest.TestCase):
                                 stamp, stamp*.1)
             self.assertEqual(aligner.command(.5, (0., 0., 0.), stopped=True),
                              'start_alignment_moving_forward')
-            self.assertAlmostEqual(aligner.step_distance, .015)
+            self.assertAlmostEqual(aligner.step_distance, .05)
             self.assertIsNone(aligner.image_response_per_m)
 
             mismatched = self.ready_aligner(ControlConfig(image_forward_direction='down'), mapping)
@@ -481,7 +573,7 @@ class StartLineAlignmentTests(unittest.TestCase):
                          'start_alignment_moving_yaw')
         self.assertEqual(aligner.velocity()[0], 0.)
         self.assertGreater(abs(aligner.velocity()[2]), 0.)
-        self.assertLessEqual(abs(aligner.step_angle), .04)
+        self.assertLessEqual(abs(aligner.step_angle), aligner.config.start_alignment_coarse_max_angle)
         aligner.command(.6, (0., 0., aligner.step_angle), stopped=False)
         self.assertEqual(aligner.velocity(), (0., 0., 0.))
 
@@ -555,6 +647,35 @@ class StartLineAlignmentTests(unittest.TestCase):
                                         int(.32e9), .32, source_time=.32))
         self.assertEqual(aligner.command(.33, (0., 0., 0.), stopped=True),
                          'start_alignment_complete')
+
+    def test_delayed_marker_samples_accumulate_during_stationary_pipeline_wait(self):
+        aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'), decision_frames=3)
+        for i, (capture, arrival) in enumerate(((.1, .42), (.34, .66), (.58, .9))):
+            if i:
+                aligner.command(arrival-.04, (0., 0., 0.), stopped=True,
+                                line_ready=False, marker_pending=True)
+                self.assertEqual(aligner.velocity(), (0., 0., 0.))
+            self.assertTrue(aligner.observe([dict(x=50., y=65.)], 101, 101,
+                                            i+1, arrival, source_time=capture))
+            self.assertEqual(len(aligner.samples), i+1)
+            state = aligner.command(arrival, (0., 0., 0.), stopped=True)
+        self.assertEqual(state, 'start_alignment_moving_forward')
+        self.assertAlmostEqual(aligner.step_distance, .005)
+
+    def test_pending_marker_cannot_complete_or_move_with_unready_inputs(self):
+        aligner = self.ready_aligner(ControlConfig(), decision_frames=3)
+        self.frames(aligner, .1, y=50.)
+        self.assertTrue(aligner.visual_ready)
+        state = aligner.command(.25, (0., 0., 0.), stopped=True,
+                                line_ready=False, marker_pending=True)
+        self.assertEqual(state, 'start_alignment_waiting_for_line')
+        self.assertEqual(aligner.velocity(), (0., 0., 0.))
+        self.assertFalse(aligner.observe([dict(x=50., y=50.)], 101, 101,
+                                         100, .8, source_time=.29))
+        aligner.command(.9, (0., 0., 0.), stopped=False,
+                        line_ready=False, marker_pending=True)
+        self.assertFalse(aligner.marker_pending)
+        self.assertEqual(len(aligner.samples), 0)
 
     def test_interrupted_motion_requires_full_stop_and_new_observation(self):
         aligner = self.ready_aligner(ControlConfig(image_forward_direction='down'))
@@ -918,7 +1039,7 @@ class RecordedRouteTests(unittest.TestCase):
         for lookahead in (.15, .30):
             config = replace(RouteConfig(), lookahead=lookahead)
             follower = ReverseRouteFollower({'points': points}, points[-1], config)
-            for x, requested, expected in ((1., .05, -.05), (.5, .2, -.08),
+            for x, requested, expected in ((1., .05, -.05), (.5, .2, -.10),
                                             (.15, .05, -.05), (.05, .05, -.025),
                                             (.04, .003, -.003), (.04, 0., 0.)):
                 # 连续里程计步进；大幅瞬移应被防跳段保护拒绝，不能用来测速度。

@@ -9,7 +9,8 @@ os.environ.setdefault("ROS_LOG_DIR", "/tmp/arm-description-launch-test")
 
 import launch_ros.actions
 from launch import LaunchDescription, LaunchService
-from launch.actions import ExecuteProcess, IncludeLaunchDescription, OpaqueFunction, TimerAction
+from launch.actions import ExecuteProcess, IncludeLaunchDescription, OpaqueFunction, TimerAction, RegisterEventHandler
+from launch.event_handlers import OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.utilities import evaluate_parameters, normalize_parameters
@@ -25,6 +26,7 @@ shares.pop("eli_cs_robot_serial", None)
 seen = []
 gate_exit_code = 0
 power_exit_code = 0
+failed_controller_name = None
 original_node = launch_ros.actions.Node
 original_find = FindPackageShare.find
 
@@ -41,7 +43,8 @@ def fake_node(**kwargs):
             elif isinstance(item, Path) and kwargs.get('name') in ('camera_detection_task', 'detect_controller'):
                 configuration = yaml.safe_load(item.read_text()) or {}
                 values.update(configuration.get(kwargs['name'], {}).get('ros__parameters', {}))
-        if kwargs.get('executable') == 'spawner':
+        values['dds_discovery_range'] = context.environment.get('ROS_AUTOMATIC_DISCOVERY_RANGE')
+        if kwargs.get('executable') in ('spawner', 'ros2_control_node'):
             values['arguments'] = [perform_substitutions(context,
                 normalize_to_list_of_substitutions(value)) for value in kwargs.get('arguments', [])]
         seen.append((kwargs.get("executable"), values))
@@ -52,7 +55,8 @@ def fake_node(**kwargs):
             def execute(self, context):
                 inspect(context)
                 return super().execute(context)
-        return FakeSpawner(cmd=['/bin/true'])
+        first_name = str(kwargs['arguments'][0])
+        return FakeSpawner(cmd=['/bin/false' if first_name == failed_controller_name else '/bin/true'])
     if kwargs.get('executable') == 'auto_power_on.py':
         class FakePowerGate(ExecuteProcess):
             def execute(self, context):
@@ -295,11 +299,11 @@ try:
         "dataset_capture_node.py" not in tracking
         and "hk_image_transfer" not in tracking
     )
-    for arguments, expected_speed in (({"drive_direction": "reverse"}, .075),
-                                     ({"drive_direction": "reverse", "route_camera_stop": "false", "route_visual_finish": "false"}, .075),
+    for arguments, expected_speed in (({"drive_direction": "reverse"}, .1),
+                                     ({"drive_direction": "reverse", "route_camera_stop": "false", "route_visual_finish": "false"}, .1),
                                      ({"drive_direction": "reverse", "line_follow_speed": ".03"}, .03),
                                      ({"drive_direction": "reverse", "reverse_steering_sign": "1.0",
-                                       "route_file": "/tmp/recorded-route-launch.json"}, .075)):
+                                       "route_file": "/tmp/recorded-route-launch.json"}, .1)):
         seen.clear()
         service = LaunchService()
         service.include_launch_description(LaunchDescription([
@@ -349,13 +353,14 @@ try:
     assert 'masc_chassis_ros_driver_node' in chassis_charge and 'camera_node' in chassis_charge
     assert not set(chassis_charge).intersection({'ros2_control_node', 'move_group', 'rviz2',
         'arm_joint_postures', 'sensor_node', 'admittance_pose_controller', 'industrial_pc_node.py'})
-    for mode,speed,fps in [('teach',.03,0.),('replay',.05,8.)]:
+    for mode,speed,fps in [('teach',.03,0.),('replay',.1,8.)]:
         seen.clear()
         service=LaunchService()
         service.include_launch_description(LaunchDescription([
             IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
                 root/'robot_task_control/launch/line_follow_only.launch.py')),
-                launch_arguments={'navigation_mode':mode,'route_name':'route_test'}.items())]))
+                launch_arguments={'navigation_mode':mode,'route_name':'route_test',
+                                  'line_opencv_threads':'2', 'line_marker_opencv_threads':'1'}.items())]))
         assert service.run()==0
         profile={executable:values for executable,values in seen}
         assert profile['line_follow_node.py']['reverse_route_lookahead']==.26
@@ -365,6 +370,8 @@ try:
         assert profile['line_follow_node.py']['navigation_mode']==('vision' if mode=='teach' else 'replay')
         assert 'route_test' in profile['line_follow_node.py']['standard_route_file']
         assert profile['line_tracker_node']['max_processing_fps']==fps
+        assert profile['line_tracker_node']['opencv_threads']==2
+        assert profile['line_follow_node.py']['opencv_threads']==1
         assert profile['line_follow_node.py']['charging_mode'] is True
         assert bool(profile['task_controller']['standard_route_output'])==(mode=='teach')
         assert str(profile['task_controller']['workflow_file']).endswith('line_follow_charge_test.yaml')
@@ -384,7 +391,10 @@ try:
     )
     assert service.run() == 0
     formal = {executable: values for executable, values in seen}
+    formal_controllers = [(values['arguments'][0], '--inactive' in values['arguments'])
+                          for executable, values in seen if executable == 'spawner']
     assert formal["task_controller"]["auto_start"] is True
+    assert all(values['dds_discovery_range'] == 'LOCALHOST' for _, values in seen)
     assert "industrial_pc_node.py" in formal
     assert formal["line_follow_node.py"]["stop_marker_target_ratio"] == .5
     assert formal["line_follow_node.py"]["stop_marker_mask_topic"] == (
@@ -400,11 +410,16 @@ try:
     assert service.run() == 0
     charge_test = {executable: values for executable, values in seen}
     assert charge_test['task_controller']['auto_start'] is True
+    assert all(values['dds_discovery_range'] == 'LOCALHOST' for _, values in seen)
     order = [executable for executable, _ in seen]
-    assert order.index('camera_node') < order.index('auto_admittance_start.py')
+    assert order.index('auto_admittance_start.py') < order.index('camera_node')
     assert order.index('auto_admittance_start.py') < order.index('move_group')
     assert order.index('auto_admittance_start.py') < order.index('task_controller')
+    assert charge_test['auto_admittance_start.py']['wait_for_all_controllers'] is True
     assert charge_test['line_follow_node.py']['enabled'] is False
+    assert charge_test['line_tracker_node']['max_processing_fps'] == 8.
+    assert charge_test['line_tracker_node']['opencv_threads'] == 2
+    assert charge_test['line_follow_node.py']['opencv_threads'] == 1
     assert charge_test['velocity_mux']['enabled_on_startup'] is False
     assert 'rviz2' not in charge_test
     assert str(charge_test['task_controller']['workflow_file']).endswith('line_follow_arm_charge_test.yaml')
@@ -416,15 +431,19 @@ try:
     assert charge_test['task_controller']['joint_posture_only'] is True
     assert charge_test['task_controller']['manage_line_stream'] is True
     assert 'admittance_pose_controller' not in charge_test and 'force_sensor_mount_tf' not in charge_test
-    batches = [values['arguments'] for executable, values in seen if executable == 'spawner']
-    assert len(batches) == 2, batches
-    active = next(args for args in batches if '--inactive' not in args)
-    inactive = next(args for args in batches if '--inactive' in args)
-    assert 'scaled_joint_trajectory_controller' in active
-    assert 'joint_state_broadcaster' in active and 'io_and_status_controller' in active
-    assert 'forward_position_controller' in inactive and 'freedrive_controller' in inactive
-    active_order = [args for args in batches]
-    assert '--inactive' not in active_order[0] and '--inactive' in active_order[1]
+    controllers = [values['arguments'] for executable, values in seen if executable == 'spawner']
+    assert len(controllers) == 8, controllers
+    assert [(args[0], '--inactive' in args) for args in controllers] == formal_controllers
+    assert charge_test['ros2_control_node']['robot_description'] == formal['ros2_control_node']['robot_description']
+    assert [args[0] for args in controllers] == [
+        'scaled_joint_trajectory_controller', 'joint_state_broadcaster', 'io_and_status_controller',
+        'speed_scaling_state_broadcaster', 'force_torque_sensor_broadcaster',
+        'tcp_pose_broadcaster',
+        'forward_position_controller', 'freedrive_controller']
+    assert charge_test['ros2_control_node']['arguments'] == []
+    assert all('--inactive' not in args for args in controllers[:6])
+    assert all('--inactive' in args for args in controllers[6:])
+    assert order.count('ros2_control_node') == 1
     assert 'moveit_pose_executor' not in charge_test and 'sensor_node' not in charge_test
     assert 'ros2_control_node' in charge_test and 'move_group' in charge_test
     assert 'masc_chassis_ros_driver_node' in charge_test
@@ -436,6 +455,8 @@ try:
             root / 'robot_task_control/launch/line_follow_arm_test.launch.py')),
             launch_arguments={'test_profile': 'return_charge', 'enable_status_monitor': 'false',
                               'start_tcp': 'true', 'remote_control': 'false',
+                              'line_processing_fps': '6.0', 'line_opencv_threads': '3',
+                              'line_marker_opencv_threads': '2',
                               'route_file': '/tmp/arm-chassis-test-route.json'}.items()),
     ]))
     assert service.run() == 0
@@ -446,6 +467,9 @@ try:
     assert tcp_only['line_follow_node.py']['forward_speed'] == .03
     assert tcp_only['line_follow_node.py']['route_file'] == '/tmp/arm-chassis-test-route.json'
     assert tcp_only['line_follow_node.py']['reverse_route_max_curvature'] == 5.
+    assert tcp_only['line_tracker_node']['max_processing_fps'] == 6.
+    assert tcp_only['line_tracker_node']['opencv_threads'] == 3
+    assert tcp_only['line_follow_node.py']['opencv_threads'] == 2
     assert 'sensor_node' not in tcp_only and 'admittance_pose_controller' not in tcp_only
     seen.clear()
     service = LaunchService()
@@ -540,28 +564,20 @@ try:
     assert explicit_admittance['admittance_pose_controller']['enabled_on_startup'] is False
     assert explicit_admittance['detect_controller.py']['touch_control_mode'] == 'admittance'
 
-    seen.clear()
     gate_exit_code = 1
-    service = LaunchService()
-    service.include_launch_description(
-        LaunchDescription(
-            [
-                IncludeLaunchDescription(
-                    PythonLaunchDescriptionSource(
-                        str(
-                            root
-                            / "robot_task_control/launch/line_follow_arm_test.launch.py"
-                        )
-                    )
-                ),
-            ]
-        )
-    )
-    service.run()
-    failed = {executable: values for executable, values in seen}
-    assert "ros2_control_node" in failed
-    assert "admittance_pose_controller" not in failed and "move_group" not in failed
-    assert "camera_node" not in failed and "task_controller" not in failed
+    for profile_name in ('stations', 'return_charge'):
+        seen.clear()
+        service = LaunchService()
+        service.include_launch_description(LaunchDescription([
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+                root / 'robot_task_control/launch/line_follow_arm_test.launch.py')),
+                launch_arguments={'test_profile': profile_name}.items()),
+        ]))
+        service.run()
+        failed = {executable: values for executable, values in seen}
+        assert 'ros2_control_node' in failed
+        assert 'admittance_pose_controller' not in failed and 'move_group' not in failed
+        assert 'camera_node' not in failed and 'task_controller' not in failed
     for arguments, fail_power in (({'auto_power_on': 'false'}, False),
                                   ({'use_fake_hardware': 'true'}, False), ({}, True)):
         power_exit_code = 1 if fail_power else 0
@@ -578,6 +594,37 @@ try:
         else:
             assert 'auto_power_on.py' not in names and 'ros2_control_node' in names
     power_exit_code = 0
+    for failure in ('joint_state_broadcaster', 'scaled_joint_trajectory_controller', 'freedrive_controller'):
+        failed_controller_name = failure
+        seen.clear()
+        shutdown_reasons = []
+        def record_shutdown(event, context):
+            shutdown_reasons.append(event.reason)
+            return []
+        service = LaunchService()
+        service.include_launch_description(LaunchDescription([
+            RegisterEventHandler(OnShutdown(on_shutdown=record_shutdown)),
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(str(
+                root/'eli_cs_robot_driver/launch/elite_control.launch.py')),
+                launch_arguments={'auto_power_on': 'false'}.items())]))
+        service.run()
+        requested = [values['arguments'][0] for executable, values in seen if executable == 'spawner']
+        expected = ['scaled_joint_trajectory_controller', 'joint_state_broadcaster', 'io_and_status_controller',
+                    'speed_scaling_state_broadcaster', 'force_torque_sensor_broadcaster',
+                    'tcp_pose_broadcaster',
+                    'forward_position_controller', 'freedrive_controller']
+        assert requested == expected, requested
+        assert f'Controller startup failed: {failure}' in shutdown_reasons, shutdown_reasons
+    failed_controller_name = None
+    for entry in (root/'eli_cs_robot_driver/launch/elite_control.launch.py',
+                  root/'robot_task_control/launch/line_follow_arm_test.launch.py'):
+        seen.clear()
+        service = LaunchService()
+        service.include_launch_description(LaunchDescription([
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(str(entry)),
+                launch_arguments={'ros_discovery_range': 'SUBNET'}.items())]))
+        assert service.run() == 0
+        assert seen and all(values['dds_discovery_range'] == 'SUBNET' for _, values in seen)
     print(
         "PASS: staged startup order, defaults, reuse, hardware description ownership, and gate failure cancellation"
     )

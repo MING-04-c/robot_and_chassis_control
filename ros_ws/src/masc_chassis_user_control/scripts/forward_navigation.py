@@ -25,6 +25,8 @@ class ForwardNavigationConfig:
     center_slowdown: float = .12
     heading_slowdown: float = .10
     min_visual_speed_factor: float = .4
+    curve_min_speed: float = .05
+    approach_deceleration: float = .04
 
     def validate(self):
         bounds = {'finish_distance': (.05, .3), 'finish_extra_distance': (0., .1),
@@ -32,7 +34,8 @@ class ForwardNavigationConfig:
                   'loss_timeout': (0., 10.), 'loss_distance': (0., .5),
                   'loss_speed': (.01, .05), 'assist_gain': (0., 1.),
                   'assist_max_yaw': (0., .10), 'center_slowdown': (.05, .3),
-                  'heading_slowdown': (.03, .3), 'min_visual_speed_factor': (.2, 1.)}
+                  'heading_slowdown': (.03, .3), 'min_visual_speed_factor': (.2, 1.),
+                  'curve_min_speed': (0., .10), 'approach_deceleration': (.01, .10)}
         for key, (low, high) in bounds.items():
             value = getattr(self, key)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -124,6 +127,9 @@ class ForwardRouteNavigator:
         self.visual_loss = None
         self.correction = 0.
         self.speed_factor = 1.
+        self.curve_floor_active = False
+        self.target_speed = 0.
+        self.speed_limit_reason = 'route'
 
     @property
     def finish(self):
@@ -133,23 +139,44 @@ class ForwardRouteNavigator:
     def diagnostics(self):
         return dict(phase=self.phase, visual_speed_factor=self.speed_factor,
                     visual_correction_radps=self.correction, visual_loss=self.visual_loss,
-                    finish=self.finish, fault=self.fault)
+                    finish=self.finish, fault=self.fault, curve_min_speed_mps=self.config.curve_min_speed,
+                    curve_floor_active=self.curve_floor_active, target_speed_mps=self.target_speed,
+                    speed_limit_reason=self.speed_limit_reason)
 
     def fail(self, reason):
         self.phase, self.fault = 'fault', reason
+        self.target_speed = 0.
+        self.speed_limit_reason = reason
         return 0., 0., reason
 
+    def _approach_speed(self, v, w, remaining):
+        # Start braking before the visual handoff. The margin covers a camera
+        # frame of travel; the slower planned deceleration leaves control reserve.
+        distance = max(0., remaining-self.config.finish_distance-.02)
+        limit = math.sqrt(self.config.finish_speed**2+2*self.config.approach_deceleration*distance)
+        scale = min(1., limit/v) if v > 0. else 0.
+        if scale < 1.:
+            self.speed_limit_reason = 'terminal_braking'
+            self.curve_floor_active = False
+        self.target_speed = v*scale
+        return v*scale, w*scale, 'tracking'
+
     def _finish_command(self, now, pose, visual):
+        self.speed_limit_reason = 'visual_finish'
         fault = self.finish_guard.check(now, pose)
         if fault:
             return self.fail(fault)
         if not visual.usable or not visual.stable:
             return 0., 0., visual.reason if not visual.usable else 'reacquiring'
         # The gate in the adapter still enforces averaging and actual stop.
-        return max(0., min(visual.v, self.config.finish_speed)), visual.w, 'tracking'
+        self.target_speed = max(0., min(visual.v, self.config.finish_speed))
+        return self.target_speed, visual.w, 'tracking'
 
     def command(self, now, pose, speed, visual):
         self.correction, self.speed_factor = 0., 1.
+        self.curve_floor_active = False
+        self.target_speed = 0.
+        self.speed_limit_reason = 'route'
         if self.fault:
             return 0., 0., self.fault
         if len(pose) != 3 or not all(isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -194,7 +221,27 @@ class ForwardRouteNavigator:
             self.speed_factor = max(self.config.min_visual_speed_factor, min(1.,
                 self.config.center_slowdown/max(abs(visual.lateral), 1e-9),
                 self.config.heading_slowdown/max(abs(visual.heading), 1e-9)))
-            return v*self.speed_factor, w*self.speed_factor, 'tracking'
+            target = v*self.speed_factor
+            if self.speed_factor < 1.:
+                self.speed_limit_reason = 'visual_slowdown'
+            curvature = w/v if v > 1e-9 else 0.
+            # The floor is a normal bend target, never a motion permission or
+            # an override of physical limits / severe visual disagreement.
+            if abs(curvature) >= .5 and abs(visual.lateral) <= .30 and abs(visual.heading) <= .60:
+                floor = min(v, self.config.curve_min_speed)
+                self.curve_floor_active = target < floor
+                target = max(target, floor)
+                if self.curve_floor_active:
+                    self.speed_limit_reason = 'curve_floor'
+            # Visual assistance may have increased curvature after the follower
+            # applied its own lateral acceleration constraint.
+            if abs(curvature) > 1e-9:
+                lateral_limit = math.sqrt(self.follower.tracker.config.max_lateral_accel/abs(curvature))
+                if target > lateral_limit:
+                    target = lateral_limit
+                    self.curve_floor_active = False
+                    self.speed_limit_reason = 'lateral_acceleration'
+            return self._approach_speed(target, curvature*target, remaining)
         if visual.reason not in self.LOSS_REASONS:
             return 0., 0., visual.reason
         if self.visual_loss is None:
@@ -209,4 +256,5 @@ class ForwardRouteNavigator:
         if v > self.config.loss_speed:
             w *= self.config.loss_speed/v
             v = self.config.loss_speed
-        return v, w, 'tracking'
+        self.speed_limit_reason = 'visual_loss'
+        return self._approach_speed(v, w, remaining)

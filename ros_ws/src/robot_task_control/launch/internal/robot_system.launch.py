@@ -12,6 +12,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     OpaqueFunction,
     RegisterEventHandler,
+    SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
@@ -57,7 +58,11 @@ def generate_launch_description():
             "cs_type": LaunchConfiguration("cs_type"),
             "robot_ip": LaunchConfiguration("robot_ip"),
             "local_ip": LaunchConfiguration("local_ip"),
+            "headless_mode": "true", "use_fake_hardware": "false",
+            "initial_joint_controller": "scaled_joint_trajectory_controller",
+            "activate_joint_controller": "true",
             "launch_rviz": "false",
+            "ros_discovery_range": LaunchConfiguration("ros_discovery_range"),
         }.items(),
     )
 
@@ -170,6 +175,7 @@ def generate_launch_description():
             "video_device": LaunchConfiguration("line_camera_device"),
             "camera_frame": "line_camera_optical_frame",
             "max_processing_fps": LaunchConfiguration("line_processing_fps"),
+            "opencv_threads": LaunchConfiguration("line_opencv_threads"),
         }.items(),
     )
     line_follower = Node(
@@ -188,6 +194,7 @@ def generate_launch_description():
             ),
             {
                 "enabled": False,
+                "opencv_threads": ParameterValue(LaunchConfiguration("line_marker_opencv_threads"), value_type=int),
                 "navigation_mode": LaunchConfiguration("line_navigation_mode"),
                 "standard_route_file": LaunchConfiguration("standard_route_file"),
                 "route_sample_distance": ParameterValue(LaunchConfiguration("line_route_sample_distance"), value_type=float),
@@ -339,7 +346,8 @@ def generate_launch_description():
             executable="auto_admittance_start.py",
             name="arm_connection_wait",
             output="screen",
-            parameters=[{"wait_only": True, "settle_seconds": delay}],
+            parameters=[{"wait_only": True, "wait_for_all_controllers": True,
+                         "settle_seconds": delay}],
         )
 
         def connected(event, launch_context):
@@ -365,6 +373,8 @@ def generate_launch_description():
             DeclareLaunchArgument("standard_route_file", default_value="~/.ros/line_follow/standards/route_01/standard_route.json"),
             DeclareLaunchArgument("standard_route_output", default_value=""),
             DeclareLaunchArgument("line_processing_fps", default_value="0.0"),
+            DeclareLaunchArgument("line_opencv_threads", default_value="2"),
+            DeclareLaunchArgument("line_marker_opencv_threads", default_value=LaunchConfiguration("line_opencv_threads")),
             DeclareLaunchArgument("line_route_sample_distance", default_value="0.02"),
             DeclareLaunchArgument("joint_posture_only", default_value="false"),
             DeclareLaunchArgument("launch_admittance", default_value=NotSubstitution(
@@ -462,6 +472,9 @@ def generate_launch_description():
                     ]
                 ),
             ),
+            DeclareLaunchArgument('ros_discovery_range', default_value='LOCALHOST',
+                                 choices=['LOCALHOST', 'SUBNET', 'SYSTEM_DEFAULT', 'OFF']),
+            SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', LaunchConfiguration('ros_discovery_range')),
             velocity_mux,
             chassis,
             hk_camera,

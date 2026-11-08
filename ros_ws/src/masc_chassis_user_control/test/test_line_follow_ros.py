@@ -1276,6 +1276,24 @@ def standard_route_ros(check_finish=False, check_loss=None):
             pump(1.5)
             assert commands[-1].linear.x>0. and abs(commands[-1].angular.z)<.005
             assert node.standard_follower.diagnostics['progress_m']>0.
+            if check_loss == 'ramp':
+                assert node.set_parameters([Parameter('forward_speed', value=.1)])[0].successful
+                pump(2.)
+                assert abs(commands[-1].linear.x-.1) < .003
+                commands.clear()
+                pump(.9, error=.25)
+                assert commands and all(c.linear.x >= .049 for c in commands)
+                assert commands[-1].linear.x <= .055, commands[-1].linear.x
+                for first, second in zip(commands, commands[1:]):
+                    assert abs(second.linear.x-first.linear.x) <= node.config.cruise_linear_deceleration*.04+1e-6
+                assert node.standard_navigator.curve_floor_active
+                commands.clear()
+                pump(.5)
+                assert .05 < commands[-1].linear.x < .09
+                for first, second in zip(commands, commands[1:]):
+                    assert abs(second.linear.x-first.linear.x) <= node.config.cruise_linear_acceleration*.04+1e-6
+                print('PASS: real replay publish path ramps bend slowdown/recovery and keeps 0.05 m/s target')
+                return
             if check_loss:
                 if check_loss == 'curve':
                     import math

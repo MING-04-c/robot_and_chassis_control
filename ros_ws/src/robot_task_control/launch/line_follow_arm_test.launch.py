@@ -1,7 +1,7 @@
 """循迹各站点联动：行驶关节姿态、中转、机械臂点位、等待下一次开始。"""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import IfCondition
 from launch.substitutions import EqualsSubstitution, IfElseSubstitution, LaunchConfiguration, NotSubstitution, OrSubstitution, PathJoinSubstitution
@@ -13,6 +13,10 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     share = FindPackageShare("robot_task_control")
     return LaunchDescription([
+        DeclareLaunchArgument('ros_discovery_range', default_value='LOCALHOST',
+                             choices=['LOCALHOST', 'SUBNET', 'SYSTEM_DEFAULT', 'OFF'],
+                             description='ROS发现范围；默认仅本机，TCP工控机与机械臂网口连接保留'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', LaunchConfiguration('ros_discovery_range')),
         DeclareLaunchArgument('test_profile', default_value='stations', choices=['stations', 'return_charge'],
                              description='stations逐站四点；return_charge首条有效横线到站后中转等待5秒并返程充电'),
         DeclareLaunchArgument('charging_status_layout', default_value='byte_flags', choices=['bitfield32', 'byte_flags']),
@@ -33,8 +37,14 @@ def generate_launch_description():
         DeclareLaunchArgument("launch_admittance", default_value="false"),
         DeclareLaunchArgument("launch_rviz", default_value="false",
                              description="树莓派默认关闭RViz；循迹画面由line_show_window单独控制"),
-        DeclareLaunchArgument("prepare_line_camera_early", default_value=EqualsSubstitution(
-            LaunchConfiguration('test_profile'), 'return_charge')),
+        DeclareLaunchArgument("prepare_line_camera_early", default_value="false",
+                             description="默认先等待机械臂控制器就绪，再启动循迹图像处理，降低启动争抢"),
+        DeclareLaunchArgument('line_processing_fps', default_value='8.0',
+                             description='联测默认限制视觉处理频率；相机采集仍为15帧'),
+        DeclareLaunchArgument('line_opencv_threads', default_value='2',
+                             description='主线图像处理的OpenCV线程数，不改变控制执行器线程数'),
+        DeclareLaunchArgument('line_marker_opencv_threads', default_value='1',
+                             description='横线检测的OpenCV线程数，与主线图像处理独立'),
         DeclareLaunchArgument('launch_force_sensor', default_value=IfElseSubstitution(
             EqualsSubstitution(LaunchConfiguration('test_profile'), 'return_charge'), 'false', 'true')),
         DeclareLaunchArgument("workflow_file", default_value=PathJoinSubstitution(
@@ -62,6 +72,7 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(PathJoinSubstitution(
                 [share, "launch", "internal", "robot_system.launch.py"])),
             launch_arguments={
+                "ros_discovery_range": LaunchConfiguration('ros_discovery_range'),
                 "workflow_file": LaunchConfiguration("workflow_file"),
                 "launch_admittance": LaunchConfiguration("launch_admittance"),
                 "auto_start": LaunchConfiguration("auto_start"),
@@ -80,6 +91,9 @@ def generate_launch_description():
                 "start_hk_camera": "false", "start_image_transfer": "false",
                 "start_line_camera": "true",
                 "prepare_line_camera_early": LaunchConfiguration("prepare_line_camera_early"),
+                "line_processing_fps": LaunchConfiguration('line_processing_fps'),
+                "line_opencv_threads": LaunchConfiguration('line_opencv_threads'),
+                "line_marker_opencv_threads": LaunchConfiguration('line_marker_opencv_threads'),
                 "launch_rviz": LaunchConfiguration("launch_rviz"),
                 'launch_force_sensor': LaunchConfiguration('launch_force_sensor'),
             }.items(),

@@ -9,6 +9,7 @@ from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
 from forward_navigation import ForwardNavigationConfig, ForwardRouteNavigator, VisualCommand
 from recorded_route import RouteConfig, StandardRouteFollower
+from line_follow_control import ControlConfig, cruise_velocity
 
 
 class ForwardNavigationTests(unittest.TestCase):
@@ -37,6 +38,54 @@ class ForwardNavigationTests(unittest.TestCase):
         self.assertLess(v, cruise/2., 'logged half-width error must not cruise at .075')
         self.assertLessEqual(abs(navigator.correction), .06)
         self.assertGreater(w, 0.)
+
+    def test_bend_floor_does_not_override_low_cruise_or_large_visual_error(self):
+        points = [[.25*math.sin(i*.01/.25), .25*(1-math.cos(i*.01/.25)), i*.01/.25] for i in range(101)]
+        def command(speed, lateral=.25, route_config=RouteConfig()):
+            follower = StandardRouteFollower(dict(points=points), (0., 0., 0.), route_config)
+            navigator = ForwardRouteNavigator(follower)
+            result = navigator.command(0., (0., 0., 0.), speed,
+                self.visual(lateral=lateral, heading=.4))
+            return result, navigator
+        (v, w, state), navigator = command(.1)
+        self.assertEqual(state, 'tracking')
+        self.assertAlmostEqual(v, .05)
+        self.assertTrue(navigator.curve_floor_active)
+        self.assertGreater(abs(w), .01)
+        self.assertLessEqual(command(.03)[0][0], .03)
+        self.assertLess(command(.1, lateral=.548)[0][0], .05)
+        (v, w, _), _ = command(.1, route_config=replace(RouteConfig(), max_curvature=5., max_lateral_accel=.005))
+        self.assertLess(v, .05)
+        self.assertLessEqual(abs(v*w), .005+1e-9, 'floor must yield to lateral acceleration limit')
+
+    def test_terminal_braking_starts_before_handoff_and_ignores_curve_floor(self):
+        navigator = self.navigator()
+        self.approach(navigator)
+        v, _, state = navigator.command(.7, (.63, 0., 0.), .1, self.visual())
+        self.assertEqual(state, 'tracking')
+        self.assertEqual(navigator.phase, 'route')
+        self.assertAlmostEqual(v, .02)
+
+    def test_cruise_changes_ramp_in_both_directions_and_stop_remains_immediate(self):
+        config = ControlConfig()
+        dt = .02
+        for sign in (1., -1.):
+            v, w = sign*.1, sign*.2
+            for target in (.05, .1, .04):
+                for _ in range(160):
+                    old_v, old_w = v, w
+                    v, w = cruise_velocity(v, w, sign*target, sign*target*2., config, dt)
+                    rate = (config.cruise_linear_acceleration if target > abs(old_v)
+                            else config.cruise_linear_deceleration)
+                    self.assertLessEqual(abs(v-old_v), rate*dt+1e-9)
+                    self.assertLessEqual(abs(w-old_w), config.angular_acceleration*dt+1e-9)
+                    self.assertAlmostEqual(w/v, 2.)
+                    self.assertGreater(abs(v), 0.)
+                self.assertAlmostEqual(v, sign*target)
+            self.assertEqual(cruise_velocity(v, w, 0., 0., config, dt), (0., 0.))
+            v, w = cruise_velocity(sign*.1, sign*.2, sign*.05, sign*.1, config, dt, hard_speed_limit=.05)
+            self.assertLessEqual(abs(v), .05)
+            self.assertAlmostEqual(w/v, 2.)
 
     def test_terminal_handoff_never_rechecks_a_carrot_behind_robot(self):
         navigator = self.navigator()

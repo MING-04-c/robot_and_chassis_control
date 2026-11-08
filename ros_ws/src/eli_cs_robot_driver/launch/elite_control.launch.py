@@ -3,11 +3,38 @@ from launch_ros.parameter_descriptions import ParameterFile, ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction, RegisterEventHandler, EmitEvent, LogInfo, GroupAction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, RegisterEventHandler, EmitEvent, LogInfo, GroupAction, SetEnvironmentVariable
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
+
+
+def spawn_controllers(specifications, manager_timeout, parameter_file):
+    """Restore the independent spawners used by the working 66f897c launch.
+
+    Start all spawners together; controller_manager's spawner owns its lock.
+    Keep startup failure shutdown rather than continuing a partial startup.
+    """
+    spawners = [Node(
+        package="controller_manager", executable="spawner", output="screen",
+        arguments=[name, "--controller-manager", "/controller_manager",
+                   "--controller-manager-timeout", manager_timeout,
+                   "--param-file", parameter_file] + ([] if active else ["--inactive"]),
+    ) for name, active in specifications]
+    handlers = []
+    for (name, _), spawner in zip(specifications, spawners):
+        def finished(event, context, controller_name=name):
+            if context.is_shutdown:
+                return []
+            if event.returncode != 0:
+                return [LogInfo(msg=f"机械臂控制器 {controller_name} 加载/配置失败，终止启动；"
+                                    "检查此前的controller_manager/spawner日志。"),
+                        EmitEvent(event=Shutdown(reason=f"Controller startup failed: {controller_name}"))]
+            return []
+
+        handlers.append(RegisterEventHandler(OnProcessExit(target_action=spawner, on_exit=finished)))
+    return handlers + spawners
 
 
 def launch_setup(context, *args, **kwargs):
@@ -27,6 +54,10 @@ def launch_setup(context, *args, **kwargs):
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
     fake_sensor_commands = LaunchConfiguration("fake_sensor_commands")
     controller_spawner_timeout = LaunchConfiguration("controller_spawner_timeout")
+    log_level = LaunchConfiguration("controller_manager_log_level").perform(context)
+    # Match the original default command line; add diagnostic arguments only on request.
+    manager_log_arguments = ([] if log_level == "info" else
+                             ["--ros-args", "--log-level", f"controller_manager:={log_level}"])
     initial_joint_controller = LaunchConfiguration("initial_joint_controller")
     activate_joint_controller = LaunchConfiguration("activate_joint_controller")
     launch_rviz = LaunchConfiguration("launch_rviz")
@@ -199,6 +230,7 @@ def launch_setup(context, *args, **kwargs):
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
+        arguments=manager_log_arguments,
         parameters=[
             robot_description,
             update_rate_config_file,
@@ -214,6 +246,7 @@ def launch_setup(context, *args, **kwargs):
         # setup) with our hardware plugin, rather than the old Humble loop.
         package="controller_manager",
         executable="ros2_control_node",
+        arguments=manager_log_arguments,
         parameters=[
             robot_description,
             update_rate_config_file,
@@ -268,7 +301,7 @@ def launch_setup(context, *args, **kwargs):
         arguments=["-d", rviz_config_file],
     )
 
-    # 同一spawner批量加载，避免8个Python进程竞争ROS的全局文件锁。
+    # 恢复66f897c：初始关节控制器及其余独立spawner在同一批launch动作中启动。
     active_names = [
         "joint_state_broadcaster", "io_and_status_controller",
         "speed_scaling_state_broadcaster", "force_torque_sensor_broadcaster",
@@ -280,39 +313,13 @@ def launch_setup(context, *args, **kwargs):
     # 初始控制器可能由调用者覆盖为forward_position_controller，不能重复加载或错误激活。
     active_names = [name for name in active_names if name != initial_name]
     inactive_names = [name for name in inactive_names if name != initial_name]
-    (active_names if activate_initial else inactive_names).append(initial_name)
-
-    def controller_batch(names, active):
-        return Node(
-            package="controller_manager", executable="spawner", output="screen",
-            arguments=names + ["--controller-manager", "/controller_manager",
-                "--controller-manager-timeout", controller_spawner_timeout.perform(context),
-                "--param-file", controller_parameters_path] + ([] if active else ["--inactive"]),
-        )
-
-    active_spawner = controller_batch(active_names, True)
-    inactive_spawner = controller_batch(inactive_names, False)
-
-    def active_controllers_loaded(event, launch_context):
-        if launch_context.is_shutdown:
-            return []
-        if event.returncode != 0:
-            return [EmitEvent(event=Shutdown(reason="Active controller batch failed"))]
-        return [inactive_spawner]
-
-    def inactive_controllers_loaded(event, launch_context):
-        if launch_context.is_shutdown or event.returncode == 0:
-            return []
-        return [EmitEvent(event=Shutdown(reason="Inactive controller batch failed"))]
-
+    controller_startup = spawn_controllers(
+        [(initial_name, activate_initial)] + [(name, True) for name in active_names]
+        + [(name, False) for name in inactive_names],
+        controller_spawner_timeout.perform(context), controller_parameters_path)
     nodes_to_start = [
         control_node, eli_control_node, controller_stopper_node,
-        robot_state_publisher_node, rviz_node,
-        RegisterEventHandler(OnProcessExit(target_action=active_spawner,
-                                          on_exit=active_controllers_loaded)),
-        RegisterEventHandler(OnProcessExit(target_action=inactive_spawner,
-                                          on_exit=inactive_controllers_loaded)),
-        active_spawner,
+        robot_state_publisher_node, rviz_node, *controller_startup,
     ]
 
     if use_fake_hardware.perform(context).lower() != 'true':
@@ -354,6 +361,9 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     declared_arguments = []
     declared_arguments.extend([
+        DeclareLaunchArgument('ros_discovery_range', default_value='LOCALHOST',
+                             choices=['LOCALHOST', 'SUBNET', 'SYSTEM_DEFAULT', 'OFF'],
+                             description='ROS发现范围；默认仅本机，厂商TCP/RTSI网口通信不受影响'),
         DeclareLaunchArgument('recovery_force_limit_n', default_value='5.0',
                              description='Maximum unbiased force norm allowed before confirmed recovery, in N'),
         DeclareLaunchArgument('auto_power_on', default_value='true', choices=['true', 'false'],
@@ -474,6 +484,13 @@ def generate_launch_description():
     )
     declared_arguments.append(
         DeclareLaunchArgument(
+            "controller_manager_log_level", default_value="info",
+            choices=["debug", "info", "warn", "error", "fatal"],
+            description="controller_manager日志级别；启动失败时可设debug定位原因",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
             "controller_spawner_timeout",
             default_value="10",
             description="Timeout used when spawning controllers.",
@@ -573,4 +590,6 @@ def generate_launch_description():
             description="Port that will be opened for trajectory control.",
         )
     )
-    return LaunchDescription(declared_arguments + [OpaqueFunction(function=launch_setup)])
+    return LaunchDescription(declared_arguments + [
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', LaunchConfiguration('ros_discovery_range')),
+        OpaqueFunction(function=launch_setup)])

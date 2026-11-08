@@ -6,7 +6,11 @@ line_follow_controller:
     start_alignment_enabled: true     # 起步横线多帧对齐后才建立路线原点
     start_alignment_timeout_sec: 45.0
     start_alignment_settle_sec: 0.6   # 停稳后等待，再收集停车后拍摄的新帧
-    start_alignment_step_distance: 0.015 # 每次里程计修正最多1.5cm；未标定首次试探5mm
+    start_alignment_recheck_settle_sec: 0.25 # 后续修正停稳后复核等待
+    start_alignment_observation_frames: 3 # 决定修正用3帧；最终确认仍用5帧
+    start_alignment_coarse_step_distance: 0.05 # 可靠估距且偏差大时最多5cm
+    start_alignment_coarse_max_angle: 0.10 # 大角度先粗调，接近后细调
+    start_alignment_step_distance: 0.015 # 精调上限1.5cm；未知尺度首次试探5mm
     start_alignment_speed: 0.03       # 起步对齐受限低速
     start_alignment_lateral_speed: 0.03 # 起步横移独立上限，m/s
     start_alignment_min_lateral_speed: 0.02 # 横移最低目标速度；需实车确认能够稳定运动
@@ -34,6 +38,7 @@ line_follow_controller:
     standard_visual_loss_timeout: 5.0 # replay中段短暂丢线最多续行5秒；相机/里程计过期仍立即停
     standard_visual_loss_distance: 0.30 # m，丢线续行累计实际路程上限；末段15cm必须视觉有效
     standard_visual_assist_gain: 0.5 # replay视觉辅助，同时检查横向与朝向
+    standard_curve_min_speed: 0.05 # m/s，replay可信弯道最低巡航目标；不覆盖低巡航设定/严重偏线/终点/物理限制
     standard_visual_assist_max_yaw: 0.06 # rad/s；最终仍服从总曲率/角速度上限
     forward_route_max_curvature: 5.0 # 1/m，前进重放独立于末段对齐；大曲率时同步减速
     route_visual_finish: true # 最后直线使用相机对线找横线，找到才正常完成
@@ -66,7 +71,7 @@ line_follow_controller:
     station_log_file: ~/.ros/line_follow/last_station_log.json # 本轮横线身份、动作及计数，后台保存
     odom_topic: /wheel_odom
     route_sample_distance: 0.02 # m，路线采样间隔；终点额外保存
-    route_max_speed: 0.08 # m/s，记录路线倒车独立上限，旧camera模式仍为0.04
+    route_max_speed: 0.10 # m/s，路线跟踪上限；倒车仍受reverse_max_speed=0.05约束
     route_approach_distance: 0.10 # m，关闭视觉末段时最后10cm减速，与转向前瞻独立
     route_lookahead: 0.20 # m，标准路线前进重放的前瞻弧长
     reverse_route_lookahead: 0.26 # m，仅记录路线倒车的前瞻，适当放长减轻急纠偏；过长会切弯
@@ -111,6 +116,8 @@ line_follow_controller:
     estimated_speed_factor: 0.3       # 估计目标/疑似遮挡时再减速
     fallback_speed_factor: 0.5        # 前瞻目标回退时再减速
     linear_acceleration: 0.08         # m/s²；有效跟线时缓加减速，丢线仍立即零速
+    cruise_linear_acceleration: 0.04 # m/s²，路线巡航恢复速度使用斜坡
+    cruise_linear_deceleration: 0.06 # m/s²，正常巡航减速；到站/失效停车仍优先
     angular_acceleration: 0.35         # 直线转向变化上限，rad/s²
     min_valid_row_fraction: 0.06      # 有效扫描行比例；新帧中仍有短近端实测段时低速多推进一点
     allow_curved_candidates: true    # 横向分类的弯线需通过实际前方几何检查

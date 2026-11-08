@@ -8,14 +8,24 @@
 机械臂实际到位、设备就绪、保护停止和底盘运动保护继续生效。
 基础任务状态仍可经TCP查询；关闭汇总不代表设备健康。
 
+联合入口、公共任务栈和单独机械臂驱动入口默认`ros_discovery_range:=LOCALHOST`。
+该参数在节点启动前统一设置`ROS_AUTOMATIC_DISCOVERY_RANGE`，隔离局域网同名ROS服务，
+不限制机械臂厂商TCP/RTSI连接、工控机TCP 9010或其他设备的直接网口通信。
+需要跨机器ROS通信时显式设置`ros_discovery_range:=SUBNET`，并统一使用专用`ROS_DOMAIN_ID`。
+launch只设置子进程环境，不修改终端或`.bashrc`；另开终端查看状态时先执行：
+
+```bash
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+```
+
 ## 动作顺序与通过条件
 
 | 阶段 | 实际动作 | 通过条件 |
 |---|---|---|
-| 1 | 加载机械臂驱动、MoveIt、底盘、USB循迹和TCP | 设备就绪，底盘连续停稳1秒 |
+| 1 | 加载机械臂驱动、底盘和TCP，先等待机械臂控制器 | 6个活动控制器及2个备用控制器状态正确，外控连接连续稳定5秒；随后加载MoveIt与USB循迹，设备检查通过 |
 | 2 | 机械臂运动到行车位 | 本次关节任务实际到位，才放行底盘 |
-| 3 | 摄像头停车观察、小步对齐出发横线 | `start_alignment_complete`，随后才建立记录首点 |
-| 4 | 小车前进循迹并记录实际里程计路线 | 忽略出发横线，在第一条有效停止横线到位停车 |
+| 3 | 摄像头停车观察、估距后分轴对齐出发横线 | `start_alignment_complete`，随后才建立记录首点 |
+| 4 | 小车沿已有标准路线前进，视觉辅助并记录实际里程计路线 | 忽略出发横线，在第一条有效停止横线到位停车 |
 | 5 | 确认底盘停稳并封存路线 | 保存完成；机械臂动作期间不重置里程计、不覆盖已封存路线 |
 | 6 | 机械臂运动到过渡位 | 本次关节任务实际到位 |
 | 7 | 等待5秒 | 从过渡位实际到位后开始计时，保持底盘停车 |
@@ -51,14 +61,49 @@ sudo bash scripts/setup_can.sh auto
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select masc_chassis_user_control eli_cs_robot_serial robot_task_control --symlink-install
+colcon build --packages-select masc_chassis_user_control eli_cs_robot_driver eli_cs_robot_serial robot_task_control --symlink-install
 source install/setup.bash
 ```
+
+构建后，**每个用于启动或诊断的旧终端都要重新执行 `source install/setup.bash`**。
+尤其从普通安装切换到 `--symlink-install` 后，旧终端缺少 build 目录的 Python 路径，
+即使 ROS 能找到可执行文件，也可能报 `PackageNotFoundError: robot-task-control`。
+可先验证入口导入，下面命令不会启动节点或发送运动指令：
+
+```bash
+python3 - <<'PY'
+from importlib.metadata import distribution
+package = distribution('robot-task-control')
+for name in ('velocity_mux', 'arm_joint_postures', 'task_controller'):
+    entry = next(e for e in package.entry_points
+                 if e.group == 'console_scripts' and e.name == name)
+    assert callable(entry.load())
+    print('OK:', name)
+PY
+```
+
+如果 TCP 报 `Address already in use`，先用 `ss -ltnp 'sport = :9010'` 确认占用进程，
+在原启动终端正常结束旧任务；不要直接再次启动一套驱动，也不要通过更换端口掩盖冲突。
+端口占用能证明 TCP 监听冲突，不能单独证明机械臂控制器重复。
+
+如果 `joint_state_broadcaster` 仍然报 `Failed loading controller`，工作流尚未开始。
+这是加载服务返回失败，与前面的 `list_controllers` 等待超时是两件事，
+不能只靠延长超时认定修复。确认旧驱动已退出后，可在原启动命令增加
+`controller_manager_log_level:=debug`，保存完整日志进一步定位。
 
 ## 本轮推荐启动命令
 
 **启动后设备就绪即自动动作。** TCP开启不要求工控机在线；没有连接也会自动执行。
-循迹设定速度0.03m/s；起步对齐、离桩、弯道和末段可能更慢。
+下面命令使用已有标准轨迹，前进上限0.10m/s、倒车上限0.05m/s；起步对齐、离桩、弯道和末段可能更慢。
+标准文件只读，倒车使用本次实际前进记录。
+
+联测入口默认`line_processing_fps:=8.0 line_opencv_threads:=2 line_marker_opencv_threads:=1`，
+分别限制视觉处理频率、主线图像线程数和横线检测线程数；相机仍采集15帧，控制和里程计频率不变。
+两个循迹入口共用公共任务栈，均接受这些参数；单独循迹未指定横线线程时沿用主线线程数。
+线程数是OpenCV算法的并行上限，不是专用CPU核或进程总线程数。
+视觉C++包未指定构建类型时默认`RelWithDebInfo`（`-O2`）；显式指定Debug等类型时尊重调用者。
+状态、中线和掩膜的接收队列只保留最新一条；后台仍使用一个执行任务加一个可替换的待处理槽。
+排查不动时先关闭`line_show_window`减少预览开销，视觉新鲜度和横线几何检查保持生效。
 
 ```bash
 cd ~/project/robot_and_chassis_control/ros_ws
@@ -69,7 +114,11 @@ ros2 launch robot_task_control line_follow_arm_test.launch.py \
   test_profile:=return_charge \
   start_tcp:=true enable_status_monitor:=false remote_control:=false \
   launch_admittance:=false launch_force_sensor:=false launch_rviz:=false \
-  line_show_window:=true line_follow_speed:=0.03 \
+  line_navigation_mode:=replay \
+  standard_route_file:="$PWD/routes/standards/shuttle_test_01/standard_route.json" \
+  prepare_line_camera_early:=false line_processing_fps:=8.0 \
+  line_opencv_threads:=2 line_marker_opencv_threads:=1 \
+  line_show_window:=false line_follow_speed:=0.1 line_reverse_speed:=0.05 \
   line_stop_marker_target_ratio:=0.5 \
   reverse_route_max_curvature:=5.0 \
   charging_status_layout:=byte_flags \
@@ -88,6 +137,12 @@ ros2 launch robot_task_control line_follow_arm_test.launch.py \
 
 - 机械臂未确认到行车位前，小车应始终停车。
 - 起步出现 `waiting_for_stop`、`settling` 或单步完成时，尚未完成整体对齐；以 `start_alignment_complete` 为准。
+- 若一直`waiting_for_line`/`waiting_for_marker`，检查“起步对齐诊断”的
+  `upstream_age_ms`（源图到提交横线任务，含上游处理/传输）、`tracker_processing_ms`（主线计算）、
+  `worker_wait_ms`（后台槽等待）、`detector_processing_ms`（横线任务，含图像转换）与
+  `result_collect_ms`（计算完成到控制线程取走）。过期结果也会打印分段耗时，但不会刷新有效观测。
+  这些是含调度影响的墙钟耗时，不能直接当CPU占用率；`bar_angle`等计数是被拒绝的候选数，
+  不能仅凭它断言真实横线角度有问题。降低负载后若候选仍不稳定，须查看对应原图与掩膜。
 - 去程重点看直线是否持续偏到一侧、出弯是否反复左右摆动。记录的是实际行驶轨迹，不是胶带中心线；明显偏线不能算录制合格。
 - 到站先确认小车停稳，再观察机械臂到过渡位。完整5秒应从实际到位后计算，不能从发出运动请求时算起。
 - 等待结束后先看机械臂回行车位，再看小车倒车。相机在机械臂动作/等待期间按需暂停，恢复返程前须等有效图像；不会重置路线。
@@ -129,6 +184,38 @@ python3 start_task.py --host 169.254.199.100 --action start
 ```
 
 该参数只改变首次开始方式；到站后的过渡、等待、回行车位及返程仍自动执行。
+
+## 控制器加载失败导致整套退出
+
+2026-11-08排查中，在本机驱动关闭后，局域网发现仍返回3个
+`/controller_manager/load_controller`服务端，且出现`gz_ros2_control`及
+`jaka_zu3_controller`的其他机器人服务；限制本机发现后同名服务端数为0。
+恢复独立spawner后，仅切换UDP仍失败，而限制本机发现的实车日志显示
+8个spawner均正常退出、6个活动控制器全部激活，随后由用户Ctrl+C结束。
+这些结果支持局域网同名服务干扰的判断；尚未定位其他服务端的具体机器。
+因此默认采用上述本机发现配置，保留显式跨机器ROS配置入口。
+
+若先出现`Failed loading controller joint_state_broadcaster`，随后所有节点收到SIGINT，
+表示机械臂驱动的控制器启动失败，启动保护主动终止整体任务；不是循迹到站或路线录制完成。
+该返回值不能单凭调度延迟就归因CPU不足，也不能按“缺包”处理，须检查此前管理器的具体报错。
+
+联合入口的`stations`与`return_charge`共用`internal/robot_system.launch.py`及
+`eli_cs_robot_driver/elite_control.launch.py`，不分别维护机械臂驱动。
+本轮按提交`66f897c`及2026-11-06整体联动的成功日志，恢复8个独立spawner同时启动；
+不再使用批量spawner或通过退出事件逐个串行启动。实际加载先后由官方spawner的锁决定。
+launch先声明scaled轨迹控制器，再声明joint_state、IO、speed_scaling、force_torque、TCP，
+以及保持inactive的备用forward_position和freedrive。任一spawner失败仍终止整套启动。
+默认info级别时恢复原来的controller_manager命令行，不附加日志参数；显式debug时才附加。
+这不改变已有任务的机械臂硬件插件、控制周期或到位检查。
+联合入口默认不提前启动循迹相机，机械臂就绪门控与检测任务一样检查完整控制器状态；
+无反馈或查询取消均保持未就绪，不触发运动。发生加载失败仍终止，不自动重试控制器命令。
+
+用户原有总任务命令`ros2 launch robot_task_control line_follow_arm_test.launch.py launch_rviz:=true`
+继续使用相同共用启动链；往返测试仅选择`test_profile:=return_charge`并保留相应轻量组件配置。
+
+需要定位时，在上面的launch命令、管道之前加`controller_manager_log_level:=debug`。
+日志会记录控制器内部加载过程。正常运行可恢复`info`，减少日志负载。
+这项调整与静态启动检查不能证明此次实车失败的底层原因已修复，仍需复测。
 
 ## 中止与复测记录
 

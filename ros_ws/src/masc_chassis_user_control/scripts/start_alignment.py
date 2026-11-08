@@ -9,7 +9,8 @@ class StartLineAligner:
     Pixel error is intentionally kept dimensionless unless a measured GroundMapping
     is supplied.  This follows the image-based visual-servo pattern used in ROS
     robotics: track a stable feature over fresh frames, use bounded corrections,
-    and only declare alignment after consecutive in-tolerance observations.
+    and only declare alignment after fresh in-tolerance observations within
+    a bounded stationary window.
     """
 
     POSITION_STEP_TOLERANCE_M = .001
@@ -18,7 +19,7 @@ class StartLineAligner:
 
     def __init__(self, config, mapping=None, max_distance_m=0.30,
                  metric_tolerance_m=0.02, lateral_tolerance_m=0.02,
-                 confirmation_frames=5, filter_frames=5):
+                 confirmation_frames=5, filter_frames=5, decision_frames=None):
         if not 0.05 <= max_distance_m <= 1.0:
             raise ValueError('start alignment max distance must be 0.05..1.0m')
         if not 0.005 <= metric_tolerance_m <= 0.1:
@@ -27,6 +28,10 @@ class StartLineAligner:
             raise ValueError('start alignment lateral tolerance must be 0.005..0.1m')
         if not 3 <= confirmation_frames <= 15 or not 3 <= filter_frames <= 9:
             raise ValueError('start alignment frame counts out of range')
+        decision_frames = filter_frames if decision_frames is None else decision_frames
+        if not 3 <= decision_frames <= filter_frames:
+            raise ValueError('decision frames must be 3..filter_frames')
+        self.decision_frames = int(decision_frames)
         self.config = config
         self.mapping = mapping
         self.max_distance_m = float(max_distance_m)
@@ -44,10 +49,13 @@ class StartLineAligner:
         self.reverse_travelled_m = 0.0
         self.last_command_v = 0.0
         self.phase = 'settling'
+        self.recheck_settle = False
         self.stopped_since = None
         self.accept_after = None
         self.step_pose = None
         self.step_started_at = None
+        self.step_timeout_sec = 4.
+        self.step_limit_m = self.config.start_alignment_step_distance
         self.step_distance = 0.0
         self.step_lateral_m = 0.0
         self.step_angle = 0.0
@@ -67,6 +75,7 @@ class StartLineAligner:
         self.distance_estimate_source = None
         self.response_reference = None
         self.inputs_ready = True
+        self.marker_pending = False
         self.resume_observation_after = float('-inf')
         self.last_observation_valid = False
         self.last_tick_at = None
@@ -101,7 +110,8 @@ class StartLineAligner:
             return False
         self.last_stamp = stamp
         source_time = now if source_time is None else source_time
-        if (self.phase != 'observing' or not self.inputs_ready or self.accept_after is None
+        if (self.phase != 'observing' or not (self.inputs_ready or self.marker_pending)
+                or self.accept_after is None
                 or source_time < max(self.accept_after, self.resume_observation_after)
                 or source_time > now + .1 or now-source_time > .5):
             return False
@@ -113,7 +123,8 @@ class StartLineAligner:
         target_y = self.config.stop_marker_target_ratio * (height - 1)
         valid = [m for m in candidates if self._valid_marker(m, width, height)]
         if not valid:
-            self.stable_frames = 0
+            # Missing detections add no evidence; retain only the bounded,
+            # stationary window. Completion still requires a new valid frame.
             self.visual_ready = False
             return False
         if self.marker is None or self.last_seen_at is None or source_time-self.last_seen_at > .75:
@@ -179,11 +190,7 @@ class StartLineAligner:
         self.samples = self.samples[-self.filter_frames:]
         self.sample_times.append(source_time)
         self.sample_times = self.sample_times[-self.filter_frames:]
-        self.position_error = median(row[0] for row in self.samples)
-        metric_values = [row[1] for row in self.samples if row[1] is not None]
-        self.position_error_m = median(metric_values) if len(metric_values) == len(self.samples) else None
-        self.lateral_error = median(row[2] for row in self.samples)
-        self.heading_error = median(row[3] for row in self.samples)
+        self._filter_observations(self.decision_frames)
         self.marker = dict(marker)
         self.width, self.height = width, height
         self.last_seen_at = source_time
@@ -196,8 +203,6 @@ class StartLineAligner:
                              self.config.start_alignment_lateral_tolerance_ratio)
         lateral_ok = abs(self.lateral_error) <= lateral_tolerance
         heading_ok = abs(self.heading_error) <= self.config.start_alignment_heading_tolerance_rad
-        # Require raw frames as well as the filtered median to be in tolerance;
-        # a median must not conceal alternating overshoot or an unsettled view.
         raw_longitudinal_ok = (abs(error_m) <= self.metric_tolerance_m if error_m is not None
                                else abs(error_ratio) <= self.config.start_alignment_tolerance_ratio)
         raw_ok = (raw_longitudinal_ok and abs(lateral) <= lateral_tolerance
@@ -213,6 +218,14 @@ class StartLineAligner:
         else:
             self.state = 'start_alignment_visual_tracking'
         return True
+
+    def _filter_observations(self, frames):
+        samples = self.samples[-frames:]
+        self.position_error = median(row[0] for row in samples)
+        metric_values = [row[1] for row in samples if row[1] is not None]
+        self.position_error_m = median(metric_values) if len(metric_values) == len(samples) else None
+        self.lateral_error = median(row[2] for row in samples)
+        self.heading_error = median(row[3] for row in samples)
 
     def _clear_observations(self):
         self.samples.clear()
@@ -230,8 +243,9 @@ class StartLineAligner:
             self.stable_frames = min(self.stable_frames, len(self.samples))
             self.visual_ready = False
 
-    def window_stable(self):
-        if len(self.samples) < self.filter_frames:
+    def window_stable(self, frames=None):
+        frames = self.filter_frames if frames is None else frames
+        if len(self.samples) < frames:
             return False
         limits = (self.config.start_alignment_tolerance_ratio,
                   self.metric_tolerance_m,
@@ -239,12 +253,30 @@ class StartLineAligner:
                   self.config.start_alignment_lateral_tolerance_ratio,
                   self.config.start_alignment_heading_tolerance_rad)
         for index, limit in enumerate(limits):
-            values = [row[index] for row in self.samples if row[index] is not None]
+            values = [row[index] for row in self.samples[-frames:] if row[index] is not None]
             if values and max(values)-min(values) > limit:
                 return False
         return True
 
-    def _settle(self):
+    def observation_stability(self):
+        """Explain the decision window without changing its acceptance rules."""
+        limits = (self.config.start_alignment_tolerance_ratio, self.metric_tolerance_m,
+                  self.lateral_tolerance_m if self.mapping is not None else
+                  self.config.start_alignment_lateral_tolerance_ratio,
+                  self.config.start_alignment_heading_tolerance_rad)
+        axes = {}
+        for index, (name, limit) in enumerate(zip(
+                ('longitudinal_ratio', 'longitudinal_m', 'lateral', 'heading_rad'), limits)):
+            values = [row[index] for row in self.samples[-self.decision_frames:]
+                      if row[index] is not None]
+            spread = max(values)-min(values) if values else None
+            axes[name] = dict(spread=spread, limit=limit,
+                              within_limit=spread is None or spread <= limit)
+        return dict(sample_count=len(self.samples), required_samples=self.decision_frames,
+                    stable=self.window_stable(self.decision_frames), axes=axes)
+
+    def _settle(self, recheck=False):
+        self.recheck_settle = recheck
         self.phase = 'settling'
         self.stopped_since = self.accept_after = None
         self.step_v = self.step_vy = self.step_w = 0.0
@@ -299,7 +331,7 @@ class StartLineAligner:
         self.response_reasons[axis] = 'accepted'
 
     def _error_spread(self, axis):
-        values = [row[0 if axis == 'longitudinal' else 2] for row in self.samples]
+        values = [row[0 if axis == 'longitudinal' else 2] for row in self.samples[-self.decision_frames:]]
         return max(values)-min(values) if values else 0.
 
     @property
@@ -326,13 +358,22 @@ class StartLineAligner:
             self.distance_estimate_source = 'probe_no_reliable_scale'
             distance = (.002 if self.step_axis == 'longitudinal' and abs(error) <= 2.*tolerance
                         else .005)
+        self.step_limit_m = self.config.start_alignment_step_distance
+        reliable = self.distance_estimate_source in ('ground_mapping', 'local_response_confirmed')
+        if (reliable and abs(error) > 4.*tolerance and
+                abs(self.estimated_remaining_m) > 2.*self.step_limit_m + 1e-6):
+            self.step_limit_m = self.config.start_alignment_coarse_step_distance
+        # Do not plan beyond the remaining cumulative motion budget.
+        self.step_limit_m = min(self.step_limit_m, max(0., self.max_distance_m-self.travelled_m))
+        if self.step_axis == 'longitudinal' and error < 0.:
+            self.step_limit_m = min(self.step_limit_m, max(0.,
+                self.config.start_alignment_max_reverse_distance-self.reverse_travelled_m))
         # A lateral correction must leave room for the nominal braking distance
         # at the minimum target speed, plus the odometry arrival tolerance.
         # This is a planning heuristic, not a measured stopping-distance claim.
         minimum = (.001 + self.config.start_alignment_min_lateral_speed**2 /
                    (2.*self.config.linear_acceleration) if self.step_axis == 'lateral' else .002)
-        return math.copysign(min(self.config.start_alignment_step_distance,
-                                 max(minimum, distance)), error)
+        return math.copysign(min(self.step_limit_m, max(minimum, distance)), error)
 
     def _plan_step(self, now, pose):
         self._update_image_response(pose)
@@ -357,7 +398,10 @@ class StartLineAligner:
             self.response_reasons = dict.fromkeys(self.response_reasons, 'heading_changed')
             for history in self.response_samples.values():
                 history.clear()
-            angle = math.copysign(min(.04, max(.01, .6*abs(self.heading_error))), sign*self.heading_error)
+            angle_limit = (self.config.start_alignment_coarse_max_angle
+                           if abs(self.heading_error) > 4.*self.config.start_alignment_heading_tolerance_rad
+                           else .04)
+            angle = math.copysign(min(angle_limit, max(.01, .6*abs(self.heading_error))), sign*self.heading_error)
             speed = max(self.config.start_alignment_min_angular_speed, .6*abs(self.heading_error))
             w = math.copysign(min(self.config.start_alignment_max_angular_speed, speed), angle)
         elif abs(self.lateral_error) > lateral_tolerance:
@@ -377,6 +421,10 @@ class StartLineAligner:
                 self.fault = self.state = 'start_alignment_failed_speed_below_motion_threshold'
                 return
             v = math.copysign(speed, distance)
+        if self.step_axis != 'heading' and abs(distance or lateral) <= self.POSITION_STEP_TOLERANCE_M:
+            self.fault = self.state = ('start_alignment_failed_reverse_limit' if self.step_axis == 'longitudinal' and error < 0. else
+                                       'start_alignment_failed_distance_limit')
+            return
         self.step_pose, self.step_started_at = tuple(pose[:3]), now
         self.step_actual_m = self.step_actual_rad = 0.0
         self.step_distance, self.step_lateral_m, self.step_angle = distance, lateral, angle
@@ -386,6 +434,8 @@ class StartLineAligner:
             response_error = self.position_error if distance else sign*self.lateral_error
             self.response_reference = (self.step_pose, response_error, self.step_axis,
                                        (self.width, self.height), self._error_spread(self.step_axis))
+        duration = abs(distance/v) if v else abs(lateral/vy) if vy else abs(angle/w)
+        self.step_timeout_sec = max(4., min(8., 2.+1.5*duration))
         self.step_count += 1
         self.phase = 'moving'
         self._clear_observations()
@@ -441,11 +491,16 @@ class StartLineAligner:
         return (all(math.isfinite(value) for value in (x, y, slope))
                 and 0 <= x < width and 0 <= y < height and abs(slope) <= 2.0)
 
-    def command(self, now, pose, odom_fresh=True, line_ready=True, stopped=False):
+    def command(self, now, pose, odom_fresh=True, line_ready=True, stopped=False,
+                marker_pending=False):
         """Advance the discrete motion/settling/observation cycle."""
         self.last_tick_at = now
         self.inputs_ready = line_ready and odom_fresh and pose is not None
         self.is_stopped = stopped and odom_fresh
+        # A delayed detector is not a new camera outage while fresh matching
+        # camera data and odometry keep confirming the same stationary window.
+        # This permits collecting evidence only; line_ready still gates motion.
+        self.marker_pending = bool(marker_pending and self.is_stopped and pose is not None)
         self._prune_observations(now)
         if self.fault:
             return self.fault
@@ -488,21 +543,26 @@ class StartLineAligner:
                        if self.step_axis == 'heading' else
                        self.step_remaining_m <= self.POSITION_STEP_TOLERANCE_M)
             if reached:
-                self._settle()
-            elif now-self.step_started_at > 4.:
+                self._settle(recheck=True)
+            elif now-self.step_started_at > self.step_timeout_sec:
                 self.fault = self.state = 'start_alignment_failed_step_timeout'
             return self.state
         if not stopped:
-            self._settle()
+            # Keep the completed-step dwell policy through measured run-on;
+            # interrupted moves already clear it in their own branch above.
+            self._settle(recheck=self.recheck_settle)
             return self.state
         if self.stopped_since is None:
             self.stopped_since = now
-            self.accept_after = now+self.config.start_alignment_settle_sec
+            settle = (self.config.start_alignment_recheck_settle_sec if self.recheck_settle
+                      else self.config.start_alignment_settle_sec)
+            self.accept_after = now+settle
         # Camera dropout must not erase an odometry-confirmed stop. Keep the
         # bounded stationary sample window, but require a new captured frame on
         # recovery before issuing any motion or declaring completion.
         if not line_ready:
-            self.resume_observation_after = now
+            if not self.marker_pending:
+                self.resume_observation_after = now
             self.visual_ready = False
             self.state = 'start_alignment_waiting_for_line'
             if now >= self.accept_after:
@@ -520,7 +580,8 @@ class StartLineAligner:
             return self.state
         if self.visual_ready and self.window_stable():
             self.state = 'start_alignment_complete'
-        elif self.window_stable():
+        elif self.window_stable(self.decision_frames):
+            self._filter_observations(self.decision_frames)
             self._plan_step(now, pose)
         else:
             self.state = 'start_alignment_waiting_for_stable_image'
@@ -547,7 +608,11 @@ class StartLineAligner:
                     input_block_reason=self.input_block_reason, stopped=self.is_stopped,
                     observation_age_sec=(self.last_tick_at-self.last_seen_at
                                          if self.last_tick_at is not None and self.last_seen_at is not None else None),
-                    filter_frames=self.filter_frames, inputs_ready=self.inputs_ready,
+                    filter_frames=self.filter_frames, decision_frames=self.decision_frames,
+                    step_limit_m=self.step_limit_m, step_timeout_sec=self.step_timeout_sec,
+                    inputs_ready=self.inputs_ready,
+                    marker_pending=self.marker_pending,
+                    observation_stability=self.observation_stability(),
                     stable_frames=self.stable_frames, confirmation_frames=self.confirmation_frames,
                     marker=self.marker, target_ratio=self.config.stop_marker_target_ratio,
                     position_error_ratio=self.position_error,

@@ -12,8 +12,8 @@ flowchart TD
     B -->|否| D[停车等待新画面]
     C -->|连续3帧脱离充电| D
     D --> E[先摆正朝向 再横移 再前后对横线]
-    E -->|完成一小步| D
-    E -->|连续5张新图满足容差且停稳| F[建立录制原点与重放锚点]
+    E -->|完成一次有界里程计修正| D
+    E -->|窗口内5张有效新图满足容差且停稳| F[建立录制原点与重放锚点]
     F --> G{导航模式}
     G -->|vision或teach| H[视觉循迹 实测里程计录制]
     G -->|replay| I[标准轨迹跟踪 有界视觉辅助]
@@ -49,25 +49,42 @@ flowchart TD
 
 ## 本次调整的规则
 
-1. **起步摆正再建立坐标基准。** 先等待实际停稳0.6秒，再采集5张稳定新图。
-   每次只控制一个轴，最多转0.04rad或移动1.5cm，然后停车重新观察。
+1. **起步摆正再建立坐标基准。** 首次实际停稳后等待0.6秒，用最近3张稳定新图决定修正；
+   最终完成仍要求1.5秒窗口内5张有效图满足容差且实际停稳。偶尔没有横线候选不抹掉窗口内有效证据，
+   但空帧不能触发运动或完成，过期证据自动剔除。
+   每次只控制一个轴。没有尺度时先试探5mm；一次有效估距仍最多走1.5cm；
+   有真实地面标定或至少两次一致的“图像变化/实际里程计位移”后，
+   误差超过4倍容差且估计剩余距离大于两倍细调步长时，单步上限增至5cm。
+   距离取朝容差带内修正量的80%，仍受累计30cm、倒退10cm预算限制；近目标恢复细调。
+   朝向误差大于4倍容差时单步最多0.10rad，接近后最多0.04rad。
+   完整执行到位后停稳等待0.25秒再收新图；运动中输入中断仍停下并重新等待0.6秒。
+   每步超时按距离与目标速度设为4～8秒，总超时仍45秒，不通过加长总超时掩盖失败。
+   运动期间由高频控制循环按里程计到位停车、按剩余距离制动，禁止预先排队盲发多步指令。
    图像横向容差从半图宽6%收紧到2%（640宽约6.4像素），切线角容差从0.12收紧到0.035rad（约2°）。
    这两个图像指标不能当作地面定位精度。重放还会用近端主线另做一致性复核。
 2. **途中里程计主导，视觉同时检查横向和朝向。** 朝向歪但线恰好居中也允许纠偏。
    视觉角速度辅助为视觉控制量的0.5倍，限幅±0.06rad/s；总输出仍服从曲率和转速限制。
    横向偏差超过半图宽12%或近端图像切线超过0.10rad后连续降速，最低为原目标速度的40%。
    稳定视觉显示横向偏差超过80%时锁停。
+   正常可信弯道另设`standard_curve_min_speed: 0.05`m/s的最低巡航目标：总请求曲率至少0.5/m、
+   横向偏差不超过半图宽30%、近端图像切线不超过0.60rad时，避免连续相乘把速度压得过低。
+   它不会把低巡航设定抬高，不覆盖较大视觉偏差、丢线、横线接近、终点减速或物理运动限制。
 3. **弯道按半径降速。** 前进重放曲率单独限为5/m，适配已有约5/m的弯道；
    `route_max_curvature: 2.0`继续用于原末段控制。所需转速超过上限时同步减小线速度，避免截断角速度后切弯。
 4. **末段只接管一次。** 剩余约15cm进入`visual_finish`后，不再调用路径前瞻控制器，
    防止终点附近前瞻点落在车侧后方导致`standard_target_not_ahead`。
    此后最高0.02m/s，最多30秒、路径外额外找线最多5cm，累计行程与路线偏离仍受检查；
    相对末段路线切线的里程计朝向偏差超过0.9rad仍会锁停，不将真正掉头当成普通终点接管。
+   视觉接管前根据剩余距离提前规划减速，并留2cm余量；不在15cm交接点才从巡航速度突然切到0.02m/s。
    无有效稳定视觉立即停；只有横线门控确认才算到站。
 5. **丢线与停帧分开。** 中段相机持续产生新图但暂时找不到线，最多以0.05m/s沿已有路线继续5秒或30cm，任一到限锁停。
    连续3帧有效主线才恢复视觉辅助。相机停帧、里程计过期、处理超预算或底盘异常仍立即停车。
-6. **录制与巡航分开。** `teach`默认0.03m/s；普通前进巡航参数默认0.1m/s，重放还受路线0.08m/s上限约束。
+6. **录制与巡航分开。** `teach`默认0.03m/s；普通前进巡航参数默认0.1m/s，重放路线速度上限同为0.10m/s。
    倒车独立上限0.05m/s。标准文件只读，返程使用本次实际前进记录，不覆盖标准。
+7. **巡航变速走斜坡。** 前进重放及途中记录轨迹倒车使用独立巡航加速度0.04m/s²、减速度0.06m/s²，
+   线速度与角速度仍使用同一插值比例，避免改变转弯比例。正常视觉降速不再在插值后直接截成新目标。
+   从0.10降至0.05m/s约0.83秒，反向恢复约1.25秒；角加速度约束可能使过程更长。
+   物理上限、丢线限速、横线及末段仍可立即收紧上限；输入失效或到站仍发零速。
 
 起步与末段仍要求新鲜图像，不能通过放宽图像过期时间解决CPU负载问题。
 轮式里程计会受打滑影响；相机没有地面标定时不把像素误差虚构成米或真实车体角度。
@@ -78,6 +95,7 @@ flowchart TD
 
 - [Nav2 Regulated Pure Pursuit](https://github.com/ros-navigation/navigation2/blob/main/nav2_regulated_pure_pursuit_controller/src/regulated_pure_pursuit_controller.cpp)：弧长前瞻、曲率与速度约束、接近阶段减速。
 - [Nav2 regulation_functions](https://github.com/ros-navigation/navigation2/blob/main/nav2_regulated_pure_pursuit_controller/include/nav2_regulated_pure_pursuit_controller/regulation_functions.hpp)：曲率和终点接近限速分开处理。
+- [Nav2 DriveOnHeading](https://github.com/ros-navigation/navigation2/blob/main/nav2_behaviors/include/nav2_behaviors/plugins/drive_on_heading.hpp)：位移目标、循环读取位姿、先判断到位，再做加减速与最低速度约束；本项目只借鉴距离执行结构，不包含其代价地图碰撞检查。
 - [Nav2 Rotation Shim](https://github.com/ros-navigation/navigation2/blob/main/nav2_rotation_shim_controller/src/nav2_rotation_shim_controller.cpp)：先摆正再交给路径跟踪器，阶段切换有独立条件。
 - [Nav2 Simple Goal Checker](https://github.com/ros-navigation/navigation2/blob/main/nav2_controller/plugins/simple_goal_checker.cpp)：有状态的终点判定，已经进入后续阶段后不重复要求上一阶段的条件。
 
@@ -99,7 +117,7 @@ ros2 launch robot_task_control line_follow_only.launch.py \
   standard_route_file:="$PWD/routes/standards/shuttle_test_01/standard_route.json" \
   round_trip:=true charging_mode:=false check_devices_on_startup:=false \
   workflow_file:="$(ros2 pkg prefix robot_task_control)/share/robot_task_control/config/line_follow_charge_test.yaml" \
-  start_alignment:=true line_follow_speed:=0.075 line_reverse_speed:=0.05 \
+  start_alignment:=true line_follow_speed:=0.1 line_reverse_speed:=0.05 \
   line_stop_marker_target_ratio:=0.5 line_show_window:=true \
   route_file:="$HOME/.ros/line_follow/replay_$(date +%Y%m%d_%H%M%S).json" \
   2>&1 | tee /tmp/chassis_replay_test.log
@@ -107,7 +125,11 @@ ros2 launch robot_task_control line_follow_only.launch.py \
 
 检查顺序：
 
-1. 起步应先摆正、再回中、再对横线；每个小步结束后轮子停下再看图，不应边滑行边判断成功。
+1. 起步应先摆正、再回中、再对横线；每次修正结束后轮子停下再看图，不应边滑行边判断成功。
+   起步分别从接近目标、小幅前后偏差、较大但横线仍可见的偏差各测试一次，记录启用至完成耗时、步数和最终停位。
+   日志应先显示`probe_no_reliable_scale`，有效估距后显示`local_response_tentative`、`local_response_confirmed`；
+   只有可靠估距且足够远才应出现超过15mm的目标。没有地面映射时，不应首次看到横线就直接走50mm。
+   诊断中的`required_samples`为3、`required_confirmations`为5。画面持续过期时仍应停车，不应继续执行预排动作。
    `start_alignment_complete`后才能建立路径锚点或记录首点。
 2. 去程状态中的`standard_route.controller.phase`应为`route`，偏线明显时速度应降低，弯道不应持续饱和后越走越偏。
    对比`geometry`（图像）与`standard_route.diagnostics`（米制里程计），二者单位不同。
@@ -144,6 +166,7 @@ ros2 launch robot_task_control line_follow_only.launch.py \
 
 ## 软件回归检查范围
 
-纯函数检查验证起步4.2°不能误判完成、视觉偏差限速、丢线预算、末段接管不可逆、末段时间/行程/偏离围栏及故障锁定。
+纯函数检查验证起步4.2°不能误判完成、视觉偏差限速、弯道最低巡航目标及其例外、双向巡航变速斜坡、
+丢线预算、末段提前减速与接管不可逆、末段时间/行程/偏离围栏及故障锁定。
 隔离ROS话题检查验证实际节点接线、输入过期停车、录制/重放锚点延迟建立及倒车限速。
 这些检查不连接CAN、不启动实车，也没有新增仿真器。

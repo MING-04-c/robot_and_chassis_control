@@ -2,7 +2,7 @@
 
 import math
 from statistics import median
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,8 @@ class ControlConfig:
     estimated_speed_factor: float = 0.3
     fallback_speed_factor: float = 0.5
     linear_acceleration: float = 0.08
+    cruise_linear_acceleration: float = 0.04
+    cruise_linear_deceleration: float = 0.06
     angular_acceleration: float = 0.35
     min_valid_row_fraction: float = 0.06
     require_bottom_connected: bool = False
@@ -66,6 +68,10 @@ class ControlConfig:
     start_alignment_enabled: bool = False
     start_alignment_timeout_sec: float = 45.0
     start_alignment_settle_sec: float = 0.6
+    start_alignment_recheck_settle_sec: float = 0.25
+    start_alignment_observation_frames: int = 3
+    start_alignment_coarse_step_distance: float = 0.05
+    start_alignment_coarse_max_angle: float = 0.10
     start_alignment_step_distance: float = 0.015
     start_alignment_speed: float = 0.03
     start_alignment_lateral_speed: float = 0.03
@@ -104,6 +110,10 @@ class ControlConfig:
     stop_marker_release_ratio: float = 0.08
 
     def validate(self):
+        for name in ('cruise_linear_acceleration', 'cruise_linear_deceleration'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not .01 <= value <= .2:
+                raise ValueError(name+' must be 0.01..0.2 m/s^2')
         if self.drive_direction not in ('forward', 'reverse'):
             raise ValueError('drive_direction must be forward or reverse')
         if isinstance(self.reverse_steering_sign, bool) or self.reverse_steering_sign not in (-1., 1.):
@@ -150,6 +160,14 @@ class ControlConfig:
             raise ValueError('start_alignment_timeout_sec must be 1..120')
         if not 0.2 <= self.start_alignment_settle_sec <= 3.0:
             raise ValueError('start_alignment_settle_sec must be 0.2..3.0')
+        if not 0.2 <= self.start_alignment_recheck_settle_sec <= 3.0:
+            raise ValueError('start_alignment_recheck_settle_sec must be 0.2..3.0')
+        if type(self.start_alignment_observation_frames) is not int or not 3 <= self.start_alignment_observation_frames <= 5:
+            raise ValueError('start_alignment_observation_frames must be an integer in 3..5')
+        if not self.start_alignment_step_distance <= self.start_alignment_coarse_step_distance <= .08:
+            raise ValueError('start alignment coarse distance must be >= fine distance and <=0.08m')
+        if not .04 <= self.start_alignment_coarse_max_angle <= .15:
+            raise ValueError('start_alignment_coarse_max_angle must be 0.04..0.15rad')
         if not 0.003 <= self.start_alignment_step_distance <= 0.03:
             raise ValueError('start_alignment_step_distance must be 0.003..0.03m')
         if not 0.005 <= self.start_alignment_speed <= self.max_forward_speed:
@@ -545,6 +563,23 @@ def coordinated_velocity(previous_v, previous_w, target_v, target_w, config, dt,
         if abs(delta) > 1e-12:
             scale = min(scale, limit*max(0., dt)/abs(delta))
     return previous_v+scale*dv, previous_w+scale*dw
+
+
+def cruise_velocity(previous_v, previous_w, target_v, target_w, config, dt,
+                    curve_strength=0., hard_speed_limit=None):
+    """Ramp normal cruise changes; only an explicit safety cap may cut the ramp.
+
+    A zero target still stops immediately. The caller supplies hard caps for
+    marker approach, physical constraints, lost vision and terminal handoff.
+    """
+    rate = (config.cruise_linear_acceleration if abs(target_v) > abs(previous_v)
+            else config.cruise_linear_deceleration)
+    v, w = coordinated_velocity(previous_v, previous_w, target_v, target_w,
+        replace(config, linear_acceleration=rate), dt, curve_strength)
+    if hard_speed_limit is not None and abs(v) > hard_speed_limit:
+        scale = max(0., hard_speed_limit)/abs(v)
+        v, w = v*scale, w*scale
+    return v, w
 
 
 def lookahead_target(ahead, bridges, ry, forward, distance_ratio, height, config):

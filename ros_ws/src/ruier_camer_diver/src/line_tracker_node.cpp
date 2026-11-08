@@ -39,7 +39,8 @@ public:
     }
     // 树莓派同时运行ROS控制：限制图像算法线程，避免争抢控制回调CPU。
     cv::setNumThreads(opencv_threads);
-    RCLCPP_INFO(get_logger(), "OpenCV processing threads: %d", cv::getNumThreads());
+    RCLCPP_INFO(get_logger(), "OpenCV processing threads: %d; processing limit: %.1f fps (0=unlimited)",
+      cv::getNumThreads(), max_processing_fps_);
     const auto topic = declare_parameter<std::string>("input_topic", "image_raw", fixed);
     show_window_ = declare_parameter<bool>("show_window", false, fixed);
     timeout_ = declare_parameter<double>("frame_timeout_sec", 0.5, fixed);
@@ -138,7 +139,7 @@ public:
     edges_pub_ = create_publisher<sensor_msgs::msg::Image>("line/edges", qos);
     path_pub_ = create_publisher<geometry_msgs::msg::PolygonStamped>("line/centerline", qos);
     estimated_pub_ = create_publisher<geometry_msgs::msg::PolygonStamped>("line/estimated_centerline", qos);
-    status_pub_ = create_publisher<std_msgs::msg::String>("line/status", 10);
+    status_pub_ = create_publisher<std_msgs::msg::String>("line/status", 1);
     lost_pub_ = create_publisher<std_msgs::msg::Bool>("line/lost", 10);
     subscription_ = create_subscription<sensor_msgs::msg::Image>(topic, qos,
       [this](sensor_msgs::msg::Image::ConstSharedPtr message) {on_image(message);});

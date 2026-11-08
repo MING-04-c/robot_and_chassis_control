@@ -17,7 +17,7 @@ LAUNCH = """
 import importlib.util
 from pathlib import Path
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction, SetLaunchConfiguration
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler, SetLaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.utilities import perform_substitutions, normalize_to_list_of_substitutions
 
@@ -30,12 +30,24 @@ def module(package, filename):
     return result
 
 driver = module("eli_cs_robot_driver", "elite_control.launch.py")
+real_controller_startup = driver.spawn_controllers
+
+def supported_controller_startup(specifications, manager_timeout, parameter_file):
+    required = ("scaled_joint_trajectory_controller", "joint_state_broadcaster",
+                "speed_scaling_state_broadcaster", "tcp_pose_broadcaster")
+    return real_controller_startup([(name, active) for name, active in specifications
+                                    if name in required], manager_timeout, parameter_file)
+
+driver.spawn_controllers = supported_controller_startup
 
 def mock_driver(context):
     nodes = []
     def resolve(value):
         return perform_substitutions(context, normalize_to_list_of_substitutions(value))
     for node in driver.launch_setup(context):
+        if isinstance(node, RegisterEventHandler):
+            nodes.append(node)
+            continue
         package = resolve(node.node_package)
         executable = resolve(node.node_executable)
         if package == "controller_manager" and executable == "ros2_control_node":

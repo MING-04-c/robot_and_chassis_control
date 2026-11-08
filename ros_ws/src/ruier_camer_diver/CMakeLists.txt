@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(ruier_camer_diver)
 
+# colcon does not select a build type by default. Pixel loops in the tracker
+# otherwise run without compiler optimization, even on the physical robot.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Wpedantic)
